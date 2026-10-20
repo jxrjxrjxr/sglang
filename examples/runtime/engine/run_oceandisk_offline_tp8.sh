@@ -7,7 +7,7 @@ set -euo pipefail
 # bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk
 
 # Edit these paths for your machine.
-MODEL_PATH="${MODEL_PATH:-/models/your-model}"
+MODEL_PATH="${MODEL_PATH:-/home/models/GLM-5.2-W4AFP8/}"
 DATASET_PATH="${DATASET_PATH:-/home/z00591349/dataset/multifieldqa_zh.jsonl}"
 OPEXTENSION="${OPEXTENSION:-/opt/oceandisk/libop_extension.so}"
 LIBGIDS="${LIBGIDS:-/opt/oceandisk/libgids_kv_host.so}"
@@ -50,6 +50,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTHONPATH="${repo_root}/python${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP="${SGLANG_JIT_DEEPGEMM_FAST_WARMUP:-1}"
+export SGLANG_DG_USE_NVRTC="${SGLANG_DG_USE_NVRTC:-1}"
 export SGLANG_ENABLE_UNIFIED_RADIX_TREE=1
 export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND="${SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND:-rust}"
 
@@ -61,7 +63,12 @@ exec "${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_offline_tp8.py" \
     --disaggregation-mode null \
     --trust-remote-code \
     --page-size 64 \
-    --mem-fraction-static 0.8 \
+    --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 32}' \
+    --moe-dense-tp-size 1 \
+    --data-parallel-size 1 \
+    --moe-a2a-backend none \
+    --disable-prefill-cuda-graph \
+    --mem-fraction-static 0.85 \
     --max-total-tokens 12000 \
     --max-running-requests 1 \
     "${linker_args[@]}" \
