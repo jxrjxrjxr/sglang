@@ -1,6 +1,7 @@
 """Real CUDA/GIDS roundtrip through OceanDiskDirectLinker, without a model.
 
 Run from the repository root with SGLang installed:
+    export CUDA_VISIBLE_DEVICES=3
     export OPEXTENSION=/opt/oceandisk/libop_extension.so
     export PYTHONPATH=/opt/oceandisk:$PWD/python:$PYTHONPATH
     python examples/runtime/engine/test_oceandisk_linker_roundtrip.py \
@@ -159,9 +160,6 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        "--device", type=int, default=0, help="Visible CUDA device index"
-    )
     parser.add_argument("--gids-config", type=Path, default=os.getenv("GIDS_CONFIG"))
     parser.add_argument("--op-extension", default=os.getenv("OPEXTENSION"))
     parser.add_argument("--connection-indices", type=int, nargs="+", default=[0])
@@ -170,17 +168,19 @@ def main():
         path = args.gids_config.resolve()
         if path.name == "gids_config.txt":
             os.environ["USE_SINGLE_PORT"] = "1"
-        elif path.name == f"gids_config_{args.device}.txt":
+        elif path.name == "gids_config_0.txt":
             os.environ["USE_SINGLE_PORT"] = "0"
         else:
-            parser.error("Config must be gids_config.txt or gids_config_<device>.txt.")
+            parser.error(
+                "Config must be gids_config.txt or gids_config_0.txt (visible device 0)."
+            )
         os.environ["GIDS_DIR"] = str(path.parent) + os.sep
 
     import torch
 
     logging.basicConfig(level=logging.INFO)
-    torch.cuda.set_device(args.device)
-    device = torch.device("cuda", args.device)
+    torch.cuda.set_device(0)
+    device = torch.device("cuda", 0)
     run_id = uuid.uuid4().hex
     config = {
         "namespace": f"oceandisk-roundtrip-{run_id}",
@@ -191,7 +191,11 @@ def main():
     pool_group, buffers = make_pool_group(torch, device)
     linker = make_linker(pool_group, config)
     try:
-        print(f"Device: {device}; layers={NUM_LAYERS}; pages={NUM_PAGES}", flush=True)
+        print(
+            f"CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES', '(unset)')}; "
+            f"device={device}; layers={NUM_LAYERS}; pages={NUM_PAGES}",
+            flush=True,
+        )
         run_roundtrip(torch, linker, buffers, run_id, max_ranges=2 * NUM_PAGES)
         run_roundtrip(torch, linker, buffers, run_id, max_ranges=4)
         print(
