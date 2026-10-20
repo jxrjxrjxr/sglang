@@ -13,10 +13,12 @@ Each run uses fresh object keys. It does not delete objects from GIDS.
 
 import argparse
 import hashlib
+import inspect
 import json
 import logging
 import os
 import uuid
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +28,114 @@ NUM_PAGES = 5
 PAGE_SIZE = 64
 KV_WIDTH = 16
 INDEXER_WIDTH = 8
+
+
+def print_runtime(linker):
+    import od_utils
+
+    from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
+        gids_config_path,
+    )
+
+    print(f"Linker source: {inspect.getfile(type(linker))}", flush=True)
+    print(f"Storage source: {inspect.getfile(type(linker.storage))}", flush=True)
+    print(f"od_utils: {od_utils.__file__}", flush=True)
+    print(
+        f"OPEXTENSION: {os.getenv('OPEXTENSION', '(unset; CLI override possible)')}",
+        flush=True,
+    )
+    print(
+        f"LIBGIDS: {os.getenv('LIBGIDS', '(unset; native compiled default)')}",
+        flush=True,
+    )
+    path = gids_config_path(os.environ["GIDS_DIR"], 0, os.getenv("USE_SINGLE_PORT"))
+    print(f"GIDS config: {path.resolve()}", flush=True)
+    maps = Path("/proc/self/maps")
+    if maps.exists():
+        libraries = sorted(
+            {
+                line.split()[-1]
+                for line in maps.read_text().splitlines()
+                if "/" in line
+                and any(
+                    name in line.lower()
+                    for name in ("gids", "op_extension", "od_utils")
+                )
+            }
+        )
+        print(f"Mapped native libraries: {json.dumps(libraries)}", flush=True)
+    print(f"Key namespace: {json.dumps(linker._namespace)}", flush=True)
+    for mr, (ptr, size) in enumerate(linker.storage.regions):
+        print(f"Registered MR={mr}: base={ptr:#x}, bytes={size}", flush=True)
+
+
+def print_metadata(operation, row_index, row):
+    count = (len(row) - 1) // 6
+    fields = (
+        "mr_ids",
+        "keys",
+        "local_offsets",
+        "storage_offsets",
+        "sizes",
+        "connections",
+    )
+    metadata = {"task_id": row[0], "io_count": count}
+    metadata.update(
+        {
+            field: row[1 + column * count : 1 + (column + 1) * count]
+            for column, field in enumerate(fields)
+        }
+    )
+    print(f"{operation} row={row_index}: {json.dumps(metadata)}", flush=True)
+
+
+@contextmanager
+def trace_native_calls(storage):
+    import od_utils
+
+    native_put = od_utils.batch_dispatch_put
+    native_get = od_utils.batch_dispatch_get
+    native_exist = storage._ops.kvcache_exist
+
+    def put(*args):
+        lengths = args[1].tolist()
+        indices = args[2].tolist()
+        print(
+            f"PUT batch: shape={tuple(args[0].shape)}, lengths={lengths}, indices={indices}, stream={args[6]}, device={args[7]}",
+            flush=True,
+        )
+        for index in indices:
+            print_metadata("PUT", index, args[3][index].tolist()[: lengths[index]])
+        result = native_put(*args)
+        print(
+            f"PUT wrapper returned {result!r} (not a per-IO success result)", flush=True
+        )
+        return result
+
+    def get(*args):
+        print(
+            f"GET batch: shape={tuple(args[0].shape)}, stream={args[5]}, device={args[6]}",
+            flush=True,
+        )
+        for index, row in enumerate(args[2].tolist()):
+            print_metadata("GET", index, row[: args[1]])
+        return native_get(*args)
+
+    def exists(metadata, output):
+        row = metadata.cpu().tolist()
+        result = native_exist(metadata, output)
+        count = (len(row) - 1) // 2
+        print(
+            f"EXIST task={row[0]} keys={row[1 : 1 + count]} connections={row[1 + count :]} raw_result={result!r}",
+            flush=True,
+        )
+        return result
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(od_utils, "batch_dispatch_put", new=put))
+        stack.enter_context(patch.object(od_utils, "batch_dispatch_get", new=get))
+        stack.enter_context(patch.object(storage._ops, "kvcache_exist", new=exists))
+        yield
 
 
 def make_pool_group(torch, device):
@@ -117,18 +227,30 @@ def run_roundtrip(torch, linker, buffers, run_id, *, max_ranges):
 
     write = PoolTransfer(name=PoolName.KV, keys=keys, device_indices=source)
     read = PoolTransfer(name=PoolName.KV, keys=keys, device_indices=target)
+    print(
+        f"\nCASE {label}: source page slots={source[::PAGE_SIZE].tolist()}; "
+        f"target page slots={target[::PAGE_SIZE].tolist()}",
+        flush=True,
+    )
+    print(f"Page hashes: {json.dumps(keys)}", flush=True)
+    print("STAGE: cold lookup", flush=True)
     if linker.lookup("cold", [read]):
         raise AssertionError(f"{label}: fresh keys unexpectedly hit.")
+    print("STAGE: offload", flush=True)
     if not linker.offload([write]):
         raise AssertionError(f"{label}: offload was not queued.")
     linker.offload_queue.join()
     if not linker.pop_completed_offload():
         raise AssertionError(f"{label}: offload failed; see worker log.")
+    print(
+        "STAGE: offload queue and CUDA event finished; checking existence", flush=True
+    )
 
     for layers in buffers.values():
         for buffer in layers:
             buffer.fill_(0xFF)
     hits = linker.lookup("restore", [read])
+    print(f"Restorable prefix boundaries: {hits}", flush=True)
     if hits != list(range(1, NUM_PAGES + 1)):
         raise AssertionError(f"{label}: expected all pages to exist, got {hits}.")
 
@@ -196,8 +318,15 @@ def main():
             f"device={device}; layers={NUM_LAYERS}; pages={NUM_PAGES}",
             flush=True,
         )
-        run_roundtrip(torch, linker, buffers, run_id, max_ranges=2 * NUM_PAGES)
-        run_roundtrip(torch, linker, buffers, run_id, max_ranges=4)
+        if args.op_extension:
+            print(
+                f"Requested op extension: {Path(args.op_extension).resolve()}",
+                flush=True,
+            )
+        print_runtime(linker)
+        with trace_native_calls(linker.storage):
+            run_roundtrip(torch, linker, buffers, run_id, max_ranges=2 * NUM_PAGES)
+            run_roundtrip(torch, linker, buffers, run_id, max_ranges=4)
         print(
             "PASS: real OceanDisk Linker + Storage roundtrip (single GPU).", flush=True
         )
