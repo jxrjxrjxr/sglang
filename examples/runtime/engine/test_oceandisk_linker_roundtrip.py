@@ -9,6 +9,8 @@ Run from the repository root with SGLang installed:
 
 od_utils must be importable. LIBGIDS follows the native library's loading rules.
 Each run uses fresh object keys. It does not delete objects from GIDS.
+Default: compare batch Put with direct per-layer operator calls. Direct mode
+bypasses only the batch Put wrapper and synchronizes after each operator call.
 """
 
 import argparse
@@ -90,22 +92,35 @@ def print_metadata(operation, row_index, row):
 
 
 @contextmanager
-def trace_native_calls(storage):
+def trace_native_calls(storage, put_mode="batch"):
     import od_utils
 
     native_put = od_utils.batch_dispatch_put
     native_get = od_utils.batch_dispatch_get
     native_exist = storage._ops.kvcache_exist
+    native_store = storage._ops.kvcache_store_v2
 
     def put(*args):
         lengths = args[1].tolist()
         indices = args[2].tolist()
         print(
-            f"PUT batch: shape={tuple(args[0].shape)}, lengths={lengths}, indices={indices}, stream={args[6]}, device={args[7]}",
+            f"PUT mode={put_mode}: shape={tuple(args[0].shape)}, lengths={lengths}, indices={indices}, stream={args[6]}, device={args[7]}",
             flush=True,
         )
         for index in indices:
             print_metadata("PUT", index, args[3][index].tolist()[: lengths[index]])
+        if put_mode == "direct":
+            for index in indices:
+                row = args[0][index, : lengths[index]]
+                task_id = int(args[3][index][0].item())
+                status = native_store(row, args[4], task_id)
+                storage._stream.synchronize()
+                print(
+                    f"PUT direct row={index}: task={task_id}, raw_status={status!r}",
+                    flush=True,
+                )
+                storage._check_status(status, "direct put")
+            return None
         result = native_put(*args)
         print(
             f"PUT wrapper returned {result!r} (not a per-IO success result)", flush=True
@@ -196,10 +211,10 @@ def make_linker(pool_group, config):
         return module.OceanDiskDirectLinker(None, params, components={})
 
 
-def run_roundtrip(torch, linker, buffers, run_id, *, max_ranges):
+def run_roundtrip(torch, linker, buffers, run_id, *, max_ranges, put_mode):
     from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 
-    label = f"max_ranges={max_ranges}"
+    label = f"put={put_mode}, max_ranges={max_ranges}"
     linker.max_ranges = max_ranges
     keys = [
         hashlib.sha256(f"{run_id}:{label}:{page}".encode()).hexdigest()
@@ -254,7 +269,7 @@ def run_roundtrip(torch, linker, buffers, run_id, *, max_ranges):
     if hits != list(range(1, NUM_PAGES + 1)):
         raise AssertionError(f"{label}: expected all pages to exist, got {hits}.")
 
-    rid = f"restore-{max_ranges}"
+    rid = f"restore-{put_mode}-{max_ranges}"
     if not linker.load(rid, [read]):
         raise AssertionError(f"{label}: load was not queued.")
     batch = linker.start_layer_wise_loading()
@@ -285,6 +300,12 @@ def main():
     parser.add_argument("--gids-config", type=Path, default=os.getenv("GIDS_CONFIG"))
     parser.add_argument("--op-extension", default=os.getenv("OPEXTENSION"))
     parser.add_argument("--connection-indices", type=int, nargs="+", default=[0])
+    parser.add_argument(
+        "--put-mode",
+        choices=("compare", "batch", "direct"),
+        default="compare",
+        help="Compare both Put paths (default), or run one path only; Get remains batch.",
+    )
     args = parser.parse_args()
     if args.gids_config is not None:
         path = args.gids_config.resolve()
@@ -324,9 +345,39 @@ def main():
                 flush=True,
             )
         print_runtime(linker)
-        with trace_native_calls(linker.storage):
-            run_roundtrip(torch, linker, buffers, run_id, max_ranges=2 * NUM_PAGES)
-            run_roundtrip(torch, linker, buffers, run_id, max_ranges=4)
+        modes = ("batch", "direct") if args.put_mode == "compare" else (args.put_mode,)
+        results = []
+        for max_ranges in (2 * NUM_PAGES, 4):
+            for mode in modes:
+                label = f"put={mode}, max_ranges={max_ranges}"
+                with trace_native_calls(linker.storage, put_mode=mode):
+                    try:
+                        run_roundtrip(
+                            torch,
+                            linker,
+                            buffers,
+                            run_id,
+                            max_ranges=max_ranges,
+                            put_mode=mode,
+                        )
+                    except AssertionError as error:
+                        results.append((label, str(error)))
+                        print(f"FAIL {label}: {error}", flush=True)
+                    else:
+                        results.append((label, None))
+                    finally:
+                        linker.reset()
+        print("\nCOMPARISON SUMMARY", flush=True)
+        for label, error in results:
+            print(
+                f"{'FAIL' if error is not None else 'PASS'} {label}"
+                + (f": {error}" if error is not None else ""),
+                flush=True,
+            )
+        if any(error is not None for _, error in results):
+            raise AssertionError(
+                "OceanDisk roundtrip failed; see comparison summary and native call logs."
+            )
         print(
             "PASS: real OceanDisk Linker + Storage roundtrip (single GPU).", flush=True
         )
