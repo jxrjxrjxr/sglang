@@ -9,16 +9,14 @@ from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
-    MAX_GIDS_RANGES,
     OceanDiskRange,
     OceanDiskStorage,
     encode_key,
-    read_io_alignment,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_model
@@ -85,10 +83,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self.num_layers = self.pool_group.num_layers
         if self.num_layers <= 0:
             raise ValueError("OceanDisk requires at least one transfer layer.")
+        self._validate_dsa_layout()
         buffers = [
             buffer
-            for entry in self.pools.values()
-            for buffer in entry.get_hybrid_pool_buffer()
+            for name in (PoolName.KV, PoolName.INDEXER)
+            for buffer in self.pools[name].get_hybrid_pool_buffer()
         ]
         if not buffers:
             raise ValueError("OceanDisk has no device buffers.")
@@ -104,14 +103,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         self.max_ranges = config.get("max_ranges_per_call", 256)
-        if (
-            type(self.max_ranges) is not int
-            or not 0 < self.max_ranges <= MAX_GIDS_RANGES
-        ):
-            raise ValueError(
-                f"OceanDisk max_ranges_per_call must be in [1, {MAX_GIDS_RANGES}]."
-            )
-        self.io_alignment = read_io_alignment(config)
         namespace = config.get("namespace", get_model().model_path)
         if not isinstance(namespace, str) or not namespace:
             raise ValueError(
@@ -128,7 +119,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             params.pp_size,
             params.pp_rank,
         )
-        self._build_object_layouts()
         self.storage = (
             OceanDiskStorage(config, self.device, buffers)
             if storage is None
@@ -160,82 +150,44 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             list(self.pools),
         )
 
-    def _build_object_layouts(self) -> None:
-        """Save and validate assembler offsets for one page/pool object."""
-        self._object_layouts = {}
-        for name, entry in self.pools.items():
+    def _validate_dsa_layout(self) -> None:
+        if set(self.pools) != {PoolName.KV, PoolName.INDEXER}:
+            raise ValueError(
+                "The GIDS DSA operator requires KV and Indexer pools only."
+            )
+        counts = []
+        for entry in self.pools.values():
             if not entry.packed:
-                raise ValueError(
-                    f"OceanDisk pool {name} requires packed=True for one page/pool object."
-                )
-            layout = {}
-            intervals = []
+                raise ValueError("OceanDisk requires packed=True for page objects.")
+            layer_counts = []
             for layer in range(self.num_layers):
                 meta = entry.get_prepared_layer_range_meta([0], layer)
-                if meta is None:
-                    continue
-                _, sizes, offsets = meta
-                fragments = []
-                for lengths, positions in zip(sizes, offsets, strict=True):
-                    for size, offset in zip(lengths, positions, strict=True):
-                        if size <= 0:
-                            raise ValueError(
-                                "OceanDisk object fragments must be nonempty."
-                            )
-                        if offset < 0:
-                            raise ValueError(
-                                "OceanDisk storage offsets must be nonnegative."
-                            )
-                        if size % self.io_alignment or offset % self.io_alignment:
-                            raise ValueError(
-                                f"OceanDisk pool {name}, layer {layer} has {size}-byte fragment "
-                                f"at offset {offset}, not aligned to io_alignment={self.io_alignment}. "
-                                "A padded staging/packing path is required."
-                            )
-                        fragments.append((int(offset), int(size)))
-                        intervals.append((int(offset), int(offset + size)))
-                layout[layer] = fragments
-            if not intervals:
-                raise ValueError(f"OceanDisk pool {name} has no object payload.")
-            intervals.sort()
-            if any(right[0] < left[1] for left, right in zip(intervals, intervals[1:])):
-                raise ValueError(
-                    f"OceanDisk pool {name} has overlapping object ranges."
-                )
-            self._object_layouts[name] = layout
+                if meta is None or not meta[1][0]:
+                    raise ValueError("Each DSA layer needs KV and Indexer fragments.")
+                layer_counts.append(len(meta[1][0]))
+            counts.extend(layer_counts)
+        if len(set(counts)) != 1:
+            raise ValueError(
+                "GIDS requires paired KV/Indexer IOs and equal IO counts across layers."
+            )
 
-    def _object_key(self, name, page_key) -> int:
-        return encode_key((self._namespace, str(name), page_key))
+    def _object_key(self, page_key) -> int:
+        return encode_key((self._namespace, page_key))
 
     def _page_fragments(
         self, name, page_keys, locations, layer
     ) -> list[OceanDiskRange]:
         """Map a pool/page object's layer to local ranges and remote offsets."""
-        if len(locations) != len(page_keys):
-            raise ValueError(
-                "OceanDisk page keys and locations must have equal length."
-            )
-        entry = self.pools[name]
-        meta = entry.get_prepared_layer_range_meta(locations, layer)
-        if meta is None:
-            if self._object_layouts[name].get(layer):
-                raise ValueError("OceanDisk required layer has no physical ranges.")
-            return []
         if not page_keys:
             return []
-        ptrs, sizes, offsets = meta
-        if len(ptrs) != len(page_keys):
-            raise ValueError("OceanDisk pool ranges do not align with page keys.")
+        ptrs, sizes, offsets = self.pools[name].get_prepared_layer_range_meta(
+            locations, layer
+        )
         ranges = []
-        schema = self._object_layouts[name].get(layer, ())
         for page_key, pointers, lengths, positions in zip(
             page_keys, ptrs, sizes, offsets, strict=True
         ):
-            if list(zip(positions, lengths, strict=True)) != schema:
-                raise ValueError(
-                    "OceanDisk range differs from registered object layout."
-                )
-            key = self._object_key(name, page_key)
+            key = self._object_key(page_key)
             ranges.extend(
                 OceanDiskRange(key, int(ptr), int(size), int(storage_offset))
                 for ptr, size, storage_offset in zip(
@@ -247,30 +199,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         self._ensure_open()
         expanded = self.pool_group.resolve_transfers(transfers)
-        kv = next((t for t in transfers if t.name == PoolName.KV), None)
-        if not expanded or kv is None or not kv.keys:
+        if not expanded:
             return []
-        page_keys = list(kv.keys)
-        valid = set(range(1, len(page_keys) + 1))
-        for transfer in expanded:
-            bitmap = self.storage.exists_many(
-                [self._object_key(transfer.name, page_key) for page_key in page_keys]
-            )
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
-                valid.intersection_update(range(1, end + 1))
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                window = max(1, len(transfer.keys or ()))
-                valid = {
-                    end for end in valid if all(bitmap[max(0, end - window) : end])
-                }
-            else:
-                raise ValueError(
-                    f"Unsupported OceanDisk hit policy: {transfer.hit_policy}"
-                )
-            if not valid:
-                break
-        return sorted(valid)
+        kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
+        bitmap = self.storage.exists_many([self._object_key(key) for key in kv.keys])
+        end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
+        return list(range(1, end + 1))
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         self._ensure_open()
@@ -312,20 +246,30 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
             for transfer in transfers
         ]
+        layers = []
         for layer in range(self.num_layers):
-            ranges = []
+            pools = {PoolName.KV: [], PoolName.INDEXER: []}
             for transfer, locations in prepared:
-                ranges.extend(
+                pools[transfer.name].extend(
                     self._page_fragments(
                         transfer.name, list(transfer.keys), locations, layer
                     )
                 )
-            if write:
-                self.storage.put_ranges(ranges, max_ranges=self.max_ranges)
-            else:
-                self.storage.get_ranges(ranges, max_ranges=self.max_ranges)
-            if counter_index is not None:
-                self.layer_done_counter.complete(counter_index, layer)
+            layers.append(pools[PoolName.KV] + pools[PoolName.INDEXER])
+        if write:
+            self.storage.put_layers(layers, max_ranges=self.max_ranges)
+        else:
+            self.storage.get_layers(
+                layers,
+                max_ranges=self.max_ranges,
+                on_layer_ready=(
+                    None
+                    if counter_index is None
+                    else lambda layer: self.layer_done_counter.complete(
+                        counter_index, layer
+                    )
+                ),
+            )
 
     def _load_worker(self) -> None:
         with torch.cuda.device(self.device):

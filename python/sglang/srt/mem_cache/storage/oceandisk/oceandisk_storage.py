@@ -109,8 +109,13 @@ def pack_io(
     connection_indices: tuple[int, ...],
 ) -> list[int]:
     """Column-major ABI used by od/cache_controller.py, with remote offsets."""
-    if not connection_indices:
-        raise ValueError("OceanDisk needs at least one connection index.")
+    half = len(ranges) // 2
+    if (
+        not ranges
+        or len(ranges) % 2
+        or [r.key for r in ranges[:half]] != [r.key for r in ranges[half:]]
+    ):
+        raise ValueError("OceanDisk requires matching KV and Indexer halves.")
     mr_offsets = [resolve_mr(regions, item.ptr, item.size) for item in ranges]
     if any(item.storage_offset < 0 for item in ranges):
         raise ValueError("OceanDisk storage offsets must be nonnegative.")
@@ -261,17 +266,42 @@ class OceanDiskStorage(HiCacheStorage):
                 result.append(status == 1)
         return result
 
-    def _io(self, ranges: list[OceanDiskRange], *, write: bool, max_ranges=256) -> None:
-        if type(max_ranges) is not int or not 0 < max_ranges <= MAX_GIDS_RANGES:
-            raise ValueError(f"OceanDisk max_ranges must be in [1, {MAX_GIDS_RANGES}].")
-        if not ranges:
-            return
-        for item in ranges:
-            if item.storage_offset % self.io_alignment or item.size % self.io_alignment:
-                raise ValueError(
-                    f"OceanDisk range size/remote offset must align to {self.io_alignment} "
-                    "bytes; padding GPU reads/writes beyond the payload is not supported."
+    def _pack_layer_batches(self, layers, max_ranges):
+        if type(max_ranges) is not int or not 2 <= max_ranges <= MAX_GIDS_RANGES:
+            raise ValueError(f"OceanDisk max_ranges must be in [2, {MAX_GIDS_RANGES}].")
+        if not layers:
+            return []
+        count = len(layers[0])
+        if count % 2 or any(len(layer) != count for layer in layers):
+            raise ValueError("OceanDisk layers require equal, even IO counts.")
+        for layer in layers:
+            for item in layer:
+                if (
+                    item.storage_offset % self.io_alignment
+                    or item.size % self.io_alignment
+                ):
+                    raise ValueError(
+                        f"OceanDisk range size/remote offset must align to {self.io_alignment} bytes."
+                    )
+        half = count // 2
+        batch_pages = max_ranges // 2
+        return [
+            [
+                pack_io(
+                    next(self._task_ids),
+                    ranges[start : min(start + batch_pages, half)]
+                    + ranges[half + start : half + min(start + batch_pages, half)],
+                    self.regions,
+                    self.connection_indices,
                 )
+                for ranges in layers
+            ]
+            for start in range(0, half, batch_pages)
+        ]
+
+    def get_layers(self, layers, *, max_ranges=256, on_layer_ready=None) -> None:
+        import od_utils
+
         torch = self._torch
         with (
             self._lock,
@@ -279,55 +309,81 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._stream),
         ):
             self._ensure_open()
-            op = self._ops.kvcache_store_v2 if write else self._ops.kvcache_load_v2
-            # GIDS requires equal IO lengths within each get dispatch.
-            groups = (
-                [ranges]
-                if write
-                else [
-                    list(group)
-                    for _, group in itertools.groupby(
-                        sorted(ranges, key=lambda item: item.size),
-                        key=lambda item: item.size,
-                    )
-                ]
-            )
-            # Resolve every range before submitting any part of the layer.
-            descriptors = [
-                pack_io(
-                    next(self._task_ids),
-                    group[start : start + max_ranges],
-                    self.regions,
-                    self.connection_indices,
-                )
-                for group in groups
-                for start in range(0, len(group), max_ranges)
-            ]
-            metadata_buffers = []  # Keep CUDA tensors alive until the event completes.
+            descriptors = self._pack_layer_batches(layers, max_ranges)
+            submitted = []
             try:
-                for descriptor in descriptors:
-                    task_id = descriptor[0]
-                    metadata = torch.tensor(
-                        descriptor,
-                        dtype=torch.int64,
-                        device=self.device,
+                for batch in descriptors:
+                    cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                    gpu = cpu.to(self.device)
+                    events = [torch.cuda.Event() for _ in layers]
+                    for event in events:
+                        event.record(self._stream)
+                    submitted.append((cpu, gpu, events))
+                    od_utils.batch_dispatch_get(
+                        gpu,
+                        gpu.shape[1],
+                        cpu,
+                        self._output,
+                        [event.cuda_event for event in events],
+                        self._stream.stream_id,
+                        self.device.index,
+                        0,
+                        len(layers),
+                        True,
+                        False,
                     )
-                    metadata_buffers.append(metadata)
-                    status = op(metadata, self._output, task_id)
-                    self._check_status(status, "put" if write else "get")
+                for layer in range(len(layers)):
+                    for _, _, events in submitted:
+                        events[layer].synchronize()
+                    if on_layer_ready is not None:
+                        on_layer_ready(layer)
+            except BaseException:
+                self._stream.synchronize()
+                raise
+
+    def put_layers(self, layers, *, max_ranges=256) -> None:
+        import od_utils
+
+        torch = self._torch
+        with (
+            self._lock,
+            torch.cuda.device(self.device),
+            torch.cuda.stream(self._stream),
+        ):
+            self._ensure_open()
+            descriptors = self._pack_layer_batches(layers, max_ranges)
+            submitted = []
+            try:
+                for batch in descriptors:
+                    cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                    gpu = cpu.to(self.device)
+                    lengths = torch.tensor(
+                        [len(row) for row in batch], dtype=torch.int64, device="cpu"
+                    )
+                    indices = torch.tensor(
+                        list(range(len(batch))), dtype=torch.int64, device="cpu"
+                    )
+                    submitted.append((cpu, gpu, lengths, indices))
+                    od_utils.batch_dispatch_put(
+                        gpu,
+                        lengths,
+                        indices,
+                        cpu,
+                        self._output,
+                        [],
+                        self._stream.stream_id,
+                        self.device.index,
+                        0,
+                        len(layers),
+                        False,
+                        False,
+                    )
                 event = torch.cuda.Event()
                 event.record(self._stream)
                 event.synchronize()
             except BaseException:
-                # Already submitted work must drain before metadata is released.
                 self._stream.synchronize()
                 raise
-
-    def get_ranges(self, ranges: list[OceanDiskRange], *, max_ranges=256) -> None:
-        self._io(ranges, write=False, max_ranges=max_ranges)
-
-    def put_ranges(self, ranges: list[OceanDiskRange], *, max_ranges=256) -> None:
-        self._io(ranges, write=True, max_ranges=max_ranges)
 
     @staticmethod
     def _unsupported_hicache() -> NotImplementedError:

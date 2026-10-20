@@ -14,7 +14,6 @@ from unittest.mock import Mock, patch
 import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
-    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -127,113 +126,273 @@ class TestOceanDiskStorage(CustomTestCase):
                     [],
                 )
 
-    def test_layer_event_waits_after_all_chunks_and_preserves_status(self):
+    def make_storage(self):
         storage = OceanDiskStorage.__new__(OceanDiskStorage)
         storage._lock = threading.Lock()
         storage._closed = False
-        storage.device = "cuda:0"
-        storage.regions = [(1000, 256)]
-        storage.connection_indices = (0,)
+        storage.device = SimpleNamespace(index=0)
+        storage.regions = [(1000, 4096), (10000, 4096)]
+        storage.connection_indices = (2, 5)
         storage._task_ids = itertools.count(1)
-        storage.io_alignment = 1  # Synthetic tiny ranges, not the deployed ABI.
+        storage.io_alignment = 1
         trace = []
+
+        class Metadata:
+            def __init__(self, values):
+                self.values = values
+                self.shape = (
+                    (len(values), len(values[0]))
+                    if isinstance(values[0], list)
+                    else (len(values),)
+                )
+
+            def to(self, _device):
+                return self
+
         fake_torch = Mock()
         fake_torch.cuda.device.side_effect = lambda *_: nullcontext()
         fake_torch.cuda.stream.side_effect = lambda *_: nullcontext()
-        fake_torch.tensor.side_effect = lambda values, **_: values
-        event = Mock()
-        event.record.side_effect = lambda _: trace.append("record")
-        event.synchronize.side_effect = lambda: trace.append("wait")
-        fake_torch.cuda.Event.return_value = event
+        fake_torch.tensor.side_effect = lambda values, **_: Metadata(values)
+        events = []
+
+        def new_event():
+            event = Mock()
+            event.cuda_event = len(events) + 1
+            event.record.side_effect = lambda *_: trace.append(
+                ("record", event.cuda_event)
+            )
+            event.synchronize.side_effect = lambda: trace.append(
+                ("wait", event.cuda_event)
+            )
+            events.append(event)
+            return event
+
+        fake_torch.cuda.Event.side_effect = new_event
         storage._torch = fake_torch
-        storage._stream = Mock()
+        storage._stream = Mock(stream_id=123)
         storage._output = Mock()
         storage._ops = Mock()
-
-        def load(*_):
-            trace.append("submit")
-            return 0
-
-        storage._ops.kvcache_load_v2.side_effect = load
-        ranges = [OceanDiskRange(7, 1000, 8, offset) for offset in (0, 8, 16)]
-        mr_lookup = Mock(wraps=resolve_mr)
-        with patch.dict(pack_io.__globals__, resolve_mr=mr_lookup):
-            storage.get_ranges(ranges, max_ranges=2)
-        self.assertEqual(mr_lookup.call_count, len(ranges))
-        self.assertEqual(trace, ["submit", "submit", "record", "wait"])
-        storage._stream.synchronize.assert_not_called()
-        trace.clear()
-        batches = []
-
-        def capture_sizes(metadata, *_):
-            count = (len(metadata) - 1) // 6
-            batches.append(metadata[1 + 4 * count : 1 + 5 * count])
-            trace.append("submit")
-            return 0
-
-        mixed = [OceanDiskRange(7, 1000, size, 0) for size in (16, 8, 16, 8, 8)]
-        storage._ops.kvcache_load_v2.side_effect = capture_sizes
-        storage.get_ranges(mixed, max_ranges=2)
-        self.assertEqual(batches, [[8, 8], [8], [16, 16]])
-        self.assertEqual(trace, ["submit"] * 3 + ["record", "wait"])
-        batches.clear()
-        trace.clear()
-        storage._ops.kvcache_store_v2.side_effect = capture_sizes
-        storage.put_ranges(mixed, max_ranges=2)
-        self.assertEqual(batches, [[16, 8], [16, 8], [8]])
-        self.assertEqual(trace, ["submit"] * 3 + ["record", "wait"])
-        storage._ops.kvcache_load_v2.side_effect = load
-        trace.clear()
-        for operation in (storage.get_ranges, storage.put_ranges):
-            for invalid in (
-                OceanDiskRange(7, 2000, 8, 16),
-                OceanDiskRange(7, 1000, 8, -1),
-            ):
-                with self.assertRaises(ValueError):
-                    operation([*ranges[:2], invalid], max_ranges=2)
-                self.assertEqual(trace, [])
-
-        linker = OceanDiskDirectLinker.__new__(OceanDiskDirectLinker)
-        linker.pools = {PoolName.KV: Mock()}
-        linker.pools[PoolName.KV].prepare_locations.return_value = [0]
-        linker.num_layers = 2
-        linker.max_ranges = 2
-        linker.storage = storage
-        linker._page_fragments = lambda *args: ranges
-        linker.layer_done_counter = Mock()
-        linker.layer_done_counter.complete.side_effect = lambda *args: trace.append(
-            "ready"
+        self.od_utils = SimpleNamespace(
+            batch_dispatch_get=Mock(
+                side_effect=lambda *args: trace.append(("dispatch", args[0].values))
+            ),
+            batch_dispatch_put=Mock(
+                side_effect=lambda *args: trace.append(("put", args[0].values))
+            ),
         )
-        trace.clear()
-        linker._run_transfers(
-            [SimpleNamespace(name=PoolName.KV, host_indices=[0], keys=["p0"])],
-            write=False,
-            counter_index=0,
+        modules = patch.dict("sys.modules", {"od_utils": self.od_utils})
+        modules.start()
+        self.addCleanup(modules.stop)
+        return storage, trace, events
+
+    @staticmethod
+    def layer_ranges(pages, layer=0):
+        return [
+            OceanDiskRange(page + 1, 1000 + layer * 256 + page * 16, 16, layer * 512)
+            for page in range(pages)
+        ] + [
+            OceanDiskRange(page + 1, 10000 + layer * 256 + page * 8, 8, layer * 256)
+            for page in range(pages)
+        ]
+
+    def test_get_submits_all_layers_before_waiting(self):
+        storage, trace, events = self.make_storage()
+        ready = []
+        layers = [self.layer_ranges(2, layer) for layer in range(3)]
+        storage.get_layers(
+            layers,
+            max_ranges=8,
+            on_layer_ready=lambda layer: (
+                ready.append(layer),
+                trace.append(("ready", layer)),
+            ),
         )
-        self.assertEqual(trace, ["submit", "submit", "record", "wait", "ready"] * 2)
-        storage.io_alignment = 512
-        trace.clear()
-        with self.assertRaisesRegex(ValueError, "align"):
-            storage.get_ranges(ranges, max_ranges=2)
-        self.assertEqual(trace, [])
-        storage.io_alignment = 1
-        storage._ops.kvcache_load_v2.side_effect = lambda *_: -1
-        with self.assertRaisesRegex(RuntimeError, "status"):
-            storage.get_ranges(ranges, max_ranges=2)
+        self.od_utils.batch_dispatch_get.assert_called_once()
+        args = self.od_utils.batch_dispatch_get.call_args.args
+        self.assertEqual(args[0].shape, (3, 25))
+        self.assertEqual(args[1], 25)
+        self.assertEqual(args[4], [1, 2, 3])
+        self.assertEqual(args[5:], (123, 0, 0, 3, True, False))
+        for row in args[0].values:
+            self.assertEqual(row[1:5], [0, 0, 1, 1])
+            self.assertEqual(row[5:9], [1, 2, 1, 2])
+            self.assertEqual(row[17:21], [16, 16, 8, 8])
+            self.assertEqual(row[21:25], [5, 2, 5, 2])
+        self.assertEqual(ready, [0, 1, 2])
+        self.assertEqual(
+            [kind for kind, _ in trace],
+            ["record"] * 3
+            + ["dispatch", "wait", "ready", "wait", "ready", "wait", "ready"],
+        )
+        storage._ops.kvcache_load_v2.assert_not_called()
+
+    def test_get_chunks_keep_pairs_and_wait_for_every_batch(self):
+        storage, trace, events = self.make_storage()
+        ready = []
+        layers = [self.layer_ranges(5, layer) for layer in range(2)]
+        storage.get_layers(
+            layers,
+            max_ranges=5,
+            on_layer_ready=lambda layer: (
+                ready.append(layer),
+                trace.append(("ready", layer)),
+            ),
+        )
+        calls = self.od_utils.batch_dispatch_get.call_args_list
+        self.assertEqual(
+            [call.args[0].shape for call in calls], [(2, 25), (2, 25), (2, 13)]
+        )
+        task_ids = []
+        for call in calls:
+            for row in call.args[0].values:
+                task_ids.append(row[0])
+                count = (len(row) - 1) // 6
+                half = count // 2
+                self.assertEqual(row[1 : 1 + half], [0] * half)
+                self.assertEqual(row[1 + half : 1 + count], [1] * half)
+                keys = row[1 + count : 1 + 2 * count]
+                self.assertEqual(keys[:half], keys[half:])
+        self.assertEqual(len(task_ids), len(set(task_ids)))
+        first_wait = next(i for i, event in enumerate(trace) if event[0] == "wait")
+        self.assertEqual(sum(event[0] == "dispatch" for event in trace[:first_wait]), 3)
+        self.assertEqual(
+            [event for event in trace if event[0] in ("wait", "ready")],
+            [
+                ("wait", 1),
+                ("wait", 3),
+                ("wait", 5),
+                ("ready", 0),
+                ("wait", 2),
+                ("wait", 4),
+                ("wait", 6),
+                ("ready", 1),
+            ],
+        )
+
+    def test_put_submits_all_layers_and_preserves_pairs_when_chunked(self):
+        storage, trace, _ = self.make_storage()
+        layers = [self.layer_ranges(3, layer) for layer in range(2)]
+        storage.put_layers(layers, max_ranges=4)
+        calls = self.od_utils.batch_dispatch_put.call_args_list
+        self.assertEqual([c.args[0].shape for c in calls], [(2, 25), (2, 13)])
+        for call in calls:
+            args = call.args
+            width = args[0].shape[1]
+            self.assertEqual(args[1].values, [width, width])
+            self.assertEqual(args[2].values, [0, 1])
+            self.assertEqual(args[5:], ([], 123, 0, 0, 2, False, False))
+            for row in args[0].values:
+                count = (len(row) - 1) // 6
+                keys = row[1 + count : 1 + count * 2]
+                self.assertEqual(keys[: count // 2], keys[count // 2 :])
+        self.assertEqual(calls[0].args[0].values[0][17:21], [16, 16, 8, 8])
+        self.assertEqual([kind for kind, _ in trace], ["put", "put", "record", "wait"])
+        storage._ops.kvcache_store_v2.assert_not_called()
+
+    def test_put_dispatch_error_drains_submitted_work(self):
+        storage, _, _ = self.make_storage()
+        self.od_utils.batch_dispatch_put.side_effect = [
+            None,
+            RuntimeError("put failed"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "put failed"):
+            storage.put_layers([self.layer_ranges(3)], max_ranges=4)
         storage._stream.synchronize.assert_called_once()
 
-    def test_descriptor_uses_registration_relative_offsets_and_stable_routing(self):
-        regions = [(1000, 128), (5000, 256)]
-        ranges = [OceanDiskRange(7, 1032, 16, 64), OceanDiskRange(8, 5040, 24, 128)]
+    def test_put_submits_all_layers_in_one_call(self):
+        storage, trace, _ = self.make_storage()
+        storage.put_layers([self.layer_ranges(2, layer) for layer in range(3)])
+        self.od_utils.batch_dispatch_put.assert_called_once()
         self.assertEqual(
-            pack_io(11, ranges, regions, (2, 5)),
-            [11, 0, 1, 7, 8, 32, 40, 64, 128, 16, 24, 5, 2],
+            self.od_utils.batch_dispatch_put.call_args.args[0].shape, (3, 25)
         )
+        self.assertEqual([kind for kind, _ in trace], ["put", "record", "wait"])
+
+    def test_get_rejects_invalid_layers_before_dispatch(self):
+        storage, _, _ = self.make_storage()
+        for limit in (0, 1, True, 409601):
+            with self.assertRaises(ValueError):
+                storage.get_layers([self.layer_ranges(1)], max_ranges=limit)
+        for layers in (
+            [self.layer_ranges(1), self.layer_ranges(2)],
+            [self.layer_ranges(1)[:1]],
+            [
+                self.layer_ranges(1)
+                + [OceanDiskRange(8, 99999, 16), OceanDiskRange(8, 10000, 8)]
+            ],
+        ):
+            with self.assertRaises(ValueError):
+                storage.get_layers(layers)
+        self.od_utils.batch_dispatch_get.assert_not_called()
+        storage.io_alignment = 512
+        with self.assertRaisesRegex(ValueError, "align"):
+            storage.get_layers([self.layer_ranges(1)])
+        self.od_utils.batch_dispatch_get.assert_not_called()
+
+    def test_get_error_drains_before_releasing_metadata(self):
+        storage, _, _ = self.make_storage()
+        ready = Mock()
+        self.od_utils.batch_dispatch_get.side_effect = [
+            None,
+            RuntimeError("dispatch failed"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+            storage.get_layers(
+                [self.layer_ranges(2), self.layer_ranges(2, 1)],
+                max_ranges=2,
+                on_layer_ready=ready,
+            )
+        ready.assert_not_called()
+        storage._stream.synchronize.assert_called_once()
+
+    def test_descriptor_uses_paired_keys_and_registration_offsets(self):
+        ranges = [
+            OceanDiskRange(7, 1032, 16, 64),
+            OceanDiskRange(8, 1048, 24, 128),
+            OceanDiskRange(7, 5040, 8, 32),
+            OceanDiskRange(8, 5048, 12, 64),
+        ]
+        row = pack_io(11, ranges, [(1000, 128), (5000, 256)], (2, 5))
+        self.assertEqual(
+            row,
+            [
+                11,
+                0,
+                0,
+                1,
+                1,
+                7,
+                8,
+                7,
+                8,
+                32,
+                48,
+                40,
+                48,
+                64,
+                128,
+                32,
+                64,
+                16,
+                24,
+                8,
+                12,
+                5,
+                2,
+                5,
+                2,
+            ],
+        )
+        for bad in (
+            ranges[:3],
+            [ranges[0], ranges[3]],
+            [ranges[0], OceanDiskRange(7, 5040, 8, -1)],
+        ):
+            with self.assertRaises(ValueError):
+                pack_io(1, bad, [(1000, 128), (5000, 256)], (0,))
         for ptr, size in ((999, 1), (1120, 16), (1000, 0)):
             with self.assertRaises(ValueError):
-                resolve_mr(regions, ptr, size)
-        with self.assertRaisesRegex(ValueError, "nonnegative"):
-            pack_io(1, [OceanDiskRange(7, 1032, 16, -1)], regions, (0,))
+                resolve_mr([(1000, 128)], ptr, size)
 
     def test_key_and_native_status_codes(self):
         self.assertEqual(encode_key(("model", "page")), encode_key(("model", "page")))
@@ -290,9 +449,8 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker.pool_group = DevicePoolGroup(entries, 2, 2, rank_replicated=True)
         linker.pools = linker.pool_group.entry_map
         linker.num_layers = 2
-        linker.io_alignment = 1  # Synthetic layout with 6/10-byte fragments.
         linker._namespace = ("sglang-oceandisk-pool-pages", "test-model", 2, 1)
-        linker._build_object_layouts()
+        linker._validate_dsa_layout()
         linker._closed = False
         linker.storage = Mock()
         linker.max_ranges = 3
@@ -300,12 +458,6 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker.pending_loads = {}
         linker.offload_results = Queue()
         return linker
-
-    def test_unaligned_layout_fails_before_gpu_registration(self):
-        linker = self.make_linker()
-        linker.io_alignment = 512
-        with self.assertRaisesRegex(ValueError, "staging/packing"):
-            linker._build_object_layouts()
 
     def test_fragment_keys_do_not_depend_on_gpu_slots(self):
         linker = self.make_linker()
@@ -316,7 +468,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertEqual([r.size for r in first], [6, 6])
         other_pool = linker._page_fragments(PoolName.INDEXER, ["p0"], [0], 0)
         other_layer = linker._page_fragments(PoolName.KV, ["p0"], [0], 1)
-        self.assertNotEqual(first[0].key, other_pool[0].key)
+        self.assertEqual(first[0].key, other_pool[0].key)
         self.assertEqual(first[0].key, other_layer[0].key)
         self.assertEqual([r.storage_offset for r in first], [0, 0])
         self.assertEqual([r.storage_offset for r in other_layer], [6])
@@ -329,61 +481,93 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertEqual([r.storage_offset for r in first], [0, 12])
         self.assertEqual([r.storage_offset for r in second], [6, 22])
 
-    def test_keys_use_namespace_pool_and_page_without_layout_fingerprinting(self):
+    def test_keys_share_dsa_namespaces_without_layout_fingerprinting(self):
         linker = self.make_linker()
         other_layout = self.make_linker(multi_component=True)
-        key = linker._object_key(PoolName.KV, "p0")
-        self.assertEqual(key, other_layout._object_key(PoolName.KV, "p0"))
-        linker._build_object_layouts()
-        self.assertEqual(key, linker._object_key(PoolName.KV, "p0"))
-        self.assertNotEqual(key, linker._object_key(PoolName.INDEXER, "p0"))
-        self.assertNotEqual(key, linker._object_key(PoolName.KV, "p1"))
+        key = linker._object_key("p0")
+        self.assertEqual(key, other_layout._object_key("p0"))
+        linker._validate_dsa_layout()
+        self.assertEqual(key, linker._object_key("p0"))
+        self.assertNotEqual(key, linker._object_key("p1"))
         linker._namespace = (*linker._namespace, "other-model")
-        self.assertNotEqual(key, linker._object_key(PoolName.KV, "p0"))
+        self.assertNotEqual(key, linker._object_key("p0"))
 
     def test_unpacked_layout_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "packed=True"):
             self.make_linker(packed=False)
 
-    def test_draft_mapping_uses_physical_buffer_offsets(self):
+    def test_nonuniform_draft_io_counts_are_rejected(self):
         linker = self.make_linker()
-        entry = linker.pools[PoolName.KV]
-        linker.pools[PoolName.KV] = DevicePoolEntry(
-            name=PoolName.KV,
-            indices_from_pool=PoolName.KV,
-            device_pool=None,
-            components=[
-                entry.components[0] + [torch.zeros((16, 3), dtype=torch.uint8)]
-            ],
-            layer_mapping={0: (0, 2), 1: 1},
-            page_size=2,
-            rows_are_pages=False,
+        for entry in linker.pools.values():
+            entry.layer_mapping = {0: (0, 1), 1: 1}
+        with self.assertRaises(ValueError):
+            linker._validate_dsa_layout()
+
+    def test_load_submits_all_layers_with_kv_then_indexer_across_requests(self):
+        linker = self.make_linker()
+        transfers = []
+        for key, slots in (("p0", [0, 1]), ("p1", [2, 3])):
+            transfers.extend(
+                linker.pool_group.resolve_transfers(
+                    [
+                        PoolTransfer(
+                            name=PoolName.KV,
+                            keys=[key],
+                            device_indices=torch.tensor(slots),
+                        )
+                    ]
+                )
+            )
+        calls = []
+
+        def load(layers, *, max_ranges, on_layer_ready):
+            calls.append("load")
+            self.assertEqual(max_ranges, 3)
+            self.assertEqual(
+                [[r.storage_offset for r in ranges] for ranges in layers],
+                [[0, 0, 0, 0], [6, 6, 10, 10]],
+            )
+            for ranges in layers:
+                self.assertEqual(
+                    [r.key for r in ranges[:2]], [r.key for r in ranges[2:]]
+                )
+                self.assertEqual([r.size for r in ranges], [6, 6, 10, 10])
+            for layer in range(len(layers)):
+                on_layer_ready(layer)
+
+        linker.storage.get_layers.side_effect = load
+        linker.layer_done_counter.complete = lambda index, layer: calls.append(
+            (index, layer)
         )
-        linker._build_object_layouts()
-        first = linker._page_fragments(PoolName.KV, ["p0"], [0], 0)
-        second = linker._page_fragments(PoolName.KV, ["p0"], [0], 1)
-        self.assertEqual([r.storage_offset for r in first], [0, 12])
-        self.assertEqual([r.storage_offset for r in second], [6])
+        linker._run_transfers(transfers, write=False, counter_index=7)
+        self.assertEqual(calls, ["load", (7, 0), (7, 1)])
+        linker.storage.get_layers.assert_called_once()
+        linker.storage.put_layers.assert_not_called()
+        linker._run_transfers(transfers, write=True)
+        linker.storage.put_layers.assert_called_once()
+        written = linker.storage.put_layers.call_args.args[0]
+        self.assertEqual(len(written), 2)
+        self.assertEqual([len(layer) for layer in written], [4, 4])
 
-    def test_changed_or_overlapping_offsets_are_rejected(self):
+    def test_real_storage_events_resolve_linker_futures_in_layer_order(self):
         linker = self.make_linker()
-        entry = linker.pools[PoolName.KV]
-        original = entry.get_prepared_layer_range_meta
+        storage, trace, _ = TestOceanDiskStorage.make_storage(self)
+        storage.regions = [
+            (base, 16 * stride)
+            for entry in linker.pools.values()
+            for component in entry.buffer_meta
+            for base, stride, _ in component
+        ]
+        linker.storage = storage
+        index = linker.layer_done_counter.update_producer()
+        complete = linker.layer_done_counter.complete
 
-        def changed(locations, layer):
-            ptrs, sizes, offsets = original(locations, layer)
-            return ptrs, sizes, [[offset + 1 for offset in group] for group in offsets]
+        def ready(batch, layer):
+            self.assertEqual(trace[-1][0], "wait")
+            complete(batch, layer)
+            trace.append(("complete", layer))
 
-        entry.get_prepared_layer_range_meta = changed
-        with self.assertRaisesRegex(ValueError, "registered object layout"):
-            linker._page_fragments(PoolName.KV, ["p0"], [0], 0)
-        entry.get_prepared_layer_range_meta = original
-        entry.layer_mapping = {0: 0, 1: 0}
-        with self.assertRaisesRegex(ValueError, "overlapping"):
-            linker._build_object_layouts()
-
-    def test_layer_batches_all_pools_before_counter_completion(self):
-        linker = self.make_linker()
+        linker.layer_done_counter.complete = ready
         transfers = linker.pool_group.resolve_transfers(
             [
                 PoolTransfer(
@@ -391,20 +575,19 @@ class TestOceanDiskDirectLinker(CustomTestCase):
                 )
             ]
         )
-        calls = []
-        linker.storage.get_ranges.side_effect = lambda ranges, **kw: calls.append(
-            ("get", len(ranges), [r.storage_offset for r in ranges], kw)
+        linker._run_transfers(transfers, write=False, counter_index=index)
+        self.od_utils.batch_dispatch_get.assert_called_once()
+        rows = self.od_utils.batch_dispatch_get.call_args.args[0].values
+        self.assertEqual([row[1:3] for row in rows], [[0, 2], [1, 3]])
+        self.assertEqual(
+            [event for event in trace if event[0] in ("wait", "complete")],
+            [("wait", 1), ("complete", 0), ("wait", 2), ("complete", 1)],
         )
-        linker.layer_done_counter.complete = lambda index, layer: calls.append(
-            ("complete", index, layer)
+        self.assertTrue(
+            all(future.done() for future in linker.layer_done_counter.futures[index])
         )
-        linker._run_transfers(transfers, write=False, counter_index=7)
-        self.assertEqual([c[0] for c in calls], ["get", "complete", "get", "complete"])
-        self.assertEqual(calls[0][1], 2)
-        self.assertEqual(calls[0][3], {"max_ranges": 3})
-        self.assertEqual(calls[2][2], [6, 10])
 
-    def test_lookup_requires_indexer_and_checks_holes(self):
+    def test_lookup_probes_shared_dsa_keys_and_checks_holes(self):
         linker = self.make_linker()
         missing = linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 1)[0].key
         linker.storage.exists_many.side_effect = lambda keys: [
@@ -415,48 +598,22 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker.storage.exists_many.side_effect = lambda keys: [True] * len(keys)
         self.assertEqual(linker.lookup("req", transfers), [1, 2, 3])
 
-    def test_window_policy_returns_sparse_boundaries(self):
+    def test_owner_ack_and_duplicate_load(self):
         linker = self.make_linker()
-        # Exercise trailing policy without relying on a particular model's SWA pool.
-        transfers = [
-            PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2", "p3"]),
-            PoolTransfer(
-                name=PoolName.INDEXER,
-                keys=["p2", "p3"],
-                hit_policy=PoolHitPolicy.TRAILING_PAGES,
-            ),
-        ]
-        missing = linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 0)[0].key
-        linker.storage.exists_many.side_effect = lambda keys: [
-            k != missing for k in keys
-        ]
-        # Preserve test-supplied policy rather than KV-derived sidecar ALL_PAGES.
-        linker.pool_group.resolve_transfers = lambda value: value
-        self.assertEqual(linker.lookup("req", transfers), [1, 4])
-
-    def test_owner_ack_and_partial_load(self):
-        linker = self.make_linker(independent_side_pool=True)
         transfer = PoolTransfer(
-            name=PoolName.SWA, keys=["p0"], device_indices=torch.tensor([2, 3])
+            name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([2, 3])
         )
         self.assertTrue(linker.load("req", [transfer]))
-        self.assertEqual(linker.pending_loads["req"][0].name, PoolName.SWA)
+        self.assertEqual(
+            {t.name for t in linker.pending_loads["req"]},
+            {PoolName.KV, PoolName.INDEXER},
+        )
         with self.assertRaisesRegex(RuntimeError, "already queued"):
             linker.load("req", [transfer])
         self.assertFalse(linker.cancel_queued_load("req"))
         linker.offload_owner = False
         linker._ready_event = Mock(side_effect=AssertionError("non-owner wrote"))
-        self.assertTrue(
-            linker.offload(
-                [
-                    PoolTransfer(
-                        name=PoolName.KV,
-                        keys=["p0"],
-                        device_indices=torch.tensor([2, 3]),
-                    )
-                ]
-            )
-        )
+        self.assertTrue(linker.offload([transfer]))
         self.assertTrue(linker.pop_completed_offload())
 
     def test_dsa_indexer_is_derived_from_logical_kv(self):
@@ -476,7 +633,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
 
     def test_page_key_location_mismatch_is_rejected(self):
         linker = self.make_linker()
-        with self.assertRaisesRegex(ValueError, "equal length"):
+        with self.assertRaises(ValueError):
             linker._page_fragments(PoolName.KV, ["p0", "p1"], [0], 0)
 
     def test_load_failure_resolves_counter_and_releases_completion(self):

@@ -10,14 +10,7 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-/home/models/GLM-5.2-W4AFP8/}"
 DATASET_PATH="${DATASET_PATH:-/home/z00591349/dataset/multifieldqa_zh.jsonl}"
 OPEXTENSION="${OPEXTENSION:-/opt/oceandisk/libop_extension.so}"
-LIBGIDS="${LIBGIDS:-/opt/oceandisk/libgids_kv_host.so}"
-GIDS_DIR="${GIDS_DIR:-/opt/oceandisk/config/}"
-GIDS_LOCAL_IP="${GIDS_LOCAL_IP:-}"       # 本机 RDMA/RoCE 网卡 IP
-GIDS_SERVER_IP="${GIDS_SERVER_IP:-}"     # 存储服务端 IP
-GIDS_SERVER_PORT="${GIDS_SERVER_PORT:-4420}"
-GIDS_GID_INDEX="${GIDS_GID_INDEX:-}"
-GIDS_ROCE_PORT="${GIDS_ROCE_PORT:-1}"
-GIDS_QP_COUNT="${GIDS_QP_COUNT:-}" # 每个 IP 的 QP 数量
+GIDS_CONFIG="${GIDS_CONFIG:-/opt/oceandisk/config/gids_config.txt}"
 
 mode=base
 if [[ "${1:-}" == base || "${1:-}" == oceandisk ]]; then
@@ -26,17 +19,13 @@ if [[ "${1:-}" == base || "${1:-}" == oceandisk ]]; then
 fi
 linker_args=()
 if [[ "$mode" == oceandisk ]]; then
-    : "${GIDS_LOCAL_IP:?请在脚本顶部填写本机 RDMA/RoCE IP}"
-    : "${GIDS_SERVER_IP:?请在脚本顶部填写存储服务端 IP}"
-    : "${GIDS_GID_INDEX:?请填写本机网卡 GID index}"
-    : "${GIDS_QP_COUNT:?请填写每个 IP 的 QP 数量}"
-    mkdir -p -- "$GIDS_DIR"
-    printf 'ip_config = %s, %s, %s, %s, %s, %s\n' \
-        "$GIDS_LOCAL_IP" "$GIDS_SERVER_IP" "$GIDS_SERVER_PORT" \
-        "$GIDS_GID_INDEX" "$GIDS_ROCE_PORT" "$GIDS_QP_COUNT" \
-        > "${GIDS_DIR%/}/gids_config.txt"
+    if [[ "$(basename -- "$GIDS_CONFIG")" != gids_config.txt ]]; then
+        printf 'GIDS_CONFIG must point to a file named gids_config.txt\n' >&2
+        exit 1
+    fi
+    GIDS_DIR="$(cd -- "$(dirname -- "$GIDS_CONFIG")" && pwd)/"
     export USE_SINGLE_PORT=1
-    export OPEXTENSION LIBGIDS GIDS_DIR
+    export OPEXTENSION GIDS_DIR
     linker_args=(
         --enable-unified-cache-external-linker
         --unified-cache-external-linker-backend oceandisk
