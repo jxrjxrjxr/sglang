@@ -26,6 +26,7 @@ if [[ "$mode" == oceandisk ]]; then
     GIDS_DIR="$(cd -- "$(dirname -- "$GIDS_CONFIG")" && pwd)/"
     export USE_SINGLE_PORT=1
     export OPEXTENSION GIDS_DIR
+    export PYTHONPATH="$(dirname -- "$OPEXTENSION")${PYTHONPATH:+:${PYTHONPATH}}"
     linker_args=(
         --enable-unified-cache-external-linker
         --unified-cache-external-linker-backend oceandisk
@@ -41,15 +42,12 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP="${SGLANG_JIT_DEEPGEMM_FAST_WARMUP:-1}"
 export SGLANG_DG_USE_NVRTC="${SGLANG_DG_USE_NVRTC:-1}"
-export SGLANG_ENABLE_UNIFIED_RADIX_TREE=1
-export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND="${SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND:-rust}"
 
 exec "${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_offline_tp8.py" \
     --model-path "${MODEL_PATH}" \
     --dataset-path "${DATASET_PATH}" \
     --context-length 8000 \
     --tp-size 8 \
-    --disaggregation-mode null \
     --trust-remote-code \
     --page-size 64 \
     --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 32}' \
@@ -59,6 +57,5 @@ exec "${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_offline_tp8.py" \
     --disable-prefill-cuda-graph \
     --mem-fraction-static 0.85 \
     --max-total-tokens 12000 \
-    --max-running-requests 1 \
     "${linker_args[@]}" \
     "$@"
