@@ -99,6 +99,12 @@ def main():
     print(f"SGLang path: {sgl.__file__}", flush=True)
     print(f"Model:       {args.model_path}", flush=True)
     print(f"Dataset:     {args.dataset_path}", flush=True)
+    print(
+        f"External Linker: enabled={args.enable_unified_cache_external_linker}; "
+        f"backend={args.unified_cache_external_linker_backend}; "
+        f"trace={os.getenv('SGLANG_OCEANDISK_TRACE', '0')}",
+        flush=True,
+    )
     with args.dataset_path.open(encoding="utf-8") as dataset:
         first_line = dataset.readline()
     if not first_line.strip():

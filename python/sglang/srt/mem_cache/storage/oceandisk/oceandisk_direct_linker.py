@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskRange,
     OceanDiskStorage,
     encode_key,
+    trace_event,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_model
@@ -160,6 +161,16 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self.offload_owner,
             list(self.pools),
         )
+        trace_event(
+            "LINKER_INIT",
+            source=__file__,
+            linker=type(self).__name__,
+            storage=type(self.storage).__name__,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            offload_owner=self.offload_owner,
+            layers=self.num_layers,
+        )
 
     def _validate_dsa_layout(self) -> None:
         if set(self.pools) != {PoolName.KV, PoolName.INDEXER}:
@@ -232,8 +243,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
-        bitmap = self.storage.exists_many([self._object_key(key) for key in kv.keys])
+        keys = [self._object_key(key) for key in kv.keys]
+        bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
+        trace_event(
+            "LOOKUP", rid=rid, pages=len(keys), prefix_pages=end, first_key=keys[0]
+        )
         return list(range(1, end + 1))
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -246,6 +261,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"OceanDisk load already queued for {rid!r}.")
         self.pending_loads[rid] = expanded
+        trace_event(
+            "LOAD_QUEUED",
+            rid=rid,
+            pools=[str(t.name) for t in expanded],
+            pages=[len(t.keys) for t in expanded],
+        )
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
@@ -266,6 +287,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         index = self.layer_done_counter.update_producer()
         pending, self.pending_loads = self.pending_loads, {}
         self.load_queue.put((index, pending, event))
+        trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
     def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
@@ -316,6 +338,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                             write=False,
                             counter_index=index,
                         )
+                        trace_event("LOAD_DONE", counter=index, rids=list(pending))
                     except BaseException as error:
                         self.layer_done_counter.fail(index, error)
                         logger.exception("OceanDisk load batch failed")
@@ -337,8 +360,14 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return False
         if not self.offload_owner:
             self.offload_results.put(True)
+            trace_event("OFFLOAD_SKIPPED", reason="non_owner_rank")
         else:
             self.offload_queue.put((expanded, self._ready_event()))
+            trace_event(
+                "OFFLOAD_QUEUED",
+                pages=[len(t.keys) for t in expanded],
+                pools=[str(t.name) for t in expanded],
+            )
         return True
 
     def _offload_worker(self) -> None:
@@ -352,11 +381,16 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     success = False
                     try:
                         event.synchronize()
+                        trace_event(
+                            "OFFLOAD_BEGIN",
+                            first_key=self._object_key(transfers[0].keys[0]),
+                        )
                         self._run_transfers(transfers, write=True)
                         success = True
                     except BaseException:
                         logger.exception("OceanDisk offload failed")
                     self.offload_results.put(success)
+                    trace_event("OFFLOAD_DONE", worker_no_exception=success)
                 finally:
                     self.offload_queue.task_done()
 

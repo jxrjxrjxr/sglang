@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import logging
 import os
 import threading
 from dataclasses import dataclass
@@ -19,6 +20,42 @@ if TYPE_CHECKING:
 
 MAX_GIDS_CONNECTIONS = 8  # od/gids_kernel.cu: MAX_CONN_NUM
 MAX_GIDS_RANGES = 409600  # od/gids_kernel.cu: MAX_BLOCK_NUM
+logger = logging.getLogger(__name__)
+
+
+def trace_event(event, **details):
+    if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
+        logger.info(
+            "[OceanDisk trace] event=%s pid=%d %s",
+            event,
+            os.getpid(),
+            json.dumps(details, default=str, ensure_ascii=True),
+        )
+
+
+def trace_batch(event, batch, index, total, native_module):
+    if os.environ.get("SGLANG_OCEANDISK_TRACE") != "1":
+        return
+    row = batch[0]
+    count = (len(row) - 1) // 6
+    samples = {}
+    for name, position in (("kv", 0), ("indexer", count // 2)):
+        samples[name] = {
+            field: row[1 + column * count + position]
+            for column, field in enumerate(
+                ("mr", "key", "local_offset", "remote_offset", "bytes", "connection")
+            )
+        }
+    trace_event(
+        event,
+        batch=index + 1,
+        batches=total,
+        layers=len(batch),
+        io_per_layer=count,
+        first_task_id=row[0],
+        native_source=getattr(native_module, "__file__", "unknown"),
+        first_layer_samples=samples,
+    )
 
 
 def gids_config_path(config_dir, device_index: int, use_single_port=None) -> Path:
@@ -250,6 +287,16 @@ class OceanDiskStorage(HiCacheStorage):
                 finally:
                     self._stream.synchronize()
             self._check_status(status, "init")
+            trace_event(
+                "STORAGE_INIT",
+                source=__file__,
+                device=str(self.device),
+                op_extension=os.fspath(library),
+                config_path=str(config_path),
+                connections=self.connection_indices,
+                registered_regions=len(self.regions),
+                staging_bytes=staging_bytes,
+            )
 
     @staticmethod
     def _check_status(status, operation: str) -> None:
@@ -359,6 +406,9 @@ class OceanDiskStorage(HiCacheStorage):
             descriptors = self._pack_layer_batches(layers, max_ranges)
             submitted = []
             staged = self._staging is not None
+            trace_event(
+                "GET_BEGIN", layers=len(layers), batches=len(descriptors), staged=staged
+            )
             try:
                 for batch_index, batch in enumerate(descriptors):
                     if staged:
@@ -369,6 +419,13 @@ class OceanDiskStorage(HiCacheStorage):
                     for event in events:
                         event.record(self._stream)
                     submitted.append((cpu, gpu, events))
+                    trace_batch(
+                        "NATIVE_GET_CALL",
+                        batch,
+                        batch_index,
+                        len(descriptors),
+                        od_utils,
+                    )
                     od_utils.batch_dispatch_get(
                         gpu,
                         gpu.shape[1],
@@ -390,6 +447,15 @@ class OceanDiskStorage(HiCacheStorage):
                             restored = torch.cuda.Event()
                             restored.record(self._stream)
                             restored.synchronize()
+                            if batch_index == len(descriptors) - 1 and layer in (
+                                0,
+                                len(layers) - 1,
+                            ):
+                                trace_event(
+                                    "GET_LAYER_READY",
+                                    layer=layer,
+                                    copied_fragments=len(copies[layer]),
+                                )
                             if batch_index == len(descriptors) - 1 and on_layer_ready:
                                 on_layer_ready(layer)
                         submitted.clear()
@@ -397,8 +463,17 @@ class OceanDiskStorage(HiCacheStorage):
                     for layer in range(len(layers)):
                         for _, _, events in submitted:
                             events[layer].synchronize()
+                        if layer in (0, len(layers) - 1):
+                            trace_event(
+                                "GET_LAYER_READY", layer=layer, copied_fragments=0
+                            )
                         if on_layer_ready is not None:
                             on_layer_ready(layer)
+                trace_event(
+                    "GET_DONE",
+                    layers=len(layers),
+                    meaning="events_and_copyback_finished",
+                )
             except BaseException:
                 self._stream.synchronize()
                 raise
@@ -415,8 +490,14 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             descriptors = self._pack_layer_batches(layers, max_ranges)
             submitted = []
+            trace_event(
+                "PUT_BEGIN",
+                layers=len(layers),
+                batches=len(descriptors),
+                staged=self._staging is not None,
+            )
             try:
-                for batch in descriptors:
+                for batch_index, batch in enumerate(descriptors):
                     if self._staging is not None:
                         batch, _ = self._stage_batch(batch, write=True)
                     cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
@@ -428,7 +509,14 @@ class OceanDiskStorage(HiCacheStorage):
                         list(range(len(batch))), dtype=torch.int64, device="cpu"
                     )
                     submitted.append((cpu, gpu, lengths, indices))
-                    od_utils.batch_dispatch_put(
+                    trace_batch(
+                        "NATIVE_PUT_CALL",
+                        batch,
+                        batch_index,
+                        len(descriptors),
+                        od_utils,
+                    )
+                    result = od_utils.batch_dispatch_put(
                         gpu,
                         lengths,
                         indices,
@@ -442,6 +530,12 @@ class OceanDiskStorage(HiCacheStorage):
                         False,
                         False,
                     )
+                    trace_event(
+                        "NATIVE_PUT_RETURN",
+                        batch=batch_index + 1,
+                        result=result,
+                        per_io_status_checked=False,
+                    )
                     if self._staging is not None:
                         event = torch.cuda.Event()
                         event.record(self._stream)
@@ -451,6 +545,12 @@ class OceanDiskStorage(HiCacheStorage):
                     event = torch.cuda.Event()
                     event.record(self._stream)
                     event.synchronize()
+                trace_event(
+                    "PUT_DONE",
+                    layers=len(layers),
+                    meaning="cuda_event_finished",
+                    per_io_status_checked=False,
+                )
             except BaseException:
                 self._stream.synchronize()
                 raise

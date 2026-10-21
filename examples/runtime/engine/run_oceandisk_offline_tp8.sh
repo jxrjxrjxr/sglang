@@ -6,6 +6,10 @@ set -euo pipefail
 # bash examples/runtime/engine/run_oceandisk_offline_tp8.sh base
 # bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk
 
+# bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk \
+#   2>&1 | tee oceandisk_trace.log
+
+
 # Edit these paths for your machine.
 MODEL_PATH="${MODEL_PATH:-/home/models/GLM-5.2-W4AFP8/}"
 DATASET_PATH="${DATASET_PATH:-/home/z00591349/dataset/multifieldqa_zh.jsonl}"
@@ -26,6 +30,7 @@ if [[ "$mode" == oceandisk ]]; then
     GIDS_DIR="$(cd -- "$(dirname -- "$GIDS_CONFIG")" && pwd)/"
     export USE_SINGLE_PORT=1
     export OPEXTENSION GIDS_DIR
+    export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-1}"
     export PYTHONPATH="$(dirname -- "$OPEXTENSION")${PYTHONPATH:+:${PYTHONPATH}}"
     linker_args=(
         --enable-unified-cache-external-linker
