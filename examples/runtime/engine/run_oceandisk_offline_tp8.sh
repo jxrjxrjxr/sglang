@@ -8,6 +8,9 @@ set -euo pipefail
 
 # bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk \
 #   2>&1 | tee oceandisk_trace.log
+# 每张 GPU 使用独立配置：目录内放 gids_config_0.txt ... gids_config_7.txt
+# USE_SINGLE_PORT=0 GIDS_DIR=/path/to/config \
+#   bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk
 
 
 # Edit these paths for your machine.
@@ -23,13 +26,25 @@ if [[ "${1:-}" == base || "${1:-}" == oceandisk ]]; then
 fi
 linker_args=()
 if [[ "$mode" == oceandisk ]]; then
-    if [[ "$(basename -- "$GIDS_CONFIG")" != gids_config.txt ]]; then
-        printf 'GIDS_CONFIG must point to a file named gids_config.txt\n' >&2
-        exit 1
-    fi
-    GIDS_DIR="$(cd -- "$(dirname -- "$GIDS_CONFIG")" && pwd)/"
-    export USE_SINGLE_PORT=1
-    export OPEXTENSION GIDS_DIR
+    USE_SINGLE_PORT="${USE_SINGLE_PORT:-1}"
+    case "$USE_SINGLE_PORT" in
+        1)
+            if [[ "$(basename -- "$GIDS_CONFIG")" != gids_config.txt ]]; then
+                printf 'GIDS_CONFIG must point to a file named gids_config.txt\n' >&2
+                exit 1
+            fi
+            GIDS_DIR="$(cd -- "$(dirname -- "$GIDS_CONFIG")" && pwd)/"
+            ;;
+        0)
+            GIDS_DIR="${GIDS_DIR:-$(dirname -- "$GIDS_CONFIG")}"
+            GIDS_DIR="$(cd -- "$GIDS_DIR" && pwd)/"
+            ;;
+        *)
+            printf 'USE_SINGLE_PORT must be 0 or 1\n' >&2
+            exit 1
+            ;;
+    esac
+    export USE_SINGLE_PORT OPEXTENSION GIDS_DIR
     export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-1}"
     export PYTHONPATH="$(dirname -- "$OPEXTENSION")${PYTHONPATH:+:${PYTHONPATH}}"
     linker_args=(

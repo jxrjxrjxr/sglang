@@ -278,7 +278,6 @@ class OceanDiskStorage(HiCacheStorage):
                 config_path=str(config_path),
                 connections=self.connection_indices,
                 registered_regions=len(self.regions),
-                io_mode="legacy_direct_aligned",
             )
 
     @staticmethod
@@ -363,7 +362,6 @@ class OceanDiskStorage(HiCacheStorage):
                 "GET_BEGIN",
                 layers=len(layers),
                 batches=len(descriptors),
-                io_mode="legacy_direct_aligned",
             )
             try:
                 for batch_index, batch in enumerate(descriptors):
@@ -397,7 +395,7 @@ class OceanDiskStorage(HiCacheStorage):
                     for _, _, events in submitted:
                         events[layer].synchronize()
                     if layer in (0, len(layers) - 1):
-                        trace_event("GET_LAYER_READY", layer=layer, copied_fragments=0)
+                        trace_event("GET_LAYER_READY", layer=layer)
                     if on_layer_ready is not None:
                         on_layer_ready(layer)
                 trace_event(
@@ -425,7 +423,6 @@ class OceanDiskStorage(HiCacheStorage):
                 "PUT_BEGIN",
                 layers=len(layers),
                 batches=len(descriptors),
-                io_mode="legacy_direct_aligned",
             )
             try:
                 for batch_index, batch in enumerate(descriptors):
