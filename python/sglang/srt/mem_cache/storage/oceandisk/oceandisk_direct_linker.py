@@ -17,7 +17,6 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     MAX_GIDS_RANGES,
     OceanDiskRange,
     OceanDiskStorage,
-    completion_key,
     encode_key,
     trace_event,
 )
@@ -44,6 +43,7 @@ class LayerwiseSaveSession:
         )
 
     def __enter__(self):
+        self.linker._unavailable_page_keys.update(self.keys)
         return self
 
     def save_layer(self, layer):
@@ -69,10 +69,9 @@ class LayerwiseSaveSession:
                     f"OceanDisk saved {self.next_layer}/{self.linker.num_layers} layers."
                 )
             if self.linker.offload_owner:
-                self.linker.storage.publish_pages(
-                    self.keys, max_ranges=self.linker.max_ranges
-                )
+                self.linker.storage.verify_saved_pages(self.keys)
             self.linker._layerwise_saved_keys.update(self.keys)
+            self.linker._unavailable_page_keys.difference_update(self.keys)
             if self.on_saved is not None:
                 self.on_saved()
             trace_event(
@@ -204,6 +203,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self.offload_results: Queue[bool] = Queue()
         self._closed = False
         self._layerwise_saved_keys = set()
+        # Pending/failed writes are hidden in this engine, even if GIDS reports
+        # an object after its first layer. This is not a cross-engine commit log.
+        self._unavailable_page_keys = set()
         self.layerwise_save_enabled = (
             config.get("layerwise_save", True)
             and params.pp_size == 1
@@ -306,7 +308,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
-        bitmap = self.storage.exists_many([completion_key(key) for key in keys])
+        bitmap = self.storage.exists_many(keys)
+        bitmap = [
+            hit and key not in self._unavailable_page_keys
+            for key, hit in zip(keys, bitmap, strict=True)
+        ]
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         trace_event(
             "LOOKUP", rid=rid, pages=len(keys), prefix_pages=end, first_key=keys[0]
@@ -408,10 +414,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         layers = self._transfer_layers(transfers, skip_saved=write)
         if write:
             if layers and layers[0]:
+                keys = list(dict.fromkeys(item.key for item in layers[0]))
+                self._unavailable_page_keys.update(keys)
                 self.storage.put_layers(layers, max_ranges=self.max_ranges)
-                self.storage.publish_pages(
-                    [item.key for item in layers[0]], max_ranges=self.max_ranges
-                )
+                self.storage.verify_saved_pages(keys)
+                self._unavailable_page_keys.difference_update(keys)
         else:
             self.storage.get_layers(
                 layers,

@@ -123,11 +123,6 @@ def encode_key(identity: tuple) -> int:
     ) or 1
 
 
-def completion_key(key: int) -> int:
-    """Separate page visibility from the presence of its first written layer."""
-    return encode_key(("sglang-oceandisk-complete", key))
-
-
 def resolve_mr(regions: list[tuple[int, int]], ptr: int, size: int) -> tuple[int, int]:
     if size <= 0:
         raise ValueError("OceanDisk ranges must have positive length.")
@@ -202,10 +197,7 @@ class OceanDiskStorage(HiCacheStorage):
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("The OceanDisk direct linker requires CUDA buffers.")
-        self._completion_buffer = torch.zeros(
-            512, dtype=torch.uint8, device=self.device
-        )
-        buffers = [*buffers, self._completion_buffer]
+        buffers = list(buffers)
         self.regions = []
         for buffer in buffers:
             if buffer.device != self.device:
@@ -538,15 +530,24 @@ class OceanDiskStorage(HiCacheStorage):
             event.record(self._stream)
             event.synchronize()
 
-    def publish_pages(self, keys, *, max_ranges=256):
-        """Publish only after all KV and Indexer layers have finished writing."""
-        ptr = self._completion_buffer.data_ptr()
-        ranges = [
-            OceanDiskRange(completion_key(key), ptr, 512) for key in dict.fromkeys(keys)
-        ]
-        if ranges:
-            self.put_layers([ranges + ranges], max_ranges=max_ranges)
-            trace_event("PAGES_PUBLISHED", pages=len(ranges))
+    def verify_saved_pages(self, keys):
+        """Verify real paired KV/Indexer objects, not synthetic marker records."""
+        keys = list(dict.fromkeys(keys))
+        hits = self.exists_many(keys)
+        missing = [key for key, hit in zip(keys, hits, strict=True) if not hit]
+        trace_event(
+            "SAVE_EXIST_CHECK",
+            pages=len(keys),
+            hit_pages=len(keys) - len(missing),
+            first_key=keys[0] if keys else None,
+            first_missing_key=missing[0] if missing else None,
+        )
+        if missing:
+            raise RuntimeError(
+                f"OceanDisk PUT event completed, but {len(missing)}/{len(keys)} "
+                f"real KV/Indexer page keys are not visible to GIDS exist; "
+                f"first missing key={missing[0]}."
+            )
 
     @staticmethod
     def _unsupported_hicache() -> NotImplementedError:

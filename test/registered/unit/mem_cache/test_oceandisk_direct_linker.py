@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskRange,
     OceanDiskStorage,
-    completion_key,
     encode_key,
     gids_config_path,
     pack_io,
@@ -415,15 +414,19 @@ class TestOceanDiskStorage(CustomTestCase):
         storage.wait_for_save()
         self.assertEqual([kind for kind, _ in trace][-2:], ["record", "wait"])
 
-    def test_completion_marker_has_a_separate_key_and_is_published_in_both_pools(self):
+    def test_saved_page_verification_checks_real_keys_without_extra_put(self):
         storage, _, _ = self.make_storage()
-        storage._completion_buffer = SimpleNamespace(data_ptr=lambda: 1000)
-        storage.publish_pages([7, 7, 8])
-        rows = self.od_utils.batch_dispatch_put.call_args.args[0].values
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][5:9], [completion_key(7), completion_key(8)] * 2)
-        self.assertEqual(rows[0][17:21], [512] * 4)
-        self.assertNotEqual(completion_key(7), 7)
+        storage.exists_many = Mock(return_value=[True, True])
+        storage.verify_saved_pages([7, 7, 8])
+        storage.exists_many.assert_called_once_with([7, 8])
+        self.od_utils.batch_dispatch_put.assert_not_called()
+
+    def test_missing_saved_page_fails_instead_of_reporting_success(self):
+        storage, _, _ = self.make_storage()
+        storage.exists_many = Mock(return_value=[True, False])
+        with self.assertRaisesRegex(RuntimeError, "first missing key=8"):
+            storage.verify_saved_pages([7, 8])
+        self.od_utils.batch_dispatch_put.assert_not_called()
 
     def test_descriptor_uses_paired_keys_and_registration_offsets(self):
         ranges = [
@@ -533,6 +536,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker._validate_dsa_layout()
         linker._closed = False
         linker._layerwise_saved_keys = set()
+        linker._unavailable_page_keys = set()
         linker.storage = Mock()
         linker.max_ranges = 3
         linker.layer_done_counter = LayerWiseLoadCounter(2)
@@ -700,9 +704,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
 
     def test_lookup_probes_shared_dsa_keys_and_checks_holes(self):
         linker = self.make_linker()
-        missing = completion_key(
-            linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 1)[0].key
-        )
+        missing = linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 1)[0].key
         linker.storage.exists_many.side_effect = lambda keys: [
             k != missing for k in keys
         ]
@@ -710,6 +712,27 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertEqual(linker.lookup("req", transfers), [1])
         linker.storage.exists_many.side_effect = lambda keys: [True] * len(keys)
         self.assertEqual(linker.lookup("req", transfers), [1, 2, 3])
+        linker.storage.exists_many.assert_called_with(
+            [linker._object_key(key) for key in ("p0", "p1", "p2")]
+        )
+
+    def test_lookup_hides_pending_or_failed_pages_even_when_remote_key_exists(self):
+        linker = self.make_linker()
+        linker.storage.exists_many.side_effect = lambda keys: [True] * len(keys)
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1"])]
+        linker._unavailable_page_keys.add(linker._object_key("p1"))
+        self.assertEqual(linker.lookup("req", transfers), [1])
+        linker._unavailable_page_keys.clear()
+        self.assertEqual(linker.lookup("req", transfers), [1, 2])
+
+    def test_cache_reset_does_not_reenable_a_known_failed_page(self):
+        linker = self.make_linker()
+        linker.load_queue = Queue()
+        linker.offload_queue = Queue()
+        linker.completed_loads = Queue()
+        linker._unavailable_page_keys.add(linker._object_key("failed"))
+        linker.reset()
+        self.assertEqual(linker._unavailable_page_keys, {linker._object_key("failed")})
 
     def test_owner_ack_and_duplicate_load(self):
         linker = self.make_linker()
@@ -748,7 +771,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         expanded = linker.pool_group.resolve_transfers([transfer])
         linker._run_transfers(expanded, write=True)
         linker.storage.put_layers.assert_not_called()
-        linker.storage.publish_pages.assert_not_called()
+        linker.storage.verify_saved_pages.assert_not_called()
 
     def test_saved_page_ack_cannot_overtake_an_earlier_failed_offload(self):
         linker = self.make_linker()
@@ -822,6 +845,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         linker.num_layers = 2
         linker.max_ranges = 256
         linker._layerwise_saved_keys = set()
+        linker._unavailable_page_keys = set()
         linker.storage.prepare_layerwise_put.return_value = [["layer0"], ["layer1"]]
         return linker, LayerwiseSaveSession(linker, [[], []], [7, 8])
 
@@ -829,11 +853,12 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         linker, session = self.make_session()
         session.on_saved = Mock()
         with session:
+            self.assertEqual(linker._unavailable_page_keys, {7, 8})
             session.save_layer(0)
             session.save_layer(1)
             self.assertEqual(linker.storage.submit_put_layer.call_count, 2)
             linker.storage.wait_for_save.assert_not_called()
-            linker.storage.publish_pages.assert_not_called()
+            linker.storage.verify_saved_pages.assert_not_called()
             session.on_saved.assert_not_called()
             self.assertEqual(linker._layerwise_saved_keys, set())
         self.assertEqual(
@@ -843,10 +868,11 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
                 "submit_put_layer",
                 "submit_put_layer",
                 "wait_for_save",
-                "publish_pages",
+                "verify_saved_pages",
             ],
         )
         self.assertEqual(linker._layerwise_saved_keys, {7, 8})
+        self.assertFalse(linker._unavailable_page_keys)
         session.on_saved.assert_called_once()
         self.assertIsNone(session.prepared)
 
@@ -856,8 +882,9 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             with session:
                 session.save_layer(0)
         linker.storage.wait_for_save.assert_called_once()
-        linker.storage.publish_pages.assert_not_called()
+        linker.storage.verify_saved_pages.assert_not_called()
         self.assertFalse(linker._layerwise_saved_keys)
+        self.assertEqual(linker._unavailable_page_keys, {7, 8})
         self.assertIsNone(session.prepared)
 
     def test_failed_forward_drains_and_preserves_the_original_exception(self):
@@ -867,13 +894,15 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
                 session.save_layer(0)
                 raise ValueError("forward failed")
         linker.storage.wait_for_save.assert_called_once()
-        linker.storage.publish_pages.assert_not_called()
+        linker.storage.verify_saved_pages.assert_not_called()
         self.assertFalse(linker._layerwise_saved_keys)
 
-    def test_publication_failure_does_not_mark_local_pages_saved(self):
+    def test_exist_verification_failure_does_not_mark_local_pages_saved(self):
         linker, session = self.make_session()
-        linker.storage.publish_pages.side_effect = RuntimeError("publish failed")
-        with self.assertRaisesRegex(RuntimeError, "publish failed"):
+        linker.storage.verify_saved_pages.side_effect = RuntimeError(
+            "exist verification failed"
+        )
+        with self.assertRaisesRegex(RuntimeError, "exist verification failed"):
             with session:
                 session.save_layer(0)
                 session.save_layer(1)
