@@ -1,6 +1,6 @@
 # OceanDisk 接入 UnifiedCacheLinker：Prefix Cache 设计方案
 
-**命名约定：** Python 后端统一命名为 OceanDisk，入口为 `oceandisk`，核心类为 `OceanDiskDirectLinker` 和 `OceanDiskStorage`，范围描述为 `OceanDiskRange`。底层继续使用现有 GIDS 库；原生算子、环境变量和配置文件名保持不变；对象使用固定标识 `sglang-oceandisk-pool-pages`，复用 assembler offsets；key 由模型/并行身份、page size、pool 名和 page hash 决定。不保留旧后端入口别名。
+**命名约定：** Python 后端统一命名为 OceanDisk，入口为 `oceandisk`，核心类为 `OceanDiskDirectLinker` 和 `OceanDiskStorage`，范围描述为 `OceanDiskRange`。底层继续使用现有 GIDS 库；原生算子、环境变量和配置文件名保持不变；对象使用固定标识 `sglang-oceandisk-pool-pages`，本地地址使用 assembler，远端长度和偏移按旧 controller 的 512 字节规则补齐；key 由模型/并行身份、page size 和 page hash 决定。不保留旧后端入口别名。
 
 本文回答“为什么这样设计、职责怎么划分、后续怎样扩展”；已经落地的代码与修改记录见 [工作区修改说明](oceandisk-unified-linker-changes.md)。本文包含后续目标，不能将所有设计目标视为已实现功能。
 
@@ -183,49 +183,17 @@ storage_offset = 0  # 示例取对象首片段；实际值来自 assembler
 
 task ID 用单调递增的整数作为任务标识；不要将请求 rid 当成远端数据 key，也不要依赖旧代码的 crc32 实现存储命名空间。
 
-### 当前实现：pool/page 对象与 assembler offset
+### 当前实现：DSA 配对与补齐布局
 
-**布局分为两层：SGLang assembler 描述 GPU 地址及 packed 对象内偏移；OceanDisk Linker 复用这些偏移、校验布局并生成远端对象 key。这个适配没有改变 SGLang 已分配的 GPU KV 布局，也不会为了远端排列而先把 GPU 数据拼成连续 tensor。**
+UC 提供 page hash 和 token slots，assembler 提供 KV/Indexer 的实际 GPU 指针、有效长度和物理排列。KV/Indexer 使用同一 page key，由原生 DSA 路径区分；提交顺序为前半 KV、后半 Indexer，各层范围数一致。
 
-| 阶段 | 当前代码 | 描述的内容 |
-| --- | --- | --- |
-| 逻辑传输 | `PoolTransfer` | page hashes、来源 pool、当前请求或节点的 GPU slots。 |
-| GPU 物理布局 | `DevicePoolGroup` / `DevicePoolEntry` | 实际 buffers、逻辑层到物理 buffer 的映射，以及 page 的 GPU 地址和大小。 |
-| 远端对象布局 | `OceanDiskDirectLinker._object_layouts` | 每个物理 pool 内，各层及 fragment 的对象内 offset 和 size。 |
-| 实际传输范围 | `OceanDiskRange` | 将对象 key、实际 GPU ptr、size 和远端 storage_offset 合在一起。 |
+远端格式参考 `bak_1020_modify:od/cache_controller.py`：每个物理片段长度向上补齐到 512 字节，远端偏移按补齐长度累计。本地位置仍按原始 stride 寻址。例如 64-token page 的 BF16 KV 为 73728 字节，Indexer 为 8448 字节；Indexer 的 I/O 长度和层间远端步长为 8704 字节。
 
-以无 MTP 的 DSA 路径为例，`_build_dsa_device_pool_group()` 为 `kvcache.kv_buffer` 和 `kvcache.index_k_with_scale_buffer` 分别生成 KV、Indexer entries。前者按 token 行寻址，后者按 page 行寻址；两者的 `indices_from_pool` 都是 KV，因此一份逻辑 KV transfer 经 `resolve_transfers()` 展开为两份物理 transfers，复用同一组 page hashes 和来源 slots。
+Linker 的 `_storage_offsets` 保存原始 offset 到补齐 offset 的映射。Storage 为不对齐片段预分配有界 CUDA staging，并注册实际 allocation；不照搬旧 controller 的超额注册。
 
-`_object_layouts[pool][layer]` 当前是 `[(storage_offset, size), ...]` 列表。它描述一个 page 在远端的排列，与本次分配到哪些 GPU slots 无关。一个物理 fragment 是 assembler 给出的一段连续地址范围，不必等同于一个完整 tensor。详细代码对应见 [代码修改说明](oceandisk-unified-linker-changes.md)。
+写出先拷贝有效数据并将补齐字节置零；读回先 GET 到 staging，再拷贝有效数据到原始目标。层 Future 在读回拷贝完成后通知，分块完成后才复用 staging。原本对齐的片段仍直接读写原始 allocation；全部对齐时不分配 staging。
 
-每个 `(page_hash, physical_pool, model/topology, page_size)` 对应一个远端 key。初始化时遍历该 pool 的全部传输层，直接保存 assembler 返回的 offsets/sizes，校验对齐、非负偏移和范围不重叠，不再按层重新累计。当前要求 packed=True，避免多个独立对象的偏移被误用到同一个 key。层号和 fragment 不单独生成 key，offsets/sizes 只用于读写和校验。
-
-```text
-一个 page hash H（DSA，无 MTP；大小仅为示意）
-  KV pool → key K1
-    第 0 层 KV：offset 0，size 100
-    第 1 层 KV：offset 100，size 100
-  Indexer pool → key K2
-    第 0 层 Indexer：offset 0，size 20
-    第 1 层 Indexer：offset 20，size 20
-```
-
-`OceanDiskRange(key, ptr, size, storage_offset)` 同时表达本地和远端位置。每层大小可以不同，缺少某层映射时不生成该层传输，其他片段仍保留 assembler 的原始偏移；不用模型专用固定公式。KV 和 Indexer 保持不同对象，不新增跨 pool bundle，以保留现有部分 pool 加载语义。
-
-直接复用 assembler 的物理 buffer 偏移，包含 MTP 等非连续层映射。key 不包含布局指纹；模型权重或缓存布局变化时，应清理旧缓存或更换 namespace。不使用额外版本号或旧格式读取分支，也不宣称与 od 旧格式互通。
-
-**完整性前提：** 同 key 的多次范围写入不等于完整提交。只有全部层和片段可读时，exist 才能报告命中。现有 Python 接口没有 commit 操作，不能自行建立该保证。若实际库首个片段写入就返回 exist=true，必须先在底层补提交/覆盖范围跟踪协议，禁止直接启用此格式。当前没有用于声明“后端已保证完整性”的配置开关；需要真实实现与测试保证。
-
-整数 key 的有效位宽、符号及保留值需核对真实 `.so` ABI。完整 page hash 压缩到有限整数空间存在碰撞，不能宣称无碰撞；根据实际位宽选稳定摘要方案，若需要可验证的严格完整性，需额外元数据或底层更宽 key 支持。不使用 Python 内置 hash，也不将 crc32 当作内容 key。
-
-对象命名由物理布局的复制/分片属性决定，采用与当前 Mooncake Direct Linker 相同的基础策略：
-
-- `rank_replicated=True`：同一 attention TP 组共享对象 key，不加入 TP rank；组内 rank 0 为 offload owner，只写一份，各 rank 从相同 keys 独立读回自己的 GPU slots。
-- `rank_replicated=False`：各 rank 保存不同分片，key 区分 TP rank。
-
-当前 GLM-5 DSA pool group 将 KV + Indexer 标记为 `rank_replicated=True`，所以使用共享 key 和单 owner 写出，不采用每 rank 重复存储一份的方案。依据 assembler 提供的布局属性分支，不仅凭模型名称或 MLA 标签猜测。
-
-读写必须使用同一稳定 conn 路由：同一个共享 key 在不同 rank 上必须路由到同一远端存储位置。不得因本地 MR、GPU 地址、请求 ID 或 rank 改变共享对象身份。实际连接若指向隔离的后端命名空间，必须先统一映射。CP/PP 及模型差异通过 key 隔离；布局变化需清理旧缓存或更换 namespace；是否支持跨 TP size 复用要单独验证，不能仅凭省略 TP rank 推断。
+key 不包含布局指纹或格式版本号。部署此补齐布局时，旧的未补齐对象需要清理或更换 namespace，不能直接混读。真实 PUT/GET 状态、CUDA event 是否覆盖底层 DMA、EXIST 是否代表完整提交，仍需实际 GIDS 验证。
 
 ### GLM-5 多卡的必要约定
 
@@ -320,7 +288,7 @@ Wrapper / Cache
 - `reset()` 不清空远端存储：启动已有 pending loads，等待本地队列排空，清理完成通知和 counter。当前没有并发拒收新任务的门控，调用方需串行协调 reset 与任务提交。
 - `close()` 在静止后退出线程、释放资源。当前 schema 无显式 deregister/close，不能虚构可用算子；确认进程退出清理约定及是否支持同进程重新初始化。
 - registry 增加 `oceandisk` 分支，memory 参数 backend choices 增加 `oceandisk`。
-- 当前配置支持 so/config 路径、namespace、连接列表、每次最大 ranges、对齐；初始化与读写统一按返回码 0 判断成功；尚未实现适配器级超时或容量参数。保留 OPEXTENSION/LIBGIDS/GIDS_DIR 环境变量兼容，不要求旧 nds 专用 server args。
+- 当前配置支持 so/config 路径、namespace、连接列表、每次最大 ranges；初始化与读写统一按返回码 0 判断成功；尚未实现适配器级超时或容量参数。保留 OPEXTENSION/LIBGIDS/GIDS_DIR 环境变量兼容，不要求旧 nds 专用 server args。
 
 启动参数：
 
@@ -359,7 +327,7 @@ Wrapper / Cache
 ## 12. od 更新后的适配边界
 
 - 新 controller 将 KV、DSA 分开管理 MR、地址和每层 item 长度。新 Linker 已通过 DevicePoolGroup/Entry 描述这些物理 pools；不迁移旧 controller 的模型专用索引公式、PD 通知或额外缓存类型枚举。
-- 新 controller 对部分长度做 512 字节向上取整，并把 DSA 注册长度人为加 512。新适配保留真实 allocation 边界，禁止照搬超额注册或跨 page 读取。`io_alignment` 默认 512，初始化校验实际 fragment 大小，I/O 校验 size 和远端 offset；不满足时明确报错，当前没有 padded staging。只有真实库验证支持字节粒度时才可配置为 1。
+- 新 controller 对部分长度做 512 字节向上取整，并把 DSA 注册长度人为加 512。新适配保留真实 allocation 边界，禁止照搬超额注册或跨 page 读取。适配层参考 controller 的 512 字节补齐长度和远端偏移，通过实际分配并注册的 staging 承接不对齐片段；读回仅还原有效字节。旧 io_alignment 拒绝校验已移除，真实读写仍需 GIDS 验证。
 - `gids_kernel.cu` 的 USE_SINGLE_PORT 未设置或等于 1 时选择 gids_config.txt，其他值选择 gids_config_<当前可见CUDA设备号>.txt。Storage 按同一规则预检文件，可用 use_single_port 布尔配置显式设置环境变量，并规范 GIDS_DIR 末尾分隔符。
 - Storage 预检六字段 ip_config；connection_indices 必须在文件实际连接数内且为 0..7，单次 ranges 不超过 409600。第六字段按 .cu 传给 qp_cnt，不照搬旧 Python 将它用作 dpu_id 的分组逻辑。当前不引入一致性 hash ring，仍使用显式连接列表的稳定 key 路由。
 - .cu 中的 g_devid、g_kvnsid、g_kvnsid_index 是固定值；Python namespace 只隔离对象 key，不能修改这些原生 namespace。部署时需匹配实际后端配置；GIDS_MR_NUM、MAX_IP_NUM 的定义还在未提供的头文件中。

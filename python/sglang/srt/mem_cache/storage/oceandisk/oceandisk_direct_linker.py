@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
+    MAX_GIDS_RANGES,
     OceanDiskRange,
     OceanDiskStorage,
     encode_key,
@@ -103,6 +104,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         self.max_ranges = config.get("max_ranges_per_call", 256)
+        if (
+            type(self.max_ranges) is not int
+            or not 2 <= self.max_ranges <= MAX_GIDS_RANGES
+        ):
+            raise ValueError(f"OceanDisk max_ranges must be in [2, {MAX_GIDS_RANGES}].")
         namespace = config.get("namespace", get_model().model_path)
         if not isinstance(namespace, str) or not namespace:
             raise ValueError(
@@ -120,7 +126,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             params.pp_rank,
         )
         self.storage = (
-            OceanDiskStorage(config, self.device, buffers)
+            OceanDiskStorage(
+                config,
+                self.device,
+                buffers,
+                staging_bytes=self._staging_bytes_per_pair * (self.max_ranges // 2),
+            )
             if storage is None
             else storage
         )
@@ -156,15 +167,29 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 "The GIDS DSA operator requires KV and Indexer pools only."
             )
         counts = []
-        for entry in self.pools.values():
+        self._storage_offsets = {}
+        self._staging_bytes_per_pair = 0
+        for name, entry in self.pools.items():
             if not entry.packed:
                 raise ValueError("OceanDisk requires packed=True for page objects.")
+            raw_offset = padded_offset = 0
+            offsets = {}
+            for component in entry.buffer_meta:
+                for _, _, size in component:
+                    offsets[raw_offset] = padded_offset
+                    raw_offset += size
+                    padded_offset += (size + 511) & ~511
+            self._storage_offsets[name] = offsets
             layer_counts = []
             for layer in range(self.num_layers):
                 meta = entry.get_prepared_layer_range_meta([0], layer)
                 if meta is None or not meta[1][0]:
                     raise ValueError("Each DSA layer needs KV and Indexer fragments.")
                 layer_counts.append(len(meta[1][0]))
+                self._staging_bytes_per_pair += max(
+                    ((size + 511) & ~511 for size in meta[1][0] if size % 512),
+                    default=0,
+                )
             counts.extend(layer_counts)
         if len(set(counts)) != 1:
             raise ValueError(
@@ -189,7 +214,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         ):
             key = self._object_key(page_key)
             ranges.extend(
-                OceanDiskRange(key, int(ptr), int(size), int(storage_offset))
+                OceanDiskRange(
+                    key,
+                    int(ptr),
+                    int(size),
+                    self._storage_offsets[name][storage_offset],
+                )
                 for ptr, size, storage_offset in zip(
                     pointers, lengths, positions, strict=True
                 )

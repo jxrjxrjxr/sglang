@@ -32,7 +32,6 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     gids_config_path,
     pack_io,
     read_connection_count,
-    read_io_alignment,
     resolve_mr,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -113,11 +112,6 @@ class TestOceanDiskStorage(CustomTestCase):
                 path.write_text(text)
                 with self.assertRaises(ValueError):
                     read_connection_count(path)
-        self.assertEqual(read_io_alignment({}), 512)
-        self.assertEqual(read_io_alignment({"io_alignment": 1}), 1)
-        for value in (0, -1, True):
-            with self.assertRaises(ValueError):
-                read_io_alignment({"io_alignment": value})
         for connections in ([8], [-1], [True], [0, 0]):
             with self.assertRaisesRegex(ValueError, "connection_indices"):
                 OceanDiskStorage(
@@ -134,7 +128,7 @@ class TestOceanDiskStorage(CustomTestCase):
         storage.regions = [(1000, 4096), (10000, 4096)]
         storage.connection_indices = (2, 5)
         storage._task_ids = itertools.count(1)
-        storage.io_alignment = 1
+        storage._staging = None
         trace = []
 
         class Metadata:
@@ -324,10 +318,106 @@ class TestOceanDiskStorage(CustomTestCase):
             with self.assertRaises(ValueError):
                 storage.get_layers(layers)
         self.od_utils.batch_dispatch_get.assert_not_called()
-        storage.io_alignment = 512
-        with self.assertRaisesRegex(ValueError, "align"):
-            storage.get_layers([self.layer_ranges(1)])
-        self.od_utils.batch_dispatch_get.assert_not_called()
+
+    def test_padded_indexer_roundtrip_uses_bounded_staging_across_chunks(self):
+        class Bytes:
+            def __init__(self, size, *, data=None, start=0):
+                self.data = bytearray(size) if data is None else data
+                self.start = start
+                self.size = size
+
+            def numel(self):
+                return self.size
+
+            def __getitem__(self, region):
+                start = region.start or 0
+                stop = self.size if region.stop is None else region.stop
+                if not 0 <= start <= stop <= self.size:
+                    raise AssertionError("Copy exceeds allocated buffer")
+                return Bytes(stop - start, data=self.data, start=self.start + start)
+
+            def zero_(self):
+                self.data[self.start : self.start + self.size] = bytes(self.size)
+
+            def copy_(self, source):
+                if self.size != source.size:
+                    raise AssertionError("Copy lengths differ")
+                self.data[self.start : self.start + self.size] = source.snapshot()
+
+            def snapshot(self):
+                return bytes(self.data[self.start : self.start + self.size])
+
+        storage, _, _ = self.make_storage()
+        kv, indexer = Bytes(4 * 512), Bytes(4 * 8448)
+        kv.data[:] = bytes((i % 251 for i in range(kv.numel())))
+        indexer.data[:] = bytes(((i + 71) % 251 for i in range(indexer.numel())))
+        expected = (kv.snapshot(), indexer.snapshot())
+        storage._staging = Bytes(2 * 8704)
+        storage._staging_mr = 2
+        storage._region_views = [kv, indexer, storage._staging]
+        storage.regions = [
+            (100000, kv.numel()),
+            (400000, indexer.numel()),
+            (800000, 17408),
+        ]
+        layers = [
+            [
+                OceanDiskRange(
+                    page + 1, 100000 + (2 * layer + page) * 512, 512, layer * 512
+                )
+                for page in range(2)
+            ]
+            + [
+                OceanDiskRange(
+                    page + 1, 400000 + (2 * layer + page) * 8448, 8448, layer * 8704
+                )
+                for page in range(2)
+            ]
+            for layer in range(2)
+        ]
+        remote = {}
+
+        def native(write, metadata, *_):
+            for row in metadata.values:
+                count = (len(row) - 1) // 6
+                for i in range(count):
+                    mr = row[1 + i]
+                    key = row[1 + count + i]
+                    local = row[1 + 2 * count + i]
+                    offset = row[1 + 3 * count + i]
+                    size = row[1 + 4 * count + i]
+                    self.assertEqual(size % 512, 0)
+                    self.assertEqual(offset % 512, 0)
+                    target = storage._region_views[mr][local : local + size]
+                    identity = (i >= count // 2, key, offset)
+                    if write:
+                        remote[identity] = target.snapshot()
+                        if identity[0]:
+                            self.assertEqual(size, 8704)
+                            self.assertEqual(remote[identity][-256:], bytes(256))
+                    else:
+                        target.copy_(Bytes(size, data=bytearray(remote[identity])))
+
+        self.od_utils.batch_dispatch_put.side_effect = lambda *args: native(True, *args)
+        self.od_utils.batch_dispatch_get.side_effect = lambda *args: native(
+            False, *args
+        )
+        storage.put_layers(layers, max_ranges=2)
+        kv.data[:] = bytes([255]) * kv.numel()
+        indexer.data[:] = bytes([255]) * indexer.numel()
+        ready = []
+
+        def on_ready(layer):
+            for view, original, size in zip((kv, indexer), expected, (512, 8448)):
+                start, end = 2 * layer * size, 2 * (layer + 1) * size
+                self.assertEqual(view[start:end].snapshot(), original[start:end])
+            ready.append(layer)
+
+        storage.get_layers(layers, max_ranges=2, on_layer_ready=on_ready)
+        self.assertEqual(ready, [0, 1])
+        self.assertEqual((kv.snapshot(), indexer.snapshot()), expected)
+        self.assertEqual(self.od_utils.batch_dispatch_put.call_count, 2)
+        self.assertEqual(self.od_utils.batch_dispatch_get.call_count, 2)
 
     def test_get_error_drains_before_releasing_metadata(self):
         storage, _, _ = self.make_storage()
@@ -471,15 +561,14 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertEqual(first[0].key, other_pool[0].key)
         self.assertEqual(first[0].key, other_layer[0].key)
         self.assertEqual([r.storage_offset for r in first], [0, 0])
-        self.assertEqual([r.storage_offset for r in other_layer], [6])
+        self.assertEqual([r.storage_offset for r in other_layer], [512])
 
-    def test_offsets_come_from_assembler_for_multiple_components(self):
+    def test_offsets_pad_each_physical_buffer_for_multiple_components(self):
         linker = self.make_linker(multi_component=True)
         first = linker._page_fragments(PoolName.KV, ["p0"], [0], 0)
         second = linker._page_fragments(PoolName.KV, ["p0"], [0], 1)
-        # Component-major offsets differ from the old layer-major packing.
-        self.assertEqual([r.storage_offset for r in first], [0, 12])
-        self.assertEqual([r.storage_offset for r in second], [6, 22])
+        self.assertEqual([r.storage_offset for r in first], [0, 1024])
+        self.assertEqual([r.storage_offset for r in second], [512, 1536])
 
     def test_keys_share_dsa_namespaces_without_layout_fingerprinting(self):
         linker = self.make_linker()
@@ -491,6 +580,38 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertNotEqual(key, linker._object_key("p1"))
         linker._namespace = (*linker._namespace, "other-model")
         self.assertNotEqual(key, linker._object_key("p0"))
+
+    def test_glm_page_uses_raw_local_stride_and_padded_remote_stride(self):
+        linker = self.make_linker()
+        for name, width, rows_are_pages in (
+            (PoolName.KV, 1152, False),
+            (PoolName.INDEXER, 8448, True),
+        ):
+            linker.pools[name] = DevicePoolEntry(
+                name=name,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[
+                    [
+                        torch.zeros(
+                            (128 if not rows_are_pages else 2, width), dtype=torch.uint8
+                        )
+                        for _ in range(2)
+                    ]
+                ],
+                layer_mapping={0: 0, 1: 1},
+                page_size=64,
+                rows_are_pages=rows_are_pages,
+            )
+        linker._validate_dsa_layout()
+        kv = linker._page_fragments(PoolName.KV, ["p0"], [64], 1)[0]
+        indexer = linker._page_fragments(PoolName.INDEXER, ["p0"], [1], 1)[0]
+        self.assertEqual((kv.size, kv.storage_offset), (73728, 73728))
+        self.assertEqual((indexer.size, indexer.storage_offset), (8448, 8704))
+        self.assertEqual(
+            indexer.ptr, linker.pools[PoolName.INDEXER].buffer_meta[0][1][0] + 8448
+        )
+        self.assertEqual(linker._staging_bytes_per_pair, 2 * 8704)
 
     def test_unpacked_layout_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "packed=True"):
@@ -525,7 +646,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             self.assertEqual(max_ranges, 3)
             self.assertEqual(
                 [[r.storage_offset for r in ranges] for ranges in layers],
-                [[0, 0, 0, 0], [6, 6, 10, 10]],
+                [[0, 0, 0, 0], [512, 512, 512, 512]],
             )
             for ranges in layers:
                 self.assertEqual(

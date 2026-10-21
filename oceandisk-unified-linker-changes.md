@@ -1,6 +1,6 @@
 # OceanDisk UnifiedCacheLinker 工作区修改说明
 
-**当前布局：** 直接复用 assembler offsets；对象 key 由固定命名空间、模型/并行身份、page size、pool 名和 page hash 决定，不使用额外格式版本号。
+**当前布局：** 本地地址和有效长度复用 assembler；远端长度及偏移参考 `bak_1020_modify` 的 cache controller，按 512 字节补齐。同一 page 的 KV/Indexer 使用相同 key，由原生 DSA 路径区分。key 包含模型/并行身份、page size 和 page hash，不包含布局指纹或额外版本号。
 
 **当前命名：** 后端入口为 `oceandisk`，包目录为 `storage/oceandisk/`，核心类为 `OceanDiskDirectLinker`、`OceanDiskStorage`，范围类型为 `OceanDiskRange`。
 
@@ -58,7 +58,7 @@ libop_extension.so → GIDS 核心库
 1. **获取已有 GPU KV cache。** 从 `params.token_to_kv_pool_allocator.get_kvcache()` 取得 SGLang 已分配的 pool，不重新分配 KV cache。
 2. **解析物理布局。** 调用 `resolve_hybrid_device_pool_group()`，保存 `entry_map` 和 `num_layers`，收集 `get_hybrid_pool_buffer()` 返回的 GPU tensors，并取得当前 device。DSA 示例包括 KV、Indexer 两个物理 pools。
 3. **确定多卡写入规则。** 获取当前 attention TP cache group（未提供时使用 TP cache group）的 rank/size。`rank_replicated=True` 时组内 rank 0 是写回 owner；否则各 rank 写自己的分片。各 rank 保留独立读取能力。
-4. **读取配置并校验远端布局。** 读取 namespace、`max_ranges_per_call` 等，生成模型、page size 和并行拓扑身份。调用 `_build_object_layouts()`，保存并校验 assembler 提供的各 pool、各层/fragment 的 offset 和 size；此时不进行具体 page 的数据传输。
+4. **读取配置并校验远端布局。** 读取 namespace、`max_ranges_per_call` 等，生成模型、page size 和并行拓扑身份。调用 `_validate_dsa_layout()` 校验 KV/Indexer 配对，建立 assembler 原始偏移到补齐后远端偏移的映射，并计算有界补齐缓冲大小；此时不传输具体 page 数据。
 5. **创建存储封装并注册 GPU 内存。** 执行 `OceanDiskStorage(config, self.device, buffers)`，自动进入 Storage 的 `__init__()`。可选 `storage=` 参数用于测试注入，注入时不在这里构造默认 Storage。
 6. **建立完成通知和队列。** 创建 `LayerWiseLoadCounter`、`pending_loads`、`load_queue`、`completed_loads`、`offload_queue` 和 `offload_results`。
 7. **启动工作线程。** 启动 `_load_worker` 与 `_offload_worker` 后台线程，等待后续任务；此时初始化不主动加载或写回任何请求的 KV 数据。
@@ -66,7 +66,7 @@ libop_extension.so → GIDS 核心库
 第 5 步中，`OceanDiskStorage.__init__()` 进一步完成：
 
 ```text
-检查连接列表和对齐参数
+检查连接列表
     ↓
 检查 buffers 都位于目标 CUDA device
     ↓
@@ -135,7 +135,7 @@ storage_offset = 0
 | 字段 | 含义 | 当前实现 |
 | --- | --- | --- |
 | `local_offset` | 相对本地 GPU 注册区域起点的偏移 | `ptr - allocation_base` |
-| `storage_offset` | 相对远端 key 对象起点的偏移 | 直接使用 assembler 返回的 offset；对象首片段通常为 `0` |
+| `storage_offset` | 相对远端 key 对象起点的偏移 | 将 assembler 的原始 offset 映射为按 512 字节补齐后的对象内偏移 |
 
 这个转换只生成 GIDS 寻址参数，不搬动 KV 数据，也不重新注册内存。当前实现对未注册、跨区域或非正长度范围直接报错，不会自动拆分。
 
@@ -169,7 +169,7 @@ transfer.host_indices
 
 这里 `host_indices` 是现有传输结构复用的字段，在这条路径中承载物理 device pool 索引，不表示 KV 数据需要经过 CPU host cache。
 
-`_build_object_layouts()` 在初始化时为每个物理 pool 保存并校验 assembler 返回的各层 offset/size schema，不再按层重新累计。一个 page、一个物理 pool 对应一个 key；`_page_fragments()` 使用 assembler 的实际范围并与保存的 schema 核对，生成同 key、不同 `storage_offset` 的连续范围。KV 和 Indexer 仍是不同对象，支持部分 pool 加载。固定命名空间标识为 `sglang-oceandisk-pool-pages`；offsets/sizes 只用于读写和校验，不参与 key；模型权重或缓存布局变化时，应清理旧缓存或更换 namespace。
+`_validate_dsa_layout()` 在初始化时检查 packed KV/Indexer 的配对范围，并按物理 buffers 顺序建立补齐后的远端偏移。`_page_fragments()` 保留真实 GPU ptr 和有效 size，仅将 storage_offset 替换为补齐布局中的偏移。KV/Indexer 共享同一 page key，传输时按 KV 在前、Indexer 在后的顺序提交；模型权重或布局变化时应清理旧对象或更换 namespace。
 
 key 的身份信息包括模型 namespace、并行拓扑、page size、pool 名和 page hash。GPU 指针、MR_ID、请求 ID 和本地缓存容量不进入 key，因此同一对象可读入不同 slots。
 
@@ -177,7 +177,7 @@ key 的身份信息包括模型 namespace、并行拓扑、page size、pool 名�
 
 ### 4.1 两层布局与 SGLang 代码的对应关系
 
-**SGLang assembler 描述 GPU 地址及 packed 对象内偏移；OceanDisk Linker 复用偏移、校验布局并生成远端 key。没有改变 SGLang 原来的 GPU KV 布局。** 远端多个片段相邻，也不要求它们在 GPU 上相邻；Storage 使用各自的本地地址和远端 offset 传输，不额外拼接 KV tensor。
+**SGLang assembler 描述 GPU 地址及 packed 对象内偏移；OceanDisk Linker 将原始偏移映射到补齐后的远端偏移并生成 key。没有改变 SGLang 原来的 GPU KV 布局。** 远端多个片段相邻，也不要求它们在 GPU 上相邻；Storage 使用各自的本地地址和远端 offset 传输，只有未满足 512 字节长度的片段通过独立缓冲补齐。
 
 #### 第一步：Wrapper 提供逻辑传输
 
@@ -218,60 +218,22 @@ DevicePoolGroup
 | `prepare_locations()` | 将传入的 slots 转成该物理 pool 的 page 起始行位置。 |
 | `get_prepared_layer_range_meta()` | 根据位置及层映射，返回具体 GPU ptrs、sizes 和 assembler 的布局 offsets。 |
 
-#### 第三步：复用 assembler 的远端对象偏移
+#### 第三步：计算补齐后的远端偏移
 
-当前 `oceandisk_direct_linker.py` 的 `_build_object_layouts()` 生成嵌套字典：
+`_storage_offsets[pool][assembler_offset]` 将物理 buffer 的原始偏移映射为补齐偏移；按物理排列累计 `(size + 511) & ~511`，保留 MTP 非连续层映射的物理顺序。
 
-```python
-_object_layouts[pool][layer] = [(storage_offset, size), ...]
-```
+例如 page size 为 64、KV 为 BF16、Indexer 含 FP32 scale 时：
 
-假设只有三层，每层一个 page 的 KV 数据为 100 字节、Indexer 数据为 20 字节（仅为说明结构的示意数值）：
+| 数据 | 本地有效长度 | 远端 I/O 长度 | 第 n 层远端偏移（每层一个 fragment） |
+| --- | ---: | ---: | ---: |
+| KV | 73728 | 73728 | n × 73728 |
+| Indexer | 8448 | 8704 | n × 8704 |
 
-```python
-_object_layouts = {
-    PoolName.KV: {
-        0: [(0,   100)],
-        1: [(100, 100)],
-        2: [(200, 100)],
-    },
-    PoolName.INDEXER: {
-        0: [(0,  20)],
-        1: [(20, 20)],
-        2: [(40, 20)],
-    },
-}
-```
+#### 第四步：构造范围与补齐读写
 
-同一个 page 在远端形成两个对象：
+`_page_fragments()` 返回原始 ptr、有效 size 和补齐后的 storage_offset。Storage 先验证真实内存范围，再为不对齐片段改用独立注册的 staging MR 和补齐长度。
 
-```text
-KV key      → [第0层 KV][第1层 KV][第2层 KV]
-Indexer key → [第0层索引][第1层索引][第2层索引]
-```
-
-某层有多个物理片段时，该层列表中有多个 `(offset, size)`。代码直接保存 assembler 的 offsets/sizes，不再自行按层累计，不要求所有层大小相同。一个物理 fragment 是一段连续 GPU 地址范围，不一定是整个 tensor。
-
-#### 第四步：合成本次读写范围
-
-`_page_fragments()` 将两层布局合起来：
-
-```text
-DevicePoolEntry + 本次 slots + layer
-    → GPU ptr、size
-
-_object_layouts[pool][layer]
-    → GIDS 对象内 storage_offset
-
-page_hash + pool/模型/并行身份/page size
-    → 远端 key
-
-合并 → OceanDiskRange(key, ptr, size, storage_offset)
-```
-
-当前实现直接复用 assembler 返回的 offsets；_object_layouts 保存校验后的 schema，实际传输时同时核对 offset 和 size。`OceanDiskStorage` 随后只把 GPU ptr 转成 MR_ID/local_offset，打包远端 storage_offset 等参数并调用底层。
-
-当前没有跨 pool bundle：布局单位仍是单个物理 pool。将嵌套字典重构成显式数据类属于后续代码整理，不是当前接入的必要条件。
+写出：将有效字节拷入 staging，补齐部分置零，再调用原生 PUT。读回：GET 到 staging，等待层 event，然后仅将有效字节拷回目标 GPU slots；拷贝完成后才通知该层 Future。缓冲按最大批次预分配，分块间等待完成后复用；原始 buffers 的注册长度不扩大。
 
 ## 5. 查询路径：`lookup()`
 
@@ -403,7 +365,7 @@ export GIDS_DIR=/opt/oceandisk/config/
 
 启用参数为 `--enable-unified-cache-external-linker --unified-cache-external-linker-backend oceandisk`。`GIDS_DIR` 中仍需提供原生库读取的 `gids_config.txt`（或按设备编号的文件），其中记录存储服务连接信息。
 
-`namespace` 默认模型路径，`connection_indices` 默认 `[0]`，`max_ranges_per_call` 默认 256，`io_alignment` 默认 512。路径也可由 `OPEXTENSION/LIBGIDS/GIDS_DIR` 提供。模型权重或缓存布局变化时应清理旧缓存或更换 namespace。
+`namespace` 默认模型路径，`connection_indices` 默认 `[0]`，`max_ranges_per_call` 默认 256。路径也可由 `OPEXTENSION/LIBGIDS/GIDS_DIR` 提供。模型权重或缓存布局变化时应清理旧缓存或更换 namespace。
 
 初始化及读写统一按原生返回值 0 表示成功、非零报错，不需要成功码配置。CUDA event 等待和注册顺序编号是当前固定实现，不要求填写声明式配置。对象完整性没有通过配置开关实现。
 
@@ -428,11 +390,11 @@ export GIDS_DIR=/opt/oceandisk/config/
 
 ## 12. 当前边界和验证
 
-- 布局要求 `packed=True`，直接使用 assembler 的 offset；初始化校验非空片段、元数据形状、非负偏移、I/O 对齐和跨层范围不重叠。实际读写再次核对 offset/size schema。
-- DSA 的 KV 与 Indexer 为不同物理 pool，各自单 component；同一 page hash 对应两个不同 key。MTP 映射直接保留物理 buffer 的 offsets，不重新按传输层排列。
+- 布局要求 `packed=True`，各层 KV/Indexer 范围数量配对且相同；本地地址使用 assembler，远端偏移映射为补齐布局。
+- DSA 的 KV 与 Indexer 为不同物理 pool，同一 page 使用相同 key；MTP 按物理 buffer 顺序计算补齐偏移，不重新按传输层排列。
 - `OceanDiskStorage(HiCacheStorage)` 当前实际服务 UC Linker，尚未注册 HiCache factory。五个抽象方法保留基类签名并抛出 NotImplementedError，保证 Storage 可以实例化；基类 v2 报错方法直接继承，v1/host 注册/clear 的静默入口显式拒绝。后续还需实现 host 内存注册、host 读写与 key 映射，以及构造和 factory 接线。
 - `MAX_GIDS_*`、`gids_config_path()`、`torch.ops.my_ops`、`kvcache_*`、原生库文件名及环境变量与现有二进制保持一致；这不是旧适配代码。`kvcache_load_v2/store_v2` 名称中的 v2 是真实算子名，不能作为对象格式标签删除。
-- `io_alignment` 默认 512，不允许扩大注册长度或越界读写来伪造 padding。未满足对齐的布局需要另行实现 staging，目前会提前报错。
+- 参考旧 controller 的 512 字节补齐规则，用独立 staging 保存补齐内容；不扩大原始注册长度，不跨 page 读写原始 GPU buffers。旧的 io_alignment 配置及直接拒绝不对齐载荷的校验已移除。
 - 配置目录按原生 USE_SINGLE_PORT 规则选择文件；连接编号限制为 0..7，且必须小于配置文件实际连接数，每次提交范围数限制为 409600。
 - 原生桥接层会吞掉部分 init/get/put 错误，exist 也可能把错误变成 miss。Python 返回码检查无法恢复这些状态；CUDA event 是否覆盖真实 DMA、对象部分写入后的可见性仍需真实库验证。未增加声明底层保证的布尔配置。
 - 进程级 `_initialized` 防止重复注册，`_registered_tensors` 和元数据引用保证异步操作期间内存存活，不能当作无用状态删除。当前原生 API 没有暴露注销注册和完整提交操作。
@@ -455,7 +417,7 @@ export GIDS_DIR=/opt/oceandisk/config/
 
 范围读写在提交前一次生成整层 CPU 描述符，MR 边界查找与地址转换只在 pack_io 中执行一次，移除 _io 中重复的 MR 查找和负偏移检查。每个批次对应的 CUDA 元数据仍保持到层 event 完成，已提交操作异常时仍同步清理。测试检查每个范围只查一次 MR，以及后续批次地址或偏移无效时不会提交前面的读写。
 
-HiCacheStorage 继承及未实现接口保留；原生返回码、内存边界、对齐、重复初始化保护和 Future 失败传播保留。没有更改对象 key、存储排列或 od/ 代码。
+HiCacheStorage 继承及未实现接口保留；原生返回码、内存边界、重复初始化保护和 Future 失败传播保留。没有更改对象 key、存储排列或 od/ 代码。
 
 本轮 20 项隔离测试及静态、格式、语法检查通过，新增断言验证读写打包只查一次 MR、后续范围无效时零提交。测试使用合成 buffers 和模拟 CUDA，不代表真实 GIDS 端到端验证。
 

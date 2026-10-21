@@ -28,8 +28,9 @@ from unittest.mock import patch
 NUM_LAYERS = 3
 NUM_PAGES = 5
 PAGE_SIZE = 64
-KV_WIDTH = 16
-INDEXER_WIDTH = 8
+# Byte widths: BF16 MLA (512 + 64) * 2; FP8 index (128) + FP32 scale (4).
+KV_WIDTH = 1152
+INDEXER_WIDTH = 132
 
 
 def print_runtime(linker):

@@ -21,13 +21,6 @@ MAX_GIDS_CONNECTIONS = 8  # od/gids_kernel.cu: MAX_CONN_NUM
 MAX_GIDS_RANGES = 409600  # od/gids_kernel.cu: MAX_BLOCK_NUM
 
 
-def read_io_alignment(config: dict) -> int:
-    alignment = config.get("io_alignment", 512)
-    if type(alignment) is not int or alignment <= 0:
-        raise ValueError("OceanDisk io_alignment must be a positive integer.")
-    return alignment
-
-
 def gids_config_path(config_dir, device_index: int, use_single_port=None) -> Path:
     """Match gids_kernel.cu: unset USE_SINGLE_PORT defaults to single-port."""
     single = use_single_port is None or use_single_port == "1"
@@ -137,7 +130,14 @@ class OceanDiskStorage(HiCacheStorage):
     _initialized = False
     _registered_tensors: list = []
 
-    def __init__(self, config: dict, device: torch.device, buffers: list[torch.Tensor]):
+    def __init__(
+        self,
+        config: dict,
+        device: torch.device,
+        buffers: list[torch.Tensor],
+        *,
+        staging_bytes: int = 0,
+    ):
         connections = config.get("connection_indices", [0])
         if (
             not isinstance(connections, list)
@@ -152,7 +152,6 @@ class OceanDiskStorage(HiCacheStorage):
                 "OceanDisk connection_indices must be distinct integers in [0, 7]."
             )
         self.connection_indices = tuple(connections)
-        self.io_alignment = read_io_alignment(config)
         self._closed = False
         self._lock = threading.Lock()
         self._task_ids = itertools.count(1)
@@ -163,7 +162,16 @@ class OceanDiskStorage(HiCacheStorage):
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("The OceanDisk direct linker requires CUDA buffers.")
+        self._staging = (
+            torch.empty(staging_bytes, dtype=torch.uint8, device=self.device)
+            if staging_bytes
+            else None
+        )
+        buffers = list(buffers)
+        if self._staging is not None:
+            buffers.append(self._staging)
         self.regions = []
+        self._region_views = []
         for buffer in buffers:
             if buffer.device != self.device:
                 raise ValueError(
@@ -173,8 +181,18 @@ class OceanDiskStorage(HiCacheStorage):
             region = (int(storage.data_ptr()), int(storage.nbytes()))
             if region[1] and region not in self.regions:
                 self.regions.append(region)
+                if self._staging is not None:
+                    self._region_views.append(
+                        torch.empty(0, dtype=torch.uint8, device=self.device).set_(
+                            storage, 0, (region[1],), (1,)
+                        )
+                    )
         if not self.regions:
             raise ValueError("OceanDisk has no GPU allocations to register.")
+        if self._staging is not None:
+            self._staging_mr = self.regions.index(
+                (self._staging.data_ptr(), self._staging.numel())
+            )
 
         library = config.get("op_extension") or os.environ.get("OPEXTENSION")
         if not library:
@@ -274,15 +292,6 @@ class OceanDiskStorage(HiCacheStorage):
         count = len(layers[0])
         if count % 2 or any(len(layer) != count for layer in layers):
             raise ValueError("OceanDisk layers require equal, even IO counts.")
-        for layer in layers:
-            for item in layer:
-                if (
-                    item.storage_offset % self.io_alignment
-                    or item.size % self.io_alignment
-                ):
-                    raise ValueError(
-                        f"OceanDisk range size/remote offset must align to {self.io_alignment} bytes."
-                    )
         half = count // 2
         batch_pages = max_ranges // 2
         return [
@@ -299,6 +308,44 @@ class OceanDiskStorage(HiCacheStorage):
             for start in range(0, half, batch_pages)
         ]
 
+    def _stage_batch(self, batch, *, write):
+        """Pad native I/O without accessing bytes outside the source allocation."""
+        rows, copies = [], []
+        cursor = 0
+        for original in batch:
+            row = list(original)
+            count = (len(row) - 1) // 6
+            layer_copies = []
+            for index in range(count):
+                size = row[1 + 4 * count + index]
+                if size % 512 == 0:
+                    continue
+                padded_size = (size + 511) & ~511
+                if (
+                    self._staging is None
+                    or cursor + padded_size > self._staging.numel()
+                ):
+                    raise ValueError(
+                        "OceanDisk padded batch exceeds registered staging memory."
+                    )
+                mr = row[1 + index]
+                local_offset = row[1 + 2 * count + index]
+                source = self._region_views[mr][local_offset : local_offset + size]
+                padded = self._staging[cursor : cursor + padded_size]
+                payload = padded[:size]
+                if write:
+                    padded.zero_()
+                    payload.copy_(source)
+                else:
+                    layer_copies.append((source, payload))
+                row[1 + index] = self._staging_mr
+                row[1 + 2 * count + index] = cursor
+                row[1 + 4 * count + index] = padded_size
+                cursor += padded_size
+            rows.append(row)
+            copies.append(layer_copies)
+        return rows, copies
+
     def get_layers(self, layers, *, max_ranges=256, on_layer_ready=None) -> None:
         import od_utils
 
@@ -311,8 +358,11 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             descriptors = self._pack_layer_batches(layers, max_ranges)
             submitted = []
+            staged = self._staging is not None
             try:
-                for batch in descriptors:
+                for batch_index, batch in enumerate(descriptors):
+                    if staged:
+                        batch, copies = self._stage_batch(batch, write=False)
                     cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
                     gpu = cpu.to(self.device)
                     events = [torch.cuda.Event() for _ in layers]
@@ -332,11 +382,23 @@ class OceanDiskStorage(HiCacheStorage):
                         True,
                         False,
                     )
-                for layer in range(len(layers)):
-                    for _, _, events in submitted:
-                        events[layer].synchronize()
-                    if on_layer_ready is not None:
-                        on_layer_ready(layer)
+                    if staged:
+                        for layer, event in enumerate(events):
+                            event.synchronize()
+                            for target, payload in copies[layer]:
+                                target.copy_(payload)
+                            restored = torch.cuda.Event()
+                            restored.record(self._stream)
+                            restored.synchronize()
+                            if batch_index == len(descriptors) - 1 and on_layer_ready:
+                                on_layer_ready(layer)
+                        submitted.clear()
+                if not staged:
+                    for layer in range(len(layers)):
+                        for _, _, events in submitted:
+                            events[layer].synchronize()
+                        if on_layer_ready is not None:
+                            on_layer_ready(layer)
             except BaseException:
                 self._stream.synchronize()
                 raise
@@ -355,6 +417,8 @@ class OceanDiskStorage(HiCacheStorage):
             submitted = []
             try:
                 for batch in descriptors:
+                    if self._staging is not None:
+                        batch, _ = self._stage_batch(batch, write=True)
                     cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
                     gpu = cpu.to(self.device)
                     lengths = torch.tensor(
@@ -378,9 +442,15 @@ class OceanDiskStorage(HiCacheStorage):
                         False,
                         False,
                     )
-                event = torch.cuda.Event()
-                event.record(self._stream)
-                event.synchronize()
+                    if self._staging is not None:
+                        event = torch.cuda.Event()
+                        event.record(self._stream)
+                        event.synchronize()
+                        submitted.clear()
+                if self._staging is None:
+                    event = torch.cuda.Event()
+                    event.record(self._stream)
+                    event.synchronize()
             except BaseException:
                 self._stream.synchronize()
                 raise
