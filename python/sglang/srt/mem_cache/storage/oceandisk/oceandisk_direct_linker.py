@@ -131,7 +131,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 config,
                 self.device,
                 buffers,
-                staging_bytes=self._staging_bytes_per_pair * (self.max_ranges // 2),
             )
             if storage is None
             else storage
@@ -179,7 +178,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
         counts = []
         self._storage_offsets = {}
-        self._staging_bytes_per_pair = 0
         for name, entry in self.pools.items():
             if not entry.packed:
                 raise ValueError("OceanDisk requires packed=True for page objects.")
@@ -197,10 +195,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 if meta is None or not meta[1][0]:
                     raise ValueError("Each DSA layer needs KV and Indexer fragments.")
                 layer_counts.append(len(meta[1][0]))
-                self._staging_bytes_per_pair += max(
-                    ((size + 511) & ~511 for size in meta[1][0] if size % 512),
-                    default=0,
-                )
             counts.extend(layer_counts)
         if len(set(counts)) != 1:
             raise ValueError(

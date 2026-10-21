@@ -128,7 +128,6 @@ class TestOceanDiskStorage(CustomTestCase):
         storage.regions = [(1000, 4096), (10000, 4096)]
         storage.connection_indices = (2, 5)
         storage._task_ids = itertools.count(1)
-        storage._staging = None
         trace = []
 
         class Metadata:
@@ -210,7 +209,7 @@ class TestOceanDiskStorage(CustomTestCase):
         for row in args[0].values:
             self.assertEqual(row[1:5], [0, 0, 1, 1])
             self.assertEqual(row[5:9], [1, 2, 1, 2])
-            self.assertEqual(row[17:21], [16, 16, 8, 8])
+            self.assertEqual(row[17:21], [512, 512, 512, 512])
             self.assertEqual(row[21:25], [5, 2, 5, 2])
         self.assertEqual(ready, [0, 1, 2])
         self.assertEqual(
@@ -279,7 +278,7 @@ class TestOceanDiskStorage(CustomTestCase):
                 count = (len(row) - 1) // 6
                 keys = row[1 + count : 1 + count * 2]
                 self.assertEqual(keys[: count // 2], keys[count // 2 :])
-        self.assertEqual(calls[0].args[0].values[0][17:21], [16, 16, 8, 8])
+        self.assertEqual(calls[0].args[0].values[0][17:21], [512, 512, 512, 512])
         self.assertEqual([kind for kind, _ in trace], ["put", "put", "record", "wait"])
         storage._ops.kvcache_store_v2.assert_not_called()
 
@@ -319,105 +318,55 @@ class TestOceanDiskStorage(CustomTestCase):
                 storage.get_layers(layers)
         self.od_utils.batch_dispatch_get.assert_not_called()
 
-    def test_padded_indexer_roundtrip_uses_bounded_staging_across_chunks(self):
-        class Bytes:
-            def __init__(self, size, *, data=None, start=0):
-                self.data = bytearray(size) if data is None else data
-                self.start = start
-                self.size = size
-
-            def numel(self):
-                return self.size
-
-            def __getitem__(self, region):
-                start = region.start or 0
-                stop = self.size if region.stop is None else region.stop
-                if not 0 <= start <= stop <= self.size:
-                    raise AssertionError("Copy exceeds allocated buffer")
-                return Bytes(stop - start, data=self.data, start=self.start + start)
-
-            def zero_(self):
-                self.data[self.start : self.start + self.size] = bytes(self.size)
-
-            def copy_(self, source):
-                if self.size != source.size:
-                    raise AssertionError("Copy lengths differ")
-                self.data[self.start : self.start + self.size] = source.snapshot()
-
-            def snapshot(self):
-                return bytes(self.data[self.start : self.start + self.size])
-
-        storage, _, _ = self.make_storage()
-        kv, indexer = Bytes(4 * 512), Bytes(4 * 8448)
-        kv.data[:] = bytes((i % 251 for i in range(kv.numel())))
-        indexer.data[:] = bytes(((i + 71) % 251 for i in range(indexer.numel())))
-        expected = (kv.snapshot(), indexer.snapshot())
-        storage._staging = Bytes(2 * 8704)
-        storage._staging_mr = 2
-        storage._region_views = [kv, indexer, storage._staging]
-        storage.regions = [
-            (100000, kv.numel()),
-            (400000, indexer.numel()),
-            (800000, 17408),
-        ]
+    def test_legacy_direct_indexer_io_keeps_raw_offsets_and_pads_lengths(self):
+        storage, trace, _ = self.make_storage()
+        storage.regions = [(100000, 4 * 73728), (500000, 4 * 8448)]
         layers = [
             [
                 OceanDiskRange(
-                    page + 1, 100000 + (2 * layer + page) * 512, 512, layer * 512
+                    page + 1,
+                    100000 + (2 * layer + page) * 73728,
+                    73728,
+                    layer * 73728,
                 )
                 for page in range(2)
             ]
             + [
                 OceanDiskRange(
-                    page + 1, 400000 + (2 * layer + page) * 8448, 8448, layer * 8704
+                    page + 1,
+                    500000 + (2 * layer + page) * 8448,
+                    8448,
+                    layer * 8704,
                 )
                 for page in range(2)
             ]
             for layer in range(2)
         ]
-        remote = {}
-
-        def native(write, metadata, *_):
-            for row in metadata.values:
-                count = (len(row) - 1) // 6
-                for i in range(count):
-                    mr = row[1 + i]
-                    key = row[1 + count + i]
-                    local = row[1 + 2 * count + i]
-                    offset = row[1 + 3 * count + i]
-                    size = row[1 + 4 * count + i]
-                    self.assertEqual(size % 512, 0)
-                    self.assertEqual(offset % 512, 0)
-                    target = storage._region_views[mr][local : local + size]
-                    identity = (i >= count // 2, key, offset)
-                    if write:
-                        remote[identity] = target.snapshot()
-                        if identity[0]:
-                            self.assertEqual(size, 8704)
-                            self.assertEqual(remote[identity][-256:], bytes(256))
-                    else:
-                        target.copy_(Bytes(size, data=bytearray(remote[identity])))
-
-        self.od_utils.batch_dispatch_put.side_effect = lambda *args: native(True, *args)
-        self.od_utils.batch_dispatch_get.side_effect = lambda *args: native(
-            False, *args
-        )
-        storage.put_layers(layers, max_ranges=2)
-        kv.data[:] = bytes([255]) * kv.numel()
-        indexer.data[:] = bytes([255]) * indexer.numel()
         ready = []
-
-        def on_ready(layer):
-            for view, original, size in zip((kv, indexer), expected, (512, 8448)):
-                start, end = 2 * layer * size, 2 * (layer + 1) * size
-                self.assertEqual(view[start:end].snapshot(), original[start:end])
-            ready.append(layer)
-
-        storage.get_layers(layers, max_ranges=2, on_layer_ready=on_ready)
+        storage.put_layers(layers, max_ranges=2)
+        storage.get_layers(layers, max_ranges=2, on_layer_ready=ready.append)
         self.assertEqual(ready, [0, 1])
-        self.assertEqual((kv.snapshot(), indexer.snapshot()), expected)
-        self.assertEqual(self.od_utils.batch_dispatch_put.call_count, 2)
-        self.assertEqual(self.od_utils.batch_dispatch_get.call_count, 2)
+        for dispatch in (
+            self.od_utils.batch_dispatch_put,
+            self.od_utils.batch_dispatch_get,
+        ):
+            self.assertEqual(dispatch.call_count, 2)
+            for page, call in enumerate(dispatch.call_args_list):
+                for layer, row in enumerate(call.args[0].values):
+                    self.assertEqual(row[1:3], [0, 1])
+                    self.assertEqual(row[3:5], [page + 1, page + 1])
+                    self.assertEqual(
+                        row[5:7],
+                        [(2 * layer + page) * 73728, (2 * layer + page) * 8448],
+                    )
+                    self.assertEqual(row[7:9], [layer * 73728, layer * 8704])
+                    self.assertEqual(row[9:11], [73728, 8704])
+        # Intentionally reproduce legacy overrun: the last wire range exceeds
+        # the actual registered allocation. This test does not certify safety.
+        last = self.od_utils.batch_dispatch_get.call_args.args[0].values[-1]
+        self.assertEqual(last[6] + last[10] - storage.regions[1][1], 256)
+        self.assertFalse(hasattr(storage, "_staging"))
+        self.assertEqual(sum(kind == "wait" for kind, _ in trace), 5)
 
     def test_get_error_drains_before_releasing_metadata(self):
         storage, _, _ = self.make_storage()
@@ -611,7 +560,6 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertEqual(
             indexer.ptr, linker.pools[PoolName.INDEXER].buffer_meta[0][1][0] + 8448
         )
-        self.assertEqual(linker._staging_bytes_per_pair, 2 * 8704)
 
     def test_unpacked_layout_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "packed=True"):
