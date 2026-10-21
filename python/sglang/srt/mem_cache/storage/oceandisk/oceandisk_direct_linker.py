@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     MAX_GIDS_RANGES,
     OceanDiskRange,
     OceanDiskStorage,
+    completion_key,
     encode_key,
     trace_event,
 )
@@ -24,6 +25,66 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCache
 from sglang.srt.runtime_context import get_memory, get_model
 
 logger = logging.getLogger(__name__)
+
+
+class LayerwiseSaveSession:
+    """One forward's paired KV/Indexer puts; source slots stay request-owned."""
+
+    def __init__(self, linker, layers, keys, phase="prefill"):
+        self.linker = linker
+        self.keys = keys
+        self.phase = phase
+        self.next_layer = 0
+        self.on_saved = None
+        self.ready_events = []
+        self.prepared = (
+            linker.storage.prepare_layerwise_put(layers, max_ranges=linker.max_ranges)
+            if linker.offload_owner
+            else None
+        )
+
+    def __enter__(self):
+        return self
+
+    def save_layer(self, layer):
+        if layer != self.next_layer:
+            raise RuntimeError(
+                f"OceanDisk expected save layer {self.next_layer}, got {layer}."
+            )
+        if self.linker.offload_owner:
+            event = self.linker._ready_event()
+            self.ready_events.append(event)
+            self.linker.storage.submit_put_layer(layer, self.prepared[layer], event)
+        self.next_layer += 1
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.linker.offload_owner:
+                # Drain even on an aborted forward before releasing metadata/slots.
+                self.linker.storage.wait_for_save()
+            if exc_type is not None:
+                return False
+            if self.next_layer != self.linker.num_layers:
+                raise RuntimeError(
+                    f"OceanDisk saved {self.next_layer}/{self.linker.num_layers} layers."
+                )
+            if self.linker.offload_owner:
+                self.linker.storage.publish_pages(
+                    self.keys, max_ranges=self.linker.max_ranges
+                )
+            self.linker._layerwise_saved_keys.update(self.keys)
+            if self.on_saved is not None:
+                self.on_saved()
+            trace_event(
+                "LAYERWISE_SAVE_DONE",
+                pages=len(self.keys),
+                layers=self.next_layer,
+                phase=self.phase,
+            )
+        finally:
+            self.prepared = None
+            self.ready_events.clear()
+        return False
 
 
 class LayerWiseLoadCounter:
@@ -142,6 +203,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self.offload_queue = Queue()
         self.offload_results: Queue[bool] = Queue()
         self._closed = False
+        self._layerwise_saved_keys = set()
+        self.layerwise_save_enabled = (
+            config.get("layerwise_save", True)
+            and params.pp_size == 1
+            and params.attn_cp_size == 1
+            and not getattr(server_args, "speculative_algorithm", None)
+        )
         self._load_thread = threading.Thread(
             target=self._load_worker, daemon=True, name=f"oceandisk-load-tp{tp_rank}"
         )
@@ -238,7 +306,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
-        bitmap = self.storage.exists_many(keys)
+        bitmap = self.storage.exists_many([completion_key(key) for key in keys])
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         trace_event(
             "LOOKUP", rid=rid, pages=len(keys), prefix_pages=end, first_key=keys[0]
@@ -284,7 +352,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
-    def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
+    def _transfer_layers(self, transfers, *, skip_saved=False):
         prepared = [
             (
                 transfer,
@@ -292,18 +360,58 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
             for transfer in transfers
         ]
+        if skip_saved:
+            saved = getattr(self, "_layerwise_saved_keys", set())
+            prepared = [
+                (
+                    transfer,
+                    [
+                        (key, location)
+                        for key, location in zip(transfer.keys, locations, strict=True)
+                        if self._object_key(key) not in saved
+                    ],
+                )
+                for transfer, locations in prepared
+            ]
+        else:
+            prepared = [
+                (transfer, list(zip(transfer.keys, locations, strict=True)))
+                for transfer, locations in prepared
+            ]
         layers = []
         for layer in range(self.num_layers):
             pools = {PoolName.KV: [], PoolName.INDEXER: []}
-            for transfer, locations in prepared:
+            for transfer, pages in prepared:
                 pools[transfer.name].extend(
                     self._page_fragments(
-                        transfer.name, list(transfer.keys), locations, layer
+                        transfer.name,
+                        [key for key, _ in pages],
+                        [location for _, location in pages],
+                        layer,
                     )
                 )
             layers.append(pools[PoolName.KV] + pools[PoolName.INDEXER])
+        return layers
+
+    def begin_layerwise_save(self, transfers, *, phase="prefill"):
+        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
+        layers = self._transfer_layers(expanded, skip_saved=True)
+        if not layers or not layers[0]:
+            return None
+        keys = list(dict.fromkeys(item.key for item in layers[0]))
+        trace_event(
+            "LAYERWISE_SAVE_BEGIN", pages=len(keys), layers=self.num_layers, phase=phase
+        )
+        return LayerwiseSaveSession(self, layers, keys, phase)
+
+    def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
+        layers = self._transfer_layers(transfers, skip_saved=write)
         if write:
-            self.storage.put_layers(layers, max_ranges=self.max_ranges)
+            if layers and layers[0]:
+                self.storage.put_layers(layers, max_ranges=self.max_ranges)
+                self.storage.publish_pages(
+                    [item.key for item in layers[0]], max_ranges=self.max_ranges
+                )
         else:
             self.storage.get_layers(
                 layers,
@@ -356,6 +464,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self.offload_results.put(True)
             trace_event("OFFLOAD_SKIPPED", reason="non_owner_rank")
         else:
+            # Even already-saved pages must acknowledge in UC's submission order.
             self.offload_queue.put((expanded, self._ready_event()))
             trace_event(
                 "OFFLOAD_QUEUED",
@@ -411,6 +520,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 except Empty:
                     break
         self.layer_done_counter.reset()
+        self._layerwise_saved_keys.clear()
 
     def close(self) -> None:
         if self._closed:

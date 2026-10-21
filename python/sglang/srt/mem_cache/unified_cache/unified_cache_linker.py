@@ -187,6 +187,77 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def prepare_layerwise_save(self, batch):
+        """Plan full pages before forward; only OceanDisk opts into this hook."""
+        mode = batch.forward_mode
+        if not (mode.is_decode() or mode.name == "EXTEND"):
+            return None
+        if not batch.spec_algorithm.is_none():
+            return None
+        if any(req.multimodal_inputs is not None for req in batch.reqs):
+            return None
+        lengths = batch.seq_lens_cpu.tolist()
+        counts = [1] * len(batch.reqs) if mode.is_decode() else batch.extend_lens
+        # Read actual input ids, not possibly unresolved overlap-sampling outputs.
+        inputs = batch.input_ids.detach().cpu().tolist()
+        cursor = 0
+        transfers, completed = [], []
+        page_size = self.cache.page_size
+        for req, end, count in zip(batch.reqs, lengths, counts, strict=True):
+            start = end - count
+            history = getattr(req, "_uc_layerwise_tokens", None)
+            if history is None or len(history) < start:
+                history = list(req.origin_input_ids[:start])
+                history.extend(req.output_ids[: max(0, start - len(history))])
+            if len(history) < start:
+                raise RuntimeError(
+                    "OceanDisk cannot reconstruct the forward's token prefix."
+                )
+            del history[start:]
+            history.extend(inputs[cursor : cursor + count])
+            tokens = history
+            cursor += count
+            req._uc_layerwise_tokens = tokens
+            first = max(
+                start // page_size,
+                req.kv.cache_protected_len // page_size,
+                getattr(req, "_uc_layerwise_saved_tokens", 0) // page_size,
+            )
+            last = end // page_size
+            if first >= last:
+                continue
+            key = RadixKey(
+                tokens,
+                req.extra_key,
+                cache_salt=req.cache_salt,
+                is_bigram=self.cache.tree_core.is_eagle,
+            ).page_aligned(page_size)
+            hashes = get_storage_hash_str(key, page_size=page_size)
+            slots = self.cache.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, first * page_size : last * page_size
+            ].clone()
+            transfers.append(
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=hashes[first:last],
+                    device_indices=slots,
+                )
+            )
+            completed.append((req, last * page_size))
+        if not transfers:
+            return None
+        session = self.cache_linker.begin_layerwise_save(
+            transfers, phase="decode" if mode.is_decode() else "prefill"
+        )
+        if session is not None:
+
+            def on_saved():
+                for req, length in completed:
+                    req._uc_layerwise_saved_tokens = length
+
+            session.on_saved = on_saved
+        return session
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:

@@ -12,12 +12,18 @@ set -euo pipefail
 # USE_SINGLE_PORT=0 GIDS_DIR=/path/to/config \
 #   bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk
 
+# 开layerwise
+# bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk \
+#   --hicache-storage-backend-extra-config '{"layerwise_save":true}'
 
 # Edit these paths for your machine.
 MODEL_PATH="${MODEL_PATH:-/home/models/GLM-5.2-W4AFP8/}"
 DATASET_PATH="${DATASET_PATH:-/home/z00591349/dataset/multifieldqa_zh.jsonl}"
 OPEXTENSION="${OPEXTENSION:-/opt/oceandisk/libop_extension.so}"
-GIDS_CONFIG="${GIDS_CONFIG:-/opt/oceandisk/config/gids_config.txt}"
+# 1：所有卡使用 GIDS_CONFIG；0：各卡使用 GIDS_DIR/gids_config_<设备号>.txt。
+USE_SINGLE_PORT="${USE_SINGLE_PORT:-1}"
+GIDS_DIR="${GIDS_DIR:-/opt/oceandisk/config}"
+GIDS_CONFIG="${GIDS_CONFIG:-${GIDS_DIR%/}/gids_config.txt}"
 
 mode=base
 if [[ "${1:-}" == base || "${1:-}" == oceandisk ]]; then
@@ -26,7 +32,6 @@ if [[ "${1:-}" == base || "${1:-}" == oceandisk ]]; then
 fi
 linker_args=()
 if [[ "$mode" == oceandisk ]]; then
-    USE_SINGLE_PORT="${USE_SINGLE_PORT:-1}"
     case "$USE_SINGLE_PORT" in
         1)
             if [[ "$(basename -- "$GIDS_CONFIG")" != gids_config.txt ]]; then
@@ -36,7 +41,6 @@ if [[ "$mode" == oceandisk ]]; then
             GIDS_DIR="$(cd -- "$(dirname -- "$GIDS_CONFIG")" && pwd)/"
             ;;
         0)
-            GIDS_DIR="${GIDS_DIR:-$(dirname -- "$GIDS_CONFIG")}"
             GIDS_DIR="$(cd -- "$GIDS_DIR" && pwd)/"
             ;;
         *)

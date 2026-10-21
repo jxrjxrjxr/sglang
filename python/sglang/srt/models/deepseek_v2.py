@@ -2459,6 +2459,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        saver = getattr(forward_batch, "layerwise_kv_saver", None)
+        if saver is not None:
+            saver.save_layer(self.layer_id)
         get_attn_tp_context().clear_attn_inputs()
 
         maybe_prefetch_next_full_attention_kv(

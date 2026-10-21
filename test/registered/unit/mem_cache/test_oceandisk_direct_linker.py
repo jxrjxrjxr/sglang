@@ -5,6 +5,7 @@ import itertools
 import tempfile
 import threading
 import unittest
+from array import array
 from contextlib import nullcontext
 from pathlib import Path
 from queue import Queue
@@ -23,11 +24,13 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
     LayerWiseLoadCounter,
+    LayerwiseSaveSession,
     OceanDiskDirectLinker,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskRange,
     OceanDiskStorage,
+    completion_key,
     encode_key,
     gids_config_path,
     pack_io,
@@ -36,6 +39,9 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    UnifiedCacheLinkerWrapper,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -384,6 +390,41 @@ class TestOceanDiskStorage(CustomTestCase):
         ready.assert_not_called()
         storage._stream.synchronize.assert_called_once()
 
+    def test_layerwise_put_waits_on_gpu_and_retains_metadata_until_final_wait(self):
+        storage, trace, events = self.make_storage()
+        prepared = storage.prepare_layerwise_put(
+            [self.layer_ranges(2, layer) for layer in range(2)], max_ranges=2
+        )
+        self.assertEqual(len(prepared), 2)
+        self.assertEqual([len(layer) for layer in prepared], [2, 2])
+        ready = [Mock(), Mock()]
+        for layer in range(2):
+            storage.submit_put_layer(layer, prepared[layer], ready[layer])
+        self.assertFalse(events)
+        self.assertEqual(self.od_utils.batch_dispatch_put.call_count, 4)
+        self.assertEqual(
+            storage._stream.wait_event.call_args_list,
+            [unittest.mock.call(event) for event in ready],
+        )
+        for call in self.od_utils.batch_dispatch_put.call_args_list:
+            self.assertEqual(call.args[0].shape, (1, 13))
+            self.assertEqual(call.args[5:], ([], 123, 0, 0, 1, False, False))
+        self.assertEqual([kind for kind, _ in trace], ["put"] * 4)
+        for event in ready:
+            event.synchronize.assert_not_called()
+        storage.wait_for_save()
+        self.assertEqual([kind for kind, _ in trace][-2:], ["record", "wait"])
+
+    def test_completion_marker_has_a_separate_key_and_is_published_in_both_pools(self):
+        storage, _, _ = self.make_storage()
+        storage._completion_buffer = SimpleNamespace(data_ptr=lambda: 1000)
+        storage.publish_pages([7, 7, 8])
+        rows = self.od_utils.batch_dispatch_put.call_args.args[0].values
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][5:9], [completion_key(7), completion_key(8)] * 2)
+        self.assertEqual(rows[0][17:21], [512] * 4)
+        self.assertNotEqual(completion_key(7), 7)
+
     def test_descriptor_uses_paired_keys_and_registration_offsets(self):
         ranges = [
             OceanDiskRange(7, 1032, 16, 64),
@@ -491,6 +532,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker._namespace = ("sglang-oceandisk-pool-pages", "test-model", 2, 1)
         linker._validate_dsa_layout()
         linker._closed = False
+        linker._layerwise_saved_keys = set()
         linker.storage = Mock()
         linker.max_ranges = 3
         linker.layer_done_counter = LayerWiseLoadCounter(2)
@@ -658,7 +700,9 @@ class TestOceanDiskDirectLinker(CustomTestCase):
 
     def test_lookup_probes_shared_dsa_keys_and_checks_holes(self):
         linker = self.make_linker()
-        missing = linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 1)[0].key
+        missing = completion_key(
+            linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 1)[0].key
+        )
         linker.storage.exists_many.side_effect = lambda keys: [
             k != missing for k in keys
         ]
@@ -684,6 +728,53 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker._ready_event = Mock(side_effect=AssertionError("non-owner wrote"))
         self.assertTrue(linker.offload([transfer]))
         self.assertTrue(linker.pop_completed_offload())
+
+    def test_uc_offload_ack_does_not_repeat_a_completed_layerwise_save(self):
+        linker = self.make_linker()
+        linker.offload_owner = True
+        linker._layerwise_saved_keys.add(linker._object_key("p0"))
+        linker._ready_event = Mock()
+        linker.device = "cuda:0"
+        linker.offload_queue = Queue()
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([2, 3])
+        )
+        self.assertTrue(linker.offload([transfer]))
+        self.assertEqual(linker.num_completed_offloads(), 0)
+        linker.offload_queue.put(None)
+        with patch("torch.cuda.device", return_value=nullcontext()):
+            linker._offload_worker()
+        self.assertTrue(linker.pop_completed_offload())
+        expanded = linker.pool_group.resolve_transfers([transfer])
+        linker._run_transfers(expanded, write=True)
+        linker.storage.put_layers.assert_not_called()
+        linker.storage.publish_pages.assert_not_called()
+
+    def test_saved_page_ack_cannot_overtake_an_earlier_failed_offload(self):
+        linker = self.make_linker()
+        linker.offload_owner = True
+        linker.device = "cuda:0"
+        linker.offload_queue = Queue()
+        linker._ready_event = Mock()
+        linker._layerwise_saved_keys.add(linker._object_key("saved"))
+        for key in ("unsaved", "saved"):
+            linker.offload(
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=[key],
+                        device_indices=torch.tensor([2, 3]),
+                    )
+                ]
+            )
+        linker.storage.put_layers.side_effect = RuntimeError("first offload failed")
+        self.assertEqual(linker.num_completed_offloads(), 0)
+        linker.offload_queue.put(None)
+        with patch("torch.cuda.device", return_value=nullcontext()):
+            linker._offload_worker()
+        self.assertFalse(linker.pop_completed_offload())
+        self.assertTrue(linker.pop_completed_offload())
+        linker.storage.put_layers.assert_called_once()
 
     def test_dsa_indexer_is_derived_from_logical_kv(self):
         linker = self.make_linker()
@@ -722,6 +813,165 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertEqual(linker.load_queue.unfinished_tasks, 0)
         with self.assertRaisesRegex(RuntimeError, "OceanDisk layer-wise"):
             linker.layer_done_counter.wait_until(0)
+
+
+class TestOceanDiskLayerwiseSave(CustomTestCase):
+    def make_session(self, owner=True):
+        linker = Mock()
+        linker.offload_owner = owner
+        linker.num_layers = 2
+        linker.max_ranges = 256
+        linker._layerwise_saved_keys = set()
+        linker.storage.prepare_layerwise_put.return_value = [["layer0"], ["layer1"]]
+        return linker, LayerwiseSaveSession(linker, [[], []], [7, 8])
+
+    def test_forward_saves_layers_without_waiting_and_publishes_only_at_end(self):
+        linker, session = self.make_session()
+        session.on_saved = Mock()
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+            self.assertEqual(linker.storage.submit_put_layer.call_count, 2)
+            linker.storage.wait_for_save.assert_not_called()
+            linker.storage.publish_pages.assert_not_called()
+            session.on_saved.assert_not_called()
+            self.assertEqual(linker._layerwise_saved_keys, set())
+        self.assertEqual(
+            [call[0] for call in linker.storage.method_calls],
+            [
+                "prepare_layerwise_put",
+                "submit_put_layer",
+                "submit_put_layer",
+                "wait_for_save",
+                "publish_pages",
+            ],
+        )
+        self.assertEqual(linker._layerwise_saved_keys, {7, 8})
+        session.on_saved.assert_called_once()
+        self.assertIsNone(session.prepared)
+
+    def test_incomplete_forward_drains_but_does_not_publish(self):
+        linker, session = self.make_session()
+        with self.assertRaisesRegex(RuntimeError, "1/2"):
+            with session:
+                session.save_layer(0)
+        linker.storage.wait_for_save.assert_called_once()
+        linker.storage.publish_pages.assert_not_called()
+        self.assertFalse(linker._layerwise_saved_keys)
+        self.assertIsNone(session.prepared)
+
+    def test_failed_forward_drains_and_preserves_the_original_exception(self):
+        linker, session = self.make_session()
+        with self.assertRaisesRegex(ValueError, "forward failed"):
+            with session:
+                session.save_layer(0)
+                raise ValueError("forward failed")
+        linker.storage.wait_for_save.assert_called_once()
+        linker.storage.publish_pages.assert_not_called()
+        self.assertFalse(linker._layerwise_saved_keys)
+
+    def test_publication_failure_does_not_mark_local_pages_saved(self):
+        linker, session = self.make_session()
+        linker.storage.publish_pages.side_effect = RuntimeError("publish failed")
+        with self.assertRaisesRegex(RuntimeError, "publish failed"):
+            with session:
+                session.save_layer(0)
+                session.save_layer(1)
+        self.assertFalse(linker._layerwise_saved_keys)
+
+    def test_non_owner_runs_same_layer_lifecycle_without_native_puts(self):
+        linker, session = self.make_session(owner=False)
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        self.assertFalse(linker.storage.method_calls)
+        self.assertEqual(linker._layerwise_saved_keys, {7, 8})
+
+    def make_planner(self):
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache = SimpleNamespace(
+            page_size=64,
+            tree_core=SimpleNamespace(is_eagle=False),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(256).reshape(2, 128)
+            ),
+        )
+        wrapper.cache_linker = Mock()
+        req = SimpleNamespace(
+            origin_input_ids=array("q", range(65)),
+            output_ids=array("q"),
+            extra_key="tenant",
+            cache_salt="salt",
+            multimodal_inputs=None,
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=0),
+        )
+        return wrapper, req
+
+    @staticmethod
+    def make_batch(req, tokens, end, mode="EXTEND"):
+        return SimpleNamespace(
+            reqs=[req],
+            seq_lens_cpu=torch.tensor([end]),
+            extend_lens=[len(tokens)],
+            input_ids=torch.tensor(tokens),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            forward_mode=SimpleNamespace(name=mode, is_decode=lambda: mode == "DECODE"),
+        )
+
+    def test_prefill_and_chunk_resume_select_only_new_complete_pages(self):
+        wrapper, req = self.make_planner()
+        hash_calls = []
+
+        def hashes(key, **kwargs):
+            hash_calls.append(key)
+            return [f"page{i}" for i in range(len(key) // 64)]
+
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__, {"get_storage_hash_str": hashes}
+        ):
+            session = wrapper.prepare_layerwise_save(
+                self.make_batch(req, list(range(65)), 65)
+            )
+            transfer = wrapper.cache_linker.begin_layerwise_save.call_args.args[0][0]
+            self.assertEqual(transfer.keys, ["page0"])
+            self.assertEqual(transfer.device_indices.tolist(), list(range(64)))
+            self.assertFalse(hasattr(req, "_uc_layerwise_saved_tokens"))
+            session.on_saved()
+            self.assertEqual(req._uc_layerwise_saved_tokens, 64)
+            wrapper.prepare_layerwise_save(
+                self.make_batch(req, list(range(65, 128)), 128)
+            )
+            transfer = wrapper.cache_linker.begin_layerwise_save.call_args.args[0][0]
+            self.assertEqual(transfer.keys, ["page1"])
+            self.assertEqual(transfer.device_indices.tolist(), list(range(64, 128)))
+        self.assertEqual(list(hash_calls[0]), list(range(64)))
+        self.assertEqual(list(hash_calls[1]), list(range(128)))
+        self.assertEqual(
+            (hash_calls[0].extra_key, hash_calls[0].cache_salt), ("tenant", "salt")
+        )
+
+    def test_decode_uses_actual_input_instead_of_unresolved_output_and_skips_partial_page(
+        self,
+    ):
+        wrapper, req = self.make_planner()
+        req.origin_input_ids = list(range(60))
+        req.output_ids = [-1] * 4
+        req._uc_layerwise_tokens = list(range(63))
+        hasher = Mock(return_value=["decoded-page"])
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__, {"get_storage_hash_str": hasher}
+        ):
+            session = wrapper.prepare_layerwise_save(
+                self.make_batch(req, [63], 64, "DECODE")
+            )
+            self.assertEqual(list(hasher.call_args.args[0]), list(range(64)))
+            self.assertEqual(req._uc_layerwise_tokens, list(range(64)))
+            session.on_saved()
+            self.assertIsNone(
+                wrapper.prepare_layerwise_save(self.make_batch(req, [64], 65, "DECODE"))
+            )
+            self.assertEqual(req._uc_layerwise_tokens, list(range(65)))
+            self.assertEqual(hasher.call_count, 1)
 
 
 if __name__ == "__main__":

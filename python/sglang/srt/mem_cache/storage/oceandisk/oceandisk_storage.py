@@ -123,6 +123,11 @@ def encode_key(identity: tuple) -> int:
     ) or 1
 
 
+def completion_key(key: int) -> int:
+    """Separate page visibility from the presence of its first written layer."""
+    return encode_key(("sglang-oceandisk-complete", key))
+
+
 def resolve_mr(regions: list[tuple[int, int]], ptr: int, size: int) -> tuple[int, int]:
     if size <= 0:
         raise ValueError("OceanDisk ranges must have positive length.")
@@ -197,7 +202,10 @@ class OceanDiskStorage(HiCacheStorage):
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("The OceanDisk direct linker requires CUDA buffers.")
-        buffers = list(buffers)
+        self._completion_buffer = torch.zeros(
+            512, dtype=torch.uint8, device=self.device
+        )
+        buffers = [*buffers, self._completion_buffer]
         self.regions = []
         for buffer in buffers:
             if buffer.device != self.device:
@@ -474,6 +482,71 @@ class OceanDiskStorage(HiCacheStorage):
             except BaseException:
                 self._stream.synchronize()
                 raise
+
+    def prepare_layerwise_put(self, layers, *, max_ranges=256):
+        """Prepare descriptors before forward, retaining them through wait_for_save."""
+        torch = self._torch
+        with torch.cuda.device(self.device):
+            self._ensure_open()
+            batches = self._pack_layer_batches(layers, max_ranges)
+            prepared = [[] for _ in layers]
+            for batch in batches:
+                for layer, row in enumerate(batch):
+                    cpu = torch.tensor([row], dtype=torch.int64, device="cpu")
+                    gpu = cpu.to(self.device)
+                    lengths = torch.tensor([len(row)], dtype=torch.int64, device="cpu")
+                    indices = torch.tensor([0], dtype=torch.int64, device="cpu")
+                    prepared[layer].append((cpu, gpu, lengths, indices))
+            return prepared
+
+    def submit_put_layer(self, layer, prepared, ready_event):
+        import od_utils
+
+        torch = self._torch
+        with (
+            self._lock,
+            torch.cuda.device(self.device),
+            torch.cuda.stream(self._stream),
+        ):
+            self._ensure_open()
+            self._stream.wait_event(ready_event)
+            for cpu, gpu, lengths, indices in prepared:
+                od_utils.batch_dispatch_put(
+                    gpu,
+                    lengths,
+                    indices,
+                    cpu,
+                    self._output,
+                    [],
+                    self._stream.stream_id,
+                    self.device.index,
+                    0,
+                    1,
+                    False,
+                    False,
+                )
+            trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
+
+    def wait_for_save(self):
+        torch = self._torch
+        with (
+            self._lock,
+            torch.cuda.device(self.device),
+            torch.cuda.stream(self._stream),
+        ):
+            event = torch.cuda.Event()
+            event.record(self._stream)
+            event.synchronize()
+
+    def publish_pages(self, keys, *, max_ranges=256):
+        """Publish only after all KV and Indexer layers have finished writing."""
+        ptr = self._completion_buffer.data_ptr()
+        ranges = [
+            OceanDiskRange(completion_key(key), ptr, 512) for key in dict.fromkeys(keys)
+        ]
+        if ranges:
+            self.put_layers([ranges + ranges], max_ranges=max_ranges)
+            trace_event("PAGES_PUBLISHED", pages=len(ranges))
 
     @staticmethod
     def _unsupported_hicache() -> NotImplementedError:

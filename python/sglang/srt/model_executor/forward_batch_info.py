@@ -422,6 +422,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
+    # Per-forward save lifecycle; absent during graph capture and replay.
+    layerwise_kv_saver: Optional[object] = None
+
     # The write loc before `rebind_write_loc` replaced it with kernel-facing
     # ids; a backend re-derives from it into its capture-stable buffer.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
