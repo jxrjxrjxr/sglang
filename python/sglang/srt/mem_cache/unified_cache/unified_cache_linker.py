@@ -176,6 +176,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        self.pending_layerwise_saves = []
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -189,6 +190,12 @@ class UnifiedCacheLinkerWrapper:
 
     def prepare_layerwise_save(self, batch):
         """Plan full pages before forward; only OceanDisk opts into this hook."""
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        allocator = self.cache.token_to_kv_pool_allocator
+        # Other layouts need their own source-page lifetime integration.
+        if type(allocator) is not PagedTokenToKVPoolAllocator:
+            return None
         mode = batch.forward_mode
         if not (mode.is_decode() or mode.name == "EXTEND"):
             return None
@@ -221,7 +228,7 @@ class UnifiedCacheLinkerWrapper:
             first = max(
                 start // page_size,
                 req.kv.cache_protected_len // page_size,
-                getattr(req, "_uc_layerwise_saved_tokens", 0) // page_size,
+                getattr(req, "_uc_layerwise_submitted_tokens", 0) // page_size,
             )
             last = end // page_size
             if first >= last:
@@ -249,14 +256,51 @@ class UnifiedCacheLinkerWrapper:
         session = self.cache_linker.begin_layerwise_save(
             transfers, phase="decode" if mode.is_decode() else "prefill"
         )
+        for transfer, (req, _) in zip(transfers, completed, strict=True):
+            receipts = getattr(req, "_uc_layerwise_receipts", None)
+            if receipts is None:
+                receipts = req._uc_layerwise_receipts = set()
+            receipts.update(
+                receipt
+                for receipt in self.cache_linker.get_layerwise_receipts(transfer.keys)
+                if receipt is not None
+            )
         if session is not None:
+            pages = torch.cat(
+                [
+                    transfer.device_indices[::page_size] // page_size
+                    for transfer in transfers
+                ]
+            )
+            lease = allocator.pin_pages_for_io(pages)
+            session.release_source = lambda: allocator.unpin_pages_for_io(lease)
 
-            def on_saved():
-                for req, length in completed:
-                    req._uc_layerwise_saved_tokens = length
+            def on_submitted():
+                if not session.aborted:
+                    for req, length in completed:
+                        req._uc_layerwise_submitted_tokens = length
+                self.pending_layerwise_saves.append(session)
 
-            session.on_saved = on_saved
+            session.on_submitted = on_submitted
         return session
+
+    def num_completed_layerwise_saves(self):
+        count = 0
+        for session in self.pending_layerwise_saves:
+            if not session.completion.done():
+                break
+            count += 1
+        return count
+
+    def take_completed_layerwise_saves(self, count):
+        return [
+            session.completion.result()
+            for session in self.pending_layerwise_saves[:count]
+        ]
+
+    def commit_completed_layerwise_saves(self, successes):
+        for success in successes:
+            self.pending_layerwise_saves.pop(0).finish(success)
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -649,6 +693,9 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self.commit_completed_layerwise_saves(
+            self.take_completed_layerwise_saves(len(self.pending_layerwise_saves))
+        )
         self.hit_markers.clear()
         self._release_pending_locks()
 
@@ -673,4 +720,7 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
+        self.commit_completed_layerwise_saves(
+            self.take_completed_layerwise_saves(len(self.pending_layerwise_saves))
+        )
         self._release_pending_locks()

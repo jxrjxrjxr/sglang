@@ -3284,14 +3284,28 @@ class UnifiedRadixCache(BasePrefixCache):
                 [
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
+                    self.linker.num_completed_layerwise_saves(),
                 ],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            load_count, offload_count, layerwise_count = map(
+                int, finish_counts.tolist()
+            )
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
+            layerwise_successes = self.linker.take_completed_layerwise_saves(
+                layerwise_count
+            )
+            if layerwise_successes:
+                successes = torch.tensor(
+                    layerwise_successes, dtype=torch.int, device="cpu"
+                )
+                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+                self.linker.commit_completed_layerwise_saves(
+                    [bool(success) for success in successes.tolist()]
+                )
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
                 self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)

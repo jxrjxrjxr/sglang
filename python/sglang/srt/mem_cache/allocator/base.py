@@ -107,6 +107,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
+    def pending_io_size(self) -> int:
+        """Freed tokens still held for asynchronous I/O, unavailable to allocate."""
+        return 0
+
     def get_kvcache(self):
         return self._kvcache
 

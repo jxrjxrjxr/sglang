@@ -1,5 +1,6 @@
 """CPU tests for OceanDisk layout conversion and backend completion contracts."""
 
+import gc
 import inspect
 import itertools
 import tempfile
@@ -7,12 +8,15 @@ import threading
 import unittest
 from array import array
 from contextlib import nullcontext
+from concurrent.futures import Future
 from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from weakref import WeakValueDictionary
 
 import torch
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     PoolName,
@@ -411,7 +415,7 @@ class TestOceanDiskStorage(CustomTestCase):
         self.assertEqual([kind for kind, _ in trace], ["put"] * 4)
         for event in ready:
             event.synchronize.assert_not_called()
-        storage.wait_for_save()
+        storage.record_save_event().synchronize()
         self.assertEqual([kind for kind, _ in trace][-2:], ["record", "wait"])
 
     def test_descriptor_uses_paired_keys_and_registration_offsets(self):
@@ -521,8 +525,13 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker._namespace = ("sglang-oceandisk-pool-pages", "test-model", 2, 1)
         linker._validate_dsa_layout()
         linker._closed = False
-        linker._layerwise_saved_keys = set()
+        linker.layerwise_save_enabled = False
+        linker._layerwise_receipts = WeakValueDictionary()
+        linker._layerwise_pending_keys = set()
         linker._unavailable_page_keys = set()
+        linker.offload_queue = Queue()
+        linker.offload_results = Queue()
+        linker.device = "cuda:0"
         linker.storage = Mock()
         linker.max_ranges = 3
         linker.layer_done_counter = LayerWiseLoadCounter(2)
@@ -740,8 +749,11 @@ class TestOceanDiskDirectLinker(CustomTestCase):
 
     def test_uc_offload_ack_does_not_repeat_a_completed_layerwise_save(self):
         linker = self.make_linker()
+        linker.layerwise_save_enabled = True
         linker.offload_owner = True
-        linker._layerwise_saved_keys.add(linker._object_key("p0"))
+        receipt = Future()
+        receipt.set_result(True)
+        linker._layerwise_receipts[linker._object_key("p0")] = receipt
         linker._ready_event = Mock()
         linker.device = "cuda:0"
         linker.offload_queue = Queue()
@@ -754,17 +766,19 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         with patch("torch.cuda.device", return_value=nullcontext()):
             linker._offload_worker()
         self.assertTrue(linker.pop_completed_offload())
-        expanded = linker.pool_group.resolve_transfers([transfer])
-        linker._run_transfers(expanded, write=True)
         linker.storage.put_layers.assert_not_called()
+        linker._ready_event.assert_not_called()
 
     def test_saved_page_ack_cannot_overtake_an_earlier_failed_offload(self):
         linker = self.make_linker()
+        linker.layerwise_save_enabled = True
         linker.offload_owner = True
         linker.device = "cuda:0"
         linker.offload_queue = Queue()
         linker._ready_event = Mock()
-        linker._layerwise_saved_keys.add(linker._object_key("saved"))
+        receipt = Future()
+        receipt.set_result(True)
+        linker._layerwise_receipts[linker._object_key("saved")] = receipt
         for key in ("unsaved", "saved"):
             linker.offload(
                 [
@@ -775,14 +789,14 @@ class TestOceanDiskDirectLinker(CustomTestCase):
                     )
                 ]
             )
-        linker.storage.put_layers.side_effect = RuntimeError("first offload failed")
         self.assertEqual(linker.num_completed_offloads(), 0)
         linker.offload_queue.put(None)
         with patch("torch.cuda.device", return_value=nullcontext()):
             linker._offload_worker()
         self.assertFalse(linker.pop_completed_offload())
         self.assertTrue(linker.pop_completed_offload())
-        linker.storage.put_layers.assert_called_once()
+        linker.storage.put_layers.assert_not_called()
+        linker._ready_event.assert_not_called()
 
     def test_dsa_indexer_is_derived_from_logical_kv(self):
         linker = self.make_linker()
@@ -829,43 +843,81 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         linker.offload_owner = owner
         linker.num_layers = 2
         linker.max_ranges = 256
-        linker._layerwise_saved_keys = set()
+        linker._layerwise_receipts = WeakValueDictionary()
+        linker._layerwise_pending_keys = set()
         linker._unavailable_page_keys = set()
+        linker.offload_queue = Queue()
+        linker.offload_results = Queue()
+        linker.device = "cuda:0"
         linker.storage.prepare_layerwise_put.return_value = [["layer0"], ["layer1"]]
-        return linker, LayerwiseSaveSession(linker, [[], []], [7, 8])
+        session = LayerwiseSaveSession(linker, [[], []], [7, 8])
+        linker.get_layerwise_receipts.return_value = [session.completion]
+        return linker, session
 
-    def test_forward_saves_layers_without_waiting_and_publishes_only_at_end(self):
+    def test_forward_returns_before_put_completion_and_keeps_source_pinned(self):
         linker, session = self.make_session()
-        session.on_saved = Mock()
+        session.on_submitted = on_submitted = Mock()
+        session.release_source = Mock()
         with session:
             self.assertEqual(linker._unavailable_page_keys, {7, 8})
             session.save_layer(0)
             session.save_layer(1)
-            self.assertEqual(linker.storage.submit_put_layer.call_count, 2)
-            linker.storage.wait_for_save.assert_not_called()
-            session.on_saved.assert_not_called()
-            self.assertEqual(linker._layerwise_saved_keys, set())
+            linker.storage.submit_put_layer.assert_not_called()
+            linker.storage.record_save_event.assert_not_called()
+            on_submitted.assert_not_called()
+            self.assertFalse(session.completion.done())
         self.assertEqual(
             [call[0] for call in linker.storage.method_calls],
             [
                 "prepare_layerwise_put",
-                "submit_put_layer",
-                "submit_put_layer",
-                "wait_for_save",
             ],
         )
-        self.assertEqual(linker._layerwise_saved_keys, {7, 8})
+        self.assertFalse(
+            any(r.done() and r.result() for r in linker._layerwise_receipts.values())
+        )
+        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        on_submitted.assert_called_once()
+        self.assertIsNotNone(session.prepared)
+        session.release_source.assert_not_called()
+        self.assertIsNone(session.finish_event)
+        self.run_worker(linker)
+        self.assertEqual(linker.storage.submit_put_layer.call_count, 2)
+        session.finish_event.synchronize.assert_called_once()
+        self.assertTrue(session.completion.result())
+        self.assertEqual(set(linker._layerwise_receipts), {7, 8})
+        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        release = session.release_source
+        session.finish(True)
+        release.assert_called_once()
         self.assertFalse(linker._unavailable_page_keys)
-        session.on_saved.assert_called_once()
         self.assertIsNone(session.prepared)
+
+    @staticmethod
+    def run_worker(linker):
+        linker.offload_queue.put(None)
+        with patch.dict(
+            OceanDiskDirectLinker._offload_worker.__globals__,
+            {
+                "torch": SimpleNamespace(
+                    cuda=SimpleNamespace(device=lambda _: nullcontext())
+                )
+            },
+        ):
+            OceanDiskDirectLinker._offload_worker(linker)
 
     def test_incomplete_forward_drains_but_does_not_publish(self):
         linker, session = self.make_session()
         with self.assertRaisesRegex(RuntimeError, "1/2"):
             with session:
                 session.save_layer(0)
-        linker.storage.wait_for_save.assert_called_once()
-        self.assertFalse(linker._layerwise_saved_keys)
+        linker.storage.record_save_event.assert_not_called()
+        self.assertFalse(session.completion.done())
+        self.run_worker(linker)
+        self.assertFalse(session.completion.result())
+        session.finish(False)
+        self.assertFalse(
+            any(r.done() and r.result() for r in linker._layerwise_receipts.values())
+        )
         self.assertEqual(linker._unavailable_page_keys, {7, 8})
         self.assertIsNone(session.prepared)
 
@@ -875,17 +927,32 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             with session:
                 session.save_layer(0)
                 raise ValueError("forward failed")
-        linker.storage.wait_for_save.assert_called_once()
-        self.assertFalse(linker._layerwise_saved_keys)
+        linker.storage.record_save_event.assert_not_called()
+        self.run_worker(linker)
+        self.assertFalse(session.completion.result())
+        self.assertFalse(
+            any(r.done() and r.result() for r in linker._layerwise_receipts.values())
+        )
 
     def test_put_completion_failure_does_not_mark_local_pages_saved(self):
         linker, session = self.make_session()
-        linker.storage.wait_for_save.side_effect = RuntimeError("PUT completion failed")
-        with self.assertRaisesRegex(RuntimeError, "PUT completion failed"):
-            with session:
-                session.save_layer(0)
-                session.save_layer(1)
-        self.assertFalse(linker._layerwise_saved_keys)
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        linker.storage.record_save_event.return_value.synchronize.side_effect = (
+            RuntimeError("PUT completion failed")
+        )
+        with patch.dict(
+            OceanDiskDirectLinker._offload_worker.__globals__, {"logger": Mock()}
+        ):
+            self.run_worker(linker)
+        self.assertFalse(session.completion.result())
+        session.finish(False)
+        self.assertFalse(
+            any(r.done() and r.result() for r in linker._layerwise_receipts.values())
+        )
+        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        self.assertFalse(linker.offload_results.qsize())
 
     def test_non_owner_runs_same_layer_lifecycle_without_native_puts(self):
         linker, session = self.make_session(owner=False)
@@ -893,11 +960,172 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             session.save_layer(0)
             session.save_layer(1)
         self.assertFalse(linker.storage.method_calls)
-        self.assertEqual(linker._layerwise_saved_keys, {7, 8})
+        self.run_worker(linker)
+        self.assertEqual(set(linker._layerwise_receipts), {7, 8})
+        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+
+    def test_non_owner_skips_all_pool_address_and_io_preparation(self):
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.offload_owner = False
+        linker.pool_group = Mock()
+        linker._transfer_layers = Mock(side_effect=AssertionError("addresses expanded"))
+        session = linker.begin_layerwise_save(
+            [
+                PoolTransfer(
+                    name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([0, 1])
+                )
+            ]
+        )
+        linker.pool_group.resolve_transfers.assert_not_called()
+        linker._transfer_layers.assert_not_called()
+        linker.storage.prepare_layerwise_put.assert_not_called()
+        self.assertIsNone(session.prepared)
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        self.run_worker(linker)
+        self.assertTrue(session.completion.result())
+        self.assertFalse(linker.storage.method_calls)
+
+    def test_queued_uc_acks_keep_receipt_until_all_are_processed(self):
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.offload_owner = True
+        linker.layerwise_save_enabled = True
+        receipt = Future()
+        receipt.set_result(True)
+        key = linker._object_key("p0")
+        linker._layerwise_receipts[key] = receipt
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([0, 1])
+            )
+        ]
+        linker.offload(transfers)
+        linker.offload(transfers)
+        del receipt
+        gc.collect()
+        self.assertIn(key, linker._layerwise_receipts)
+        self.run_worker(linker)
+        self.assertTrue(linker.pop_completed_offload())
+        self.assertTrue(linker.pop_completed_offload())
+        gc.collect()
+        self.assertFalse(linker._layerwise_receipts)
+        linker.storage.put_layers.assert_not_called()
+
+    def test_request_keeps_receipt_after_uc_reap_and_releases_it_at_end(self):
+        wrapper, req = self.make_planner()
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.offload_owner = False
+        wrapper.cache_linker = linker
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__,
+            {"get_storage_hash_str": Mock(return_value=["p0"])},
+        ):
+            session = wrapper.prepare_layerwise_save(
+                self.make_batch(req, list(range(65)), 65)
+            )
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        self.run_worker(linker)
+        wrapper.commit_completed_layerwise_saves(
+            wrapper.take_completed_layerwise_saves(1)
+        )
+        self.assertEqual(req._uc_layerwise_receipts, {session.completion})
+        del session
+        gc.collect()
+        self.assertEqual(len(linker._layerwise_receipts), 1)
+        req._uc_layerwise_receipts.clear()
+        gc.collect()
+        self.assertFalse(linker._layerwise_receipts)
+
+    def test_second_request_retains_shared_pending_receipt_without_new_put(self):
+        wrapper, req = self.make_planner()
+        _, other = self.make_planner()
+        other.kv.req_pool_idx = 1
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.offload_owner = False
+        wrapper.cache_linker = linker
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__,
+            {"get_storage_hash_str": Mock(return_value=["p0"])},
+        ):
+            session = wrapper.prepare_layerwise_save(
+                self.make_batch(req, list(range(65)), 65)
+            )
+            with session:
+                duplicate = wrapper.prepare_layerwise_save(
+                    self.make_batch(other, list(range(65)), 65)
+                )
+                self.assertIsNone(duplicate)
+                self.assertEqual(other._uc_layerwise_receipts, {session.completion})
+                session.save_layer(0)
+                session.save_layer(1)
+        self.run_worker(linker)
+        wrapper.commit_completed_layerwise_saves(
+            wrapper.take_completed_layerwise_saves(1)
+        )
+        del session
+        req._uc_layerwise_receipts.clear()
+        gc.collect()
+        self.assertEqual(len(linker._layerwise_receipts), 1)
+        other._uc_layerwise_receipts.clear()
+        gc.collect()
+        self.assertFalse(linker._layerwise_receipts)
+
+    def test_slow_native_put_runs_in_worker_without_blocking_forward(self):
+        linker, session = self.make_session()
+        started, release = threading.Event(), threading.Event()
+        submit_threads = []
+
+        def submit(layer, prepared, ready):
+            submit_threads.append(threading.get_ident())
+            if layer == 0:
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("test PUT was not released")
+
+        linker.storage.submit_put_layer.side_effect = submit
+        worker = threading.Thread(
+            target=OceanDiskDirectLinker._offload_worker, args=(linker,), daemon=True
+        )
+        with patch.dict(
+            OceanDiskDirectLinker._offload_worker.__globals__,
+            {
+                "torch": SimpleNamespace(
+                    cuda=SimpleNamespace(device=lambda _: nullcontext())
+                )
+            },
+        ):
+            worker.start()
+            try:
+                with session:
+                    session.save_layer(0)
+                    self.assertTrue(started.wait(2))
+                    session.save_layer(1)
+                self.assertFalse(session.completion.done())
+                self.assertIsNone(session.finish_event)
+                self.assertIsNotNone(session.prepared)
+                self.assertEqual(submit_threads, [worker.ident])
+                self.assertNotEqual(worker.ident, threading.get_ident())
+            finally:
+                release.set()
+                linker.offload_queue.put(None)
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(submit_threads, [worker.ident, worker.ident])
+        self.assertTrue(session.completion.result())
+        linker.storage.record_save_event.assert_called_once()
+        session.finish_event.synchronize.assert_called_once()
 
     def make_planner(self):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        allocator = PagedTokenToKVPoolAllocator.__new__(PagedTokenToKVPoolAllocator)
+        allocator.pin_pages_for_io = Mock(return_value=object())
+        allocator.unpin_pages_for_io = Mock()
+        wrapper.pending_layerwise_saves = []
         wrapper.cache = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
             page_size=64,
             tree_core=SimpleNamespace(is_eagle=False),
             req_to_token_pool=SimpleNamespace(
@@ -905,6 +1133,8 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             ),
         )
         wrapper.cache_linker = Mock()
+        wrapper.cache_linker.begin_layerwise_save.return_value.aborted = False
+        wrapper.cache_linker.get_layerwise_receipts.return_value = []
         req = SimpleNamespace(
             origin_input_ids=array("q", range(65)),
             output_ids=array("q"),
@@ -914,6 +1144,162 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=0),
         )
         return wrapper, req
+
+    def test_completed_session_releases_source_only_when_scheduler_commits(self):
+        linker, session = self.make_session()
+        session.release_source = Mock()
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.pending_layerwise_saves = [session]
+        self.assertEqual(wrapper.num_completed_layerwise_saves(), 0)
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        self.run_worker(linker)
+        self.assertEqual(wrapper.num_completed_layerwise_saves(), 1)
+        session.release_source.assert_not_called()
+        release = session.release_source
+        wrapper.commit_completed_layerwise_saves(
+            wrapper.take_completed_layerwise_saves(1)
+        )
+        release.assert_called_once()
+        self.assertFalse(wrapper.pending_layerwise_saves)
+
+    def test_aborted_forward_retains_source_until_background_drain_and_uc_reap(self):
+        wrapper, req = self.make_planner()
+        linker, session = self.make_session()
+        wrapper.cache_linker = linker
+        linker.begin_layerwise_save.return_value = session
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__,
+            {"get_storage_hash_str": Mock(return_value=["p0"])},
+        ):
+            wrapper.prepare_layerwise_save(self.make_batch(req, list(range(65)), 65))
+        with self.assertRaisesRegex(ValueError, "forward failed"):
+            with session:
+                session.save_layer(0)
+                raise ValueError("forward failed")
+        self.assertEqual(wrapper.pending_layerwise_saves, [session])
+        self.assertFalse(hasattr(req, "_uc_layerwise_submitted_tokens"))
+        allocator = wrapper.cache.token_to_kv_pool_allocator
+        allocator.unpin_pages_for_io.assert_not_called()
+        self.run_worker(linker)
+        self.assertFalse(session.completion.result())
+        allocator.unpin_pages_for_io.assert_not_called()
+        wrapper.commit_completed_layerwise_saves(
+            wrapper.take_completed_layerwise_saves(1)
+        )
+        allocator.unpin_pages_for_io.assert_called_once()
+        self.assertIsNone(session.prepared)
+
+    def test_source_pages_are_not_reused_until_all_io_leases_finish(self):
+        allocator = PagedTokenToKVPoolAllocator.__new__(PagedTokenToKVPoolAllocator)
+        allocator._io_page_pins = {}
+        allocator._io_deferred_pages = []
+        allocator.need_sort = False
+        allocator.page_size = 64
+        allocator.free_pages = torch.tensor([], dtype=torch.int64)
+        first = allocator.pin_pages_for_io(torch.tensor([1, 2]))
+        second = allocator.pin_pages_for_io(torch.tensor([2]))
+        allocator._release_page_ids(torch.tensor([1, 2, 3]))
+        self.assertEqual(allocator.free_pages.tolist(), [3])
+        self.assertEqual(allocator.pending_io_size(), 128)
+        allocator.unpin_pages_for_io(first)
+        self.assertEqual(allocator.free_pages.tolist(), [1, 3])
+        self.assertEqual(allocator.pending_io_size(), 64)
+        allocator.unpin_pages_for_io(second)
+        self.assertEqual(allocator.free_pages.tolist(), [2, 1, 3])
+        self.assertEqual(allocator.pending_io_size(), 0)
+
+    def test_uc_offload_after_layerwise_does_not_repeat_put_or_ack_early(self):
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.layerwise_save_enabled = True
+        linker.storage.prepare_layerwise_put.return_value = [[], []]
+        linker.offload_owner = True
+        linker._ready_event = Mock()
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=["p0"],
+                device_indices=torch.tensor([0, 1]),
+            )
+        ]
+        session = linker.begin_layerwise_save(transfers)
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        linker.offload(transfers)
+        self.assertEqual(linker.num_completed_offloads(), 0)
+        self.run_worker(linker)
+        linker.storage.put_layers.assert_not_called()
+        self.assertTrue(session.completion.result())
+        self.assertEqual(linker.num_completed_offloads(), 1)
+        self.assertTrue(linker.pop_completed_offload())
+
+    def test_failed_layerwise_put_reports_failure_without_full_page_retry(self):
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.layerwise_save_enabled = True
+        linker.storage.prepare_layerwise_put.return_value = [[], []]
+        linker.offload_owner = True
+        linker._ready_event = Mock()
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([0, 1])
+            )
+        ]
+        session = linker.begin_layerwise_save(transfers)
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        linker.storage.submit_put_layer.side_effect = RuntimeError("PUT failed")
+        linker.offload(transfers)
+        with patch.dict(
+            OceanDiskDirectLinker._offload_worker.__globals__, {"logger": Mock()}
+        ):
+            self.run_worker(linker)
+        self.assertFalse(session.completion.result())
+        self.assertFalse(linker.pop_completed_offload())
+        linker.storage.put_layers.assert_not_called()
+        linker.storage.submit_put_layer.assert_called_once()
+        linker.storage.record_save_event.assert_called_once()
+        session.finish_event.synchronize.assert_called_once()
+
+    def test_non_layerwise_put_does_not_consult_layerwise_receipts(self):
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.layerwise_save_enabled = False
+        linker.offload_owner = True
+        linker._ready_event = Mock()
+        receipt = Future()
+        receipt.set_result(True)
+        linker._layerwise_receipts[linker._object_key("p0")] = receipt
+        linker.offload(
+            [
+                PoolTransfer(
+                    name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([0, 1])
+                )
+            ]
+        )
+        self.run_worker(linker)
+        linker.storage.put_layers.assert_called_once()
+        self.assertTrue(linker.pop_completed_offload())
+
+    def test_reset_drains_pending_session_before_releasing_source(self):
+        linker, session = self.make_session()
+        session.release_source = Mock()
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        linker.reset.side_effect = lambda: self.run_worker(linker)
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache_linker = linker
+        wrapper.pending_layerwise_saves = [session]
+        wrapper.hit_markers = {}
+        wrapper.pending_loads = {}
+        wrapper.pending_offloads = []
+        release = session.release_source
+        wrapper.reset()
+        self.assertTrue(session.completion.result())
+        release.assert_called_once()
+        self.assertFalse(wrapper.pending_layerwise_saves)
 
     @staticmethod
     def make_batch(req, tokens, end, mode="EXTEND"):
@@ -943,9 +1329,9 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             transfer = wrapper.cache_linker.begin_layerwise_save.call_args.args[0][0]
             self.assertEqual(transfer.keys, ["page0"])
             self.assertEqual(transfer.device_indices.tolist(), list(range(64)))
-            self.assertFalse(hasattr(req, "_uc_layerwise_saved_tokens"))
-            session.on_saved()
-            self.assertEqual(req._uc_layerwise_saved_tokens, 64)
+            self.assertFalse(hasattr(req, "_uc_layerwise_submitted_tokens"))
+            session.on_submitted()
+            self.assertEqual(req._uc_layerwise_submitted_tokens, 64)
             wrapper.prepare_layerwise_save(
                 self.make_batch(req, list(range(65, 128)), 128)
             )
@@ -974,7 +1360,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             )
             self.assertEqual(list(hasher.call_args.args[0]), list(range(64)))
             self.assertEqual(req._uc_layerwise_tokens, list(range(64)))
-            session.on_saved()
+            session.on_submitted()
             self.assertIsNone(
                 wrapper.prepare_layerwise_save(self.make_batch(req, [64], 65, "DECODE"))
             )

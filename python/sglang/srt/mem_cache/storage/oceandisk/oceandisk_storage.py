@@ -485,7 +485,7 @@ class OceanDiskStorage(HiCacheStorage):
                 raise
 
     def prepare_layerwise_put(self, layers, *, max_ranges=256):
-        """Prepare descriptors before forward, retaining them through wait_for_save."""
+        """Prepare descriptors before forward, retaining them through completion."""
         torch = self._torch
         with torch.cuda.device(self.device):
             self._ensure_open()
@@ -528,7 +528,7 @@ class OceanDiskStorage(HiCacheStorage):
                 )
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
 
-    def wait_for_save(self):
+    def record_save_event(self):
         torch = self._torch
         with (
             self._lock,
@@ -537,7 +537,7 @@ class OceanDiskStorage(HiCacheStorage):
         ):
             event = torch.cuda.Event()
             event.record(self._stream)
-            event.synchronize()
+            return event
 
     @staticmethod
     def _unsupported_hicache() -> NotImplementedError:

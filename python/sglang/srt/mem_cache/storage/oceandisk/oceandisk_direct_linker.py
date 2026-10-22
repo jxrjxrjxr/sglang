@@ -7,6 +7,7 @@ import logging
 import threading
 from concurrent.futures import Future
 from queue import Empty, Queue
+from weakref import WeakValueDictionary
 
 import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -27,61 +28,68 @@ logger = logging.getLogger(__name__)
 
 
 class LayerwiseSaveSession:
-    """One forward's paired KV/Indexer puts; source slots stay request-owned."""
+    """One forward's puts, completed by the offload worker and reaped by UC."""
 
     def __init__(self, linker, layers, keys, phase="prefill"):
         self.linker = linker
         self.keys = keys
         self.phase = phase
         self.next_layer = 0
-        self.on_saved = None
+        self.on_submitted = None
+        self.release_source = None
+        self.completion = Future()
+        self.finish_event = None
+        self.aborted = False
+        self.put_failed = False
         self.ready_events = []
         self.prepared = (
             linker.storage.prepare_layerwise_put(layers, max_ranges=linker.max_ranges)
             if linker.offload_owner
             else None
         )
+        for key in keys:
+            linker._layerwise_receipts[key] = self.completion
 
     def __enter__(self):
         self.linker._unavailable_page_keys.update(self.keys)
+        self.linker._layerwise_pending_keys.update(self.keys)
         return self
 
     def save_layer(self, layer):
-        if layer != self.next_layer:
-            raise RuntimeError(
-                f"OceanDisk expected save layer {self.next_layer}, got {layer}."
-            )
         if self.linker.offload_owner:
             event = self.linker._ready_event()
             self.ready_events.append(event)
-            self.linker.storage.submit_put_layer(layer, self.prepared[layer], event)
+            self.linker.offload_queue.put((self, layer, event))
         self.next_layer += 1
 
     def __exit__(self, exc_type, exc, tb):
-        try:
-            if self.linker.offload_owner:
-                # Drain even on an aborted forward before releasing metadata/slots.
-                self.linker.storage.wait_for_save()
-            if exc_type is not None:
-                return False
-            if self.next_layer != self.linker.num_layers:
-                raise RuntimeError(
-                    f"OceanDisk saved {self.next_layer}/{self.linker.num_layers} layers."
-                )
-            self.linker._layerwise_saved_keys.update(self.keys)
-            self.linker._unavailable_page_keys.difference_update(self.keys)
-            if self.on_saved is not None:
-                self.on_saved()
-            trace_event(
-                "LAYERWISE_SAVE_DONE",
-                pages=len(self.keys),
-                layers=self.next_layer,
-                phase=self.phase,
+        self.aborted = exc_type is not None or self.next_layer != self.linker.num_layers
+        # The FIFO keeps the completion task after this session's layer tasks.
+        # Even aborted forwards retain source pages until queued I/O is drained.
+        self.linker.offload_queue.put(self)
+        callback, self.on_submitted = self.on_submitted, None
+        if callback is not None:
+            callback()
+        if exc_type is None and self.aborted:
+            raise RuntimeError(
+                f"OceanDisk saved {self.next_layer}/{self.linker.num_layers} layers."
             )
-        finally:
-            self.prepared = None
-            self.ready_events.clear()
         return False
+
+    def finish(self, success):
+        """Called on the scheduler thread after TP-wide completion consensus."""
+        self.linker._layerwise_pending_keys.difference_update(self.keys)
+        if success:
+            self.linker._unavailable_page_keys.difference_update(self.keys)
+        else:
+            for key in self.keys:
+                if self.linker._layerwise_receipts.get(key) is self.completion:
+                    self.linker._layerwise_receipts.pop(key)
+        if self.release_source is not None:
+            self.release_source()
+            self.release_source = None
+        self.prepared = None
+        self.ready_events.clear()
 
 
 class LayerWiseLoadCounter:
@@ -200,16 +208,21 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self.offload_queue = Queue()
         self.offload_results: Queue[bool] = Queue()
         self._closed = False
-        self._layerwise_saved_keys = set()
+        # Requests and queued UC acknowledgements own completion receipts.
+        self._layerwise_receipts = WeakValueDictionary()
+        self._layerwise_pending_keys = set()
         # Pending/failed writes are hidden in this engine, even if GIDS reports
         # an object after its first layer. This is not a cross-engine commit log.
         self._unavailable_page_keys = set()
-        self.layerwise_save_enabled = (
-            config.get("layerwise_save", True)
-            and params.pp_size == 1
-            and params.attn_cp_size == 1
-            and not getattr(server_args, "speculative_algorithm", None)
-        )
+        self.layerwise_save_enabled = config.get("layerwise_save", True)
+        if self.layerwise_save_enabled and (
+            params.pp_size != 1
+            or params.attn_cp_size != 1
+            or getattr(server_args, "speculative_algorithm", None)
+        ):
+            raise ValueError(
+                "OceanDisk layerwise_save requires PP=1, CP=1 and no speculative decoding."
+            )
         self._load_thread = threading.Thread(
             target=self._load_worker, daemon=True, name=f"oceandisk-load-tp{tp_rank}"
         )
@@ -356,7 +369,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
-    def _transfer_layers(self, transfers, *, skip_saved=False):
+    def _transfer_layers(self, transfers, *, skip_scheduled=False):
         prepared = [
             (
                 transfer,
@@ -364,15 +377,15 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
             for transfer in transfers
         ]
-        if skip_saved:
-            saved = getattr(self, "_layerwise_saved_keys", set())
+        if skip_scheduled:
+            scheduled = self._layerwise_pending_keys
             prepared = [
                 (
                     transfer,
                     [
                         (key, location)
                         for key, location in zip(transfer.keys, locations, strict=True)
-                        if self._object_key(key) not in saved
+                        if self._object_key(key) not in scheduled
                     ],
                 )
                 for transfer, locations in prepared
@@ -398,18 +411,35 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         return layers
 
     def begin_layerwise_save(self, transfers, *, phase="prefill"):
-        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
-        layers = self._transfer_layers(expanded, skip_saved=True)
-        if not layers or not layers[0]:
+        kv = next((t for t in transfers if t.name == PoolName.KV), None)
+        if kv is None:
             return None
-        keys = list(dict.fromkeys(item.key for item in layers[0]))
+        keys = list(
+            dict.fromkeys(
+                key
+                for page_key in kv.keys
+                if (key := self._object_key(page_key))
+                not in self._layerwise_pending_keys
+            )
+        )
+        if not keys:
+            return None
+        layers = None
+        if self.offload_owner:
+            expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
+            layers = self._transfer_layers(expanded, skip_scheduled=True)
         trace_event(
             "LAYERWISE_SAVE_BEGIN", pages=len(keys), layers=self.num_layers, phase=phase
         )
         return LayerwiseSaveSession(self, layers, keys, phase)
 
+    def get_layerwise_receipts(self, page_keys):
+        return [
+            self._layerwise_receipts.get(self._object_key(key)) for key in page_keys
+        ]
+
     def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
-        layers = self._transfer_layers(transfers, skip_saved=write)
+        layers = self._transfer_layers(transfers)
         if write:
             if layers and layers[0]:
                 keys = list(dict.fromkeys(item.key for item in layers[0]))
@@ -468,10 +498,18 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self.offload_results.put(True)
             trace_event("OFFLOAD_SKIPPED", reason="non_owner_rank")
         else:
-            # Even already-saved pages must acknowledge in UC's submission order.
-            self.offload_queue.put((expanded, self._ready_event()))
+            # Layerwise mode only acknowledges existing saves; it never retries PUT.
+            event = None if self.layerwise_save_enabled else self._ready_event()
+            if self.layerwise_save_enabled:
+                kv = next(t for t in expanded if t.name == PoolName.KV)
+                payload = self.get_layerwise_receipts(kv.keys)
+            else:
+                payload = expanded
+            self.offload_queue.put((payload, event))
             trace_event(
-                "OFFLOAD_QUEUED",
+                "LAYERWISE_ACK_QUEUED"
+                if self.layerwise_save_enabled
+                else "OFFLOAD_QUEUED",
                 pages=[len(t.keys) for t in expanded],
                 pools=[str(t.name) for t in expanded],
             )
@@ -484,22 +522,67 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 try:
                     if task is None:
                         return
+                    if isinstance(task, LayerwiseSaveSession):
+                        success = False
+                        try:
+                            if self.offload_owner:
+                                task.finish_event = self.storage.record_save_event()
+                                task.finish_event.synchronize()
+                            success = not task.aborted and not task.put_failed
+                            if self.offload_owner and success:
+                                trace_event(
+                                    "LAYERWISE_SAVE_DONE",
+                                    pages=len(task.keys),
+                                    layers=task.next_layer,
+                                    phase=task.phase,
+                                )
+                        except BaseException:
+                            logger.exception("OceanDisk layerwise offload failed")
+                        finally:
+                            task.completion.set_result(success)
+                        continue
+                    if len(task) == 3:
+                        session, layer, ready_event = task
+                        if not session.put_failed:
+                            try:
+                                self.storage.submit_put_layer(
+                                    layer, session.prepared[layer], ready_event
+                                )
+                            except BaseException:
+                                session.put_failed = True
+                                logger.exception("OceanDisk layer %d PUT failed", layer)
+                        del session
+                        continue
                     transfers, event = task
                     success = False
                     try:
-                        event.synchronize()
-                        trace_event(
-                            "OFFLOAD_BEGIN",
-                            first_key=self._object_key(transfers[0].keys[0]),
-                        )
-                        self._run_transfers(transfers, write=True)
-                        success = True
+                        if self.layerwise_save_enabled:
+                            # Session completion is ahead of this task in the same FIFO.
+                            success = all(
+                                receipt is not None and receipt.result()
+                                for receipt in transfers
+                            )
+                        else:
+                            event.synchronize()
+                            trace_event(
+                                "OFFLOAD_BEGIN",
+                                first_key=self._object_key(transfers[0].keys[0]),
+                            )
+                            self._run_transfers(transfers, write=True)
+                            success = True
                     except BaseException:
                         logger.exception("OceanDisk offload failed")
                     self.offload_results.put(success)
-                    trace_event("OFFLOAD_DONE", worker_no_exception=success)
+                    trace_event(
+                        "LAYERWISE_ACK_DONE"
+                        if self.layerwise_save_enabled
+                        else "OFFLOAD_DONE",
+                        success=success,
+                    )
+                    del transfers
                 finally:
                     self.offload_queue.task_done()
+                    del task
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()
@@ -524,7 +607,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 except Empty:
                     break
         self.layer_done_counter.reset()
-        self._layerwise_saved_keys.clear()
+        self._layerwise_receipts.clear()
 
     def close(self) -> None:
         if self._closed:
