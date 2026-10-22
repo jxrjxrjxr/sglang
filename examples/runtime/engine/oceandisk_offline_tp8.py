@@ -33,15 +33,59 @@ def build_prompt(tokenizer, data):
 def run_request(engine, prompt, label):
     print(f"\n{'=' * 20} {label} {'=' * 20}", flush=True)
     started = time.perf_counter()
-    output = engine.generate(
+    arrivals = []
+    completion_tokens = 0
+    output = None
+    for output in engine.generate(
         prompt,
-        sampling_params={"temperature": 0, "top_p": 0.95, "max_new_tokens": 16},
-    )
+        sampling_params={
+            "temperature": 0,
+            "top_p": 0.95,
+            "max_new_tokens": 16,
+            "stream_interval": 1,
+        },
+        stream=True,
+    ):
+        received = time.perf_counter()
+        count = output["meta_info"]["completion_tokens"]
+        if count > completion_tokens:
+            arrivals.append((received, count - completion_tokens))
+            completion_tokens = count
     elapsed = time.perf_counter() - started
+    if output is None:
+        raise RuntimeError("Generation returned no output.")
     meta = output.get("meta_info", {})
     details = meta.get("cached_tokens_details") or {}
-    print(f"Elapsed:       {elapsed:.2f}s", flush=True)
+    # Measure Engine delivery, including scheduling, tokenization and IPC.
+    # A final status-only message must not extend token-to-token intervals.
+    ttft = (
+        (arrivals[0][0] - started) * 1000 if arrivals and arrivals[0][1] == 1 else None
+    )
+    single_token_chunks = bool(arrivals) and all(count == 1 for _, count in arrivals)
+    tbts = (
+        [(right[0] - left[0]) * 1000 for left, right in zip(arrivals, arrivals[1:])]
+        if single_token_chunks
+        else []
+    )
+    print(f"Total latency: {elapsed:.3f}s (full response)", flush=True)
+    print(
+        f"TTFT:          {ttft:.3f} ms"
+        if ttft is not None
+        else "TTFT:          N/A (no individually delivered first token)",
+        flush=True,
+    )
+    print(
+        f"TBT mean:      {sum(tbts) / len(tbts):.3f} ms"
+        if tbts
+        else "TBT mean:      N/A (fewer than two tokens or merged token chunks)",
+        flush=True,
+    )
+    if tbts:
+        print(f"TBT each (ms): {[round(value, 3) for value in tbts]}", flush=True)
+    elif arrivals and not single_token_chunks:
+        print(f"Tokens/chunk:  {[count for _, count in arrivals]}", flush=True)
     print(f"Prompt tokens: {meta.get('prompt_tokens')}", flush=True)
+    print(f"Output tokens: {meta.get('completion_tokens')}", flush=True)
     print(f"Cached tokens: {meta.get('cached_tokens')}", flush=True)
     print(f"Cache details: {details}", flush=True)
     print(f"Output:        {output['text']!r}", flush=True)
@@ -116,6 +160,8 @@ def main():
     prompt = build_prompt(tokenizer, data)
     print(f"Prompt characters: {len(prompt)}", flush=True)
     args.enable_cache_report = True
+    # Keep the final streamed result cumulative, as expected by the cache checks.
+    args.incremental_streaming_output = False
 
     engine = sgl.Engine(server_args=ServerArgs.from_cli_args(args))
     try:

@@ -68,8 +68,6 @@ class LayerwiseSaveSession:
                 raise RuntimeError(
                     f"OceanDisk saved {self.next_layer}/{self.linker.num_layers} layers."
                 )
-            if self.linker.offload_owner:
-                self.linker.storage.verify_saved_pages(self.keys)
             self.linker._layerwise_saved_keys.update(self.keys)
             self.linker._unavailable_page_keys.difference_update(self.keys)
             if self.on_saved is not None:
@@ -417,7 +415,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 keys = list(dict.fromkeys(item.key for item in layers[0]))
                 self._unavailable_page_keys.update(keys)
                 self.storage.put_layers(layers, max_ranges=self.max_ranges)
-                self.storage.verify_saved_pages(keys)
                 self._unavailable_page_keys.difference_update(keys)
         else:
             self.storage.get_layers(

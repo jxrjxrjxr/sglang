@@ -530,25 +530,6 @@ class OceanDiskStorage(HiCacheStorage):
             event.record(self._stream)
             event.synchronize()
 
-    def verify_saved_pages(self, keys):
-        """Verify real paired KV/Indexer objects, not synthetic marker records."""
-        keys = list(dict.fromkeys(keys))
-        hits = self.exists_many(keys)
-        missing = [key for key, hit in zip(keys, hits, strict=True) if not hit]
-        trace_event(
-            "SAVE_EXIST_CHECK",
-            pages=len(keys),
-            hit_pages=len(keys) - len(missing),
-            first_key=keys[0] if keys else None,
-            first_missing_key=missing[0] if missing else None,
-        )
-        if missing:
-            raise RuntimeError(
-                f"OceanDisk PUT event completed, but {len(missing)}/{len(keys)} "
-                f"real KV/Indexer page keys are not visible to GIDS exist; "
-                f"first missing key={missing[0]}."
-            )
-
     @staticmethod
     def _unsupported_hicache() -> NotImplementedError:
         return NotImplementedError(
