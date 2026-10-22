@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -266,6 +267,14 @@ class OceanDiskStorage(HiCacheStorage):
             type(self)._registered_tensors = list(buffers)
             with torch.cuda.stream(self._stream):
                 try:
+                    # Match od/nds_utils.py: stagger GIDS connection setup by GPU.
+                    time.sleep(device_index * 2)
+                    trace_event(
+                        "NATIVE_INIT_CALL",
+                        device=str(self.device),
+                        config_path=str(config_path),
+                        configured_connections=connection_count,
+                    )
                     status = self._ops.kvcache_init(tensor, self._output)
                 finally:
                     self._stream.synchronize()
