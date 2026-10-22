@@ -320,10 +320,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
         bitmap = self.storage.exists_many(keys)
-        bitmap = [
-            hit and key not in self._unavailable_page_keys
-            for key, hit in zip(keys, bitmap, strict=True)
-        ]
+        if self.layerwise_save_enabled:
+            bitmap = [
+                hit and key not in self._unavailable_page_keys
+                for key, hit in zip(keys, bitmap, strict=True)
+            ]
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         trace_event(
             "LOOKUP", rid=rid, pages=len(keys), prefix_pages=end, first_key=keys[0]
@@ -442,10 +443,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         layers = self._transfer_layers(transfers)
         if write:
             if layers and layers[0]:
-                keys = list(dict.fromkeys(item.key for item in layers[0]))
-                self._unavailable_page_keys.update(keys)
                 self.storage.put_layers(layers, max_ranges=self.max_ranges)
-                self._unavailable_page_keys.difference_update(keys)
         else:
             self.storage.get_layers(
                 layers,

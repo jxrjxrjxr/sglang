@@ -713,12 +713,33 @@ class TestOceanDiskDirectLinker(CustomTestCase):
 
     def test_lookup_hides_pending_or_failed_pages_even_when_remote_key_exists(self):
         linker = self.make_linker()
+        linker.layerwise_save_enabled = True
         linker.storage.exists_many.side_effect = lambda keys: [True] * len(keys)
         transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1"])]
         linker._unavailable_page_keys.add(linker._object_key("p1"))
         self.assertEqual(linker.lookup("req", transfers), [1])
         linker._unavailable_page_keys.clear()
         self.assertEqual(linker.lookup("req", transfers), [1, 2])
+
+    def test_non_layerwise_lookup_uses_storage_result_without_local_filter(self):
+        linker = self.make_linker()
+        linker.layerwise_save_enabled = False
+        linker._unavailable_page_keys.add(linker._object_key("p1"))
+        linker.storage.exists_many.return_value = [True, True, False]
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2"])]
+        self.assertEqual(linker.lookup("req", transfers), [1, 2])
+
+    def test_non_layerwise_put_failure_does_not_add_local_key_filter(self):
+        linker = self.make_linker()
+        linker.storage.put_layers.side_effect = RuntimeError("PUT failed")
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([0, 1])
+            )
+        ]
+        with self.assertRaisesRegex(RuntimeError, "PUT failed"):
+            linker._run_transfers(transfers, write=True)
+        self.assertFalse(linker._unavailable_page_keys)
 
     def test_cache_reset_does_not_reenable_a_known_failed_page(self):
         linker = self.make_linker()
@@ -1303,6 +1324,13 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
 
     @staticmethod
     def make_batch(req, tokens, end, mode="EXTEND"):
+        if mode == "EXTEND":
+            prefix = getattr(
+                req,
+                "_uc_layerwise_tokens",
+                list(req.origin_input_ids) + list(req.output_ids),
+            )
+            req.get_fill_ids = Mock(return_value=prefix[: end - len(tokens)] + tokens)
         return SimpleNamespace(
             reqs=[req],
             seq_lens_cpu=torch.tensor([end]),
@@ -1343,6 +1371,38 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertEqual(
             (hash_calls[0].extra_key, hash_calls[0].cache_salt), ("tenant", "salt")
         )
+
+    def test_prefill_uses_cpu_tokens_without_reading_gpu_input(self):
+        wrapper, req = self.make_planner()
+        batch = self.make_batch(req, list(range(65)), 65)
+        batch.input_ids = Mock()
+        batch.input_ids.detach.side_effect = AssertionError("Unexpected GPU token read")
+        hasher = Mock(return_value=["page0"])
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__, {"get_storage_hash_str": hasher}
+        ):
+            wrapper.prepare_layerwise_save(batch)
+        self.assertEqual(req._uc_layerwise_tokens, list(range(65)))
+        self.assertEqual(list(hasher.call_args.args[0]), list(range(64)))
+        batch.input_ids.detach.assert_not_called()
+
+    def test_prefill_with_cached_prefix_hashes_full_cpu_prefix(self):
+        wrapper, req = self.make_planner()
+        req.origin_input_ids = list(range(128))
+        req.kv.cache_protected_len = 64
+        batch = self.make_batch(req, list(range(64, 128)), 128)
+        batch.input_ids = Mock()
+        batch.input_ids.detach.side_effect = AssertionError("Unexpected GPU token read")
+        hasher = Mock(return_value=["cached-page", "new-page"])
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__, {"get_storage_hash_str": hasher}
+        ):
+            wrapper.prepare_layerwise_save(batch)
+        self.assertEqual(list(hasher.call_args.args[0]), list(range(128)))
+        transfer = wrapper.cache_linker.begin_layerwise_save.call_args.args[0][0]
+        self.assertEqual(transfer.keys, ["new-page"])
+        self.assertEqual(transfer.device_indices.tolist(), list(range(64, 128)))
+        batch.input_ids.detach.assert_not_called()
 
     def test_decode_uses_actual_input_instead_of_unresolved_output_and_skips_partial_page(
         self,

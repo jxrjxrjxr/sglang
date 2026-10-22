@@ -205,8 +205,9 @@ class UnifiedCacheLinkerWrapper:
             return None
         lengths = batch.seq_lens_cpu.tolist()
         counts = [1] * len(batch.reqs) if mode.is_decode() else batch.extend_lens
-        # Read actual input ids, not possibly unresolved overlap-sampling outputs.
-        inputs = batch.input_ids.detach().cpu().tolist()
+        # Prefill uses the same CPU tokens as ScheduleBatch.prepare_for_extend.
+        # Decode must resolve actual inputs, not pending overlap-sampling outputs.
+        inputs = batch.input_ids.detach().cpu().tolist() if mode.is_decode() else None
         cursor = 0
         transfers, completed = [], []
         page_size = self.cache.page_size
@@ -221,7 +222,10 @@ class UnifiedCacheLinkerWrapper:
                     "OceanDisk cannot reconstruct the forward's token prefix."
                 )
             del history[start:]
-            history.extend(inputs[cursor : cursor + count])
+            if mode.is_decode():
+                history.extend(inputs[cursor : cursor + count])
+            else:
+                history.extend(req.get_fill_ids()[start:end])
             tokens = history
             cursor += count
             req._uc_layerwise_tokens = tokens
