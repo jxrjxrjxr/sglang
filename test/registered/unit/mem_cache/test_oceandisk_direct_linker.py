@@ -3,6 +3,7 @@
 import gc
 import inspect
 import itertools
+import json
 import tempfile
 import threading
 import unittest
@@ -50,6 +51,55 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestOceanDiskStorage(CustomTestCase):
+    def test_debug_checks_logical_bytes_and_reports_mismatches(self):
+        storage = OceanDiskStorage.__new__(OceanDiskStorage)
+        storage._debug_verify = True
+        storage._debug_digests = {}
+        storage.device = "cuda:0"
+        storage.regions = [(1000, 16)]
+        payload = bytearray(range(16))
+
+        class ByteRegion:
+            def __getitem__(self, selection):
+                raw = bytes(payload[selection])
+                return SimpleNamespace(
+                    cpu=lambda: SimpleNamespace(
+                        numpy=lambda: SimpleNamespace(tobytes=lambda: raw)
+                    )
+                )
+
+        storage._debug_regions = {1000: ByteRegion()}
+        ranges = [OceanDiskRange(7, 1000, 4), OceanDiskRange(7, 1008, 4)]
+        with self.assertLogs(level="INFO") as captured:
+            storage._debug_check_layer(0, ranges, write=True)
+            # Alignment padding is outside the logical payload being checked.
+            payload[4] ^= 1
+            storage._debug_check_layer(0, ranges, write=False)
+            payload[8] ^= 1
+            storage._debug_check_layer(0, ranges, write=False)
+            storage._debug_check_layer(1, ranges, write=False)
+        records = [json.loads(record.getMessage().split("] ", 1)[1])
+                   for record in captured.records]
+        self.assertEqual([r["status"] for r in records], [
+            "BASELINE", "BASELINE", "MATCH", "MATCH",
+            "MATCH", "MISMATCH", "NO_BASELINE", "NO_BASELINE",
+        ])
+        issue = records[5]["first_issue"]
+        self.assertEqual(records[5]["pool"], "indexer")
+        self.assertEqual(issue["key"], 7)
+        self.assertNotEqual(issue["expected_sha256"], issue["actual_sha256"])
+
+    def test_debug_get_checks_before_notifying_model(self):
+        storage, trace, _ = self.make_storage()
+        storage._debug_check_layer = Mock(
+            side_effect=lambda layer, ranges, **_: trace.append(("verify", layer))
+        )
+        storage.get_layers(
+            [self.layer_ranges(1)],
+            on_layer_ready=lambda layer: trace.append(("ready", layer)),
+        )
+        self.assertLess(trace.index(("verify", 0)), trace.index(("ready", 0)))
+
     def test_hicache_contract_is_reserved_without_changing_uc_range_io(self):
         self.assertTrue(issubclass(OceanDiskStorage, HiCacheStorage))
         self.assertFalse(inspect.isabstract(OceanDiskStorage))

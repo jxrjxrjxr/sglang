@@ -116,6 +116,12 @@ class OceanDiskRange:
     storage_offset: int = 0
 
 
+class _DebugPreparedLayer(list):
+    def __init__(self, ranges):
+        super().__init__()
+        self.debug_ranges = ranges
+
+
 def encode_key(identity: tuple) -> int:
     """Encode an object identity as a positive int64."""
     data = json.dumps(identity, separators=(",", ":"), ensure_ascii=True).encode()
@@ -199,6 +205,9 @@ class OceanDiskStorage(HiCacheStorage):
         if self.device.type != "cuda":
             raise ValueError("The OceanDisk direct linker requires CUDA buffers.")
         buffers = list(buffers)
+        self._debug_verify = os.environ.get("SGLANG_OCEANDISK_VERIFY_DATA") == "1"
+        self._debug_digests = {}
+        self._debug_regions = {}
         self.regions = []
         for buffer in buffers:
             if buffer.device != self.device:
@@ -209,6 +218,10 @@ class OceanDiskStorage(HiCacheStorage):
             region = (int(storage.data_ptr()), int(storage.nbytes()))
             if region[1] and region not in self.regions:
                 self.regions.append(region)
+                if self._debug_verify:
+                    self._debug_regions[region[0]] = torch.empty(
+                        0, dtype=torch.uint8, device=self.device
+                    ).set_(storage, 0, (region[1],), (1,))
         if not self.regions:
             raise ValueError("OceanDisk has no GPU allocations to register.")
 
@@ -355,6 +368,57 @@ class OceanDiskStorage(HiCacheStorage):
                     row[position] = (row[position] + 511) & ~511
         return batches
 
+    def _debug_check_layer(self, layer, ranges, *, write):
+        """Hash logical bytes only, before PUT or before publishing GET readiness.
+
+        Baselines are process-local and survive cache flushes. No tensor payloads
+        are logged or retained. Debug copies synchronize and affect performance.
+        """
+        if not getattr(self, "_debug_verify", False):
+            return
+        half = len(ranges) // 2
+        for pool, fragments in (("kv", ranges[:half]), ("indexer", ranges[half:])):
+            counts = {"MATCH": 0, "MISMATCH": 0, "NO_BASELINE": 0}
+            total_bytes = 0
+            first_issue = None
+            for item in fragments:
+                mr, offset = resolve_mr(self.regions, item.ptr, item.size)
+                base = self.regions[mr][0]
+                data = self._debug_regions[base][offset : offset + item.size]
+                digest = hashlib.sha256(data.cpu().numpy().tobytes()).hexdigest()
+                identity = (layer, pool, item.key, item.storage_offset, item.size)
+                total_bytes += item.size
+                if write:
+                    self._debug_digests[identity] = digest
+                    continue
+                expected = self._debug_digests.get(identity)
+                status = (
+                    "NO_BASELINE" if expected is None
+                    else "MATCH" if expected == digest else "MISMATCH"
+                )
+                counts[status] += 1
+                if status != "MATCH" and first_issue is None:
+                    first_issue = {
+                        "status": status, "key": item.key,
+                        "storage_offset": item.storage_offset, "bytes": item.size,
+                        "expected_sha256": expected, "actual_sha256": digest,
+                    }
+            status = (
+                "BASELINE" if write else "MISMATCH" if counts["MISMATCH"]
+                else "NO_BASELINE" if counts["NO_BASELINE"] else "MATCH"
+            )
+            log = logger.error if status == "MISMATCH" else logger.info
+            log(
+                "[OceanDisk verify] %s",
+                json.dumps({
+                    "operation": "PUT" if write else "GET", "status": status,
+                    "pid": os.getpid(), "device": str(self.device),
+                    "layer": layer, "pool": pool, "fragments": len(fragments),
+                    "bytes": total_bytes, "counts": counts,
+                    "first_issue": first_issue,
+                }),
+            )
+
     def get_layers(self, layers, *, max_ranges=256, on_layer_ready=None) -> None:
         import od_utils
 
@@ -403,6 +467,7 @@ class OceanDiskStorage(HiCacheStorage):
                 for layer in range(len(layers)):
                     for _, _, events in submitted:
                         events[layer].synchronize()
+                    self._debug_check_layer(layer, layers[layer], write=False)
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
                     if on_layer_ready is not None:
@@ -434,6 +499,8 @@ class OceanDiskStorage(HiCacheStorage):
                 batches=len(descriptors),
             )
             try:
+                for layer, ranges in enumerate(layers):
+                    self._debug_check_layer(layer, ranges, write=True)
                 for batch_index, batch in enumerate(descriptors):
                     cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
                     gpu = cpu.to(self.device)
@@ -490,7 +557,10 @@ class OceanDiskStorage(HiCacheStorage):
         with torch.cuda.device(self.device):
             self._ensure_open()
             batches = self._pack_layer_batches(layers, max_ranges)
-            prepared = [[] for _ in layers]
+            prepared = [
+                _DebugPreparedLayer(ranges) if getattr(self, "_debug_verify", False) else []
+                for ranges in layers
+            ]
             for batch in batches:
                 for layer, row in enumerate(batch):
                     cpu = torch.tensor([row], dtype=torch.int64, device="cpu")
@@ -511,6 +581,9 @@ class OceanDiskStorage(HiCacheStorage):
         ):
             self._ensure_open()
             self._stream.wait_event(ready_event)
+            if getattr(self, "_debug_verify", False):
+                # CPU copy is ordered after the ready event on the I/O stream.
+                self._debug_check_layer(layer, prepared.debug_ranges, write=True)
             for cpu, gpu, lengths, indices in prepared:
                 od_utils.batch_dispatch_put(
                     gpu,

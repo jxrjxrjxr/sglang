@@ -8,6 +8,10 @@ set -euo pipefail
 
 # bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk \
 #   2>&1 | tee oceandisk_trace.log
+# 校验写出前/恢复后的每层 KV 和 Indexer（会显著影响计时）：
+# SGLANG_OCEANDISK_VERIFY_DATA=1 bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk \
+#   2>&1 | tee oceandisk_verify.log
+# MATCH=同进程基线一致；MISMATCH=不一致；NO_BASELINE=旧对象或本 rank 未写出，无法比较。
 # 每张 GPU 使用独立配置：目录内放 gids_config_0.txt ... gids_config_7.txt
 # USE_SINGLE_PORT=0 GIDS_DIR=/path/to/config \
 #   bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk
