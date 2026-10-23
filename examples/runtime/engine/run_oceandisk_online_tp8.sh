@@ -13,6 +13,8 @@ OPEXTENSION="${OPEXTENSION:-/opt/oceandisk/libop_extension.so}"
 USE_SINGLE_PORT="${USE_SINGLE_PORT:-0}"
 GIDS_DIR="${GIDS_DIR:-/opt/oceandisk/config}"
 GIDS_CONFIG="${GIDS_CONFIG:-${GIDS_DIR%/}/gids_config.txt}"
+# OceanDisk trace：1 开启，0 关闭。
+export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-0}"
 
 case "$USE_SINGLE_PORT" in
     0)
@@ -39,7 +41,6 @@ export PYTHONPATH="${repo_root}/python:$(dirname -- "$OPEXTENSION")${PYTHONPATH:
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 export SGLANG_DG_USE_NVRTC=1
-export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-0}"
 export CUDA_LAUNCH_BLOCKING=0
 
 exec "${PYTHON_BIN:-python3}" -u -m sglang.launch_server \

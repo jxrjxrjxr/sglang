@@ -8,7 +8,7 @@ set -euo pipefail
 
 # bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk \
 #   2>&1 | tee oceandisk_trace.log
-# 校验写出前/恢复后的每层 KV 和 Indexer（会显著影响计时）：
+# 校验写出前/恢复后的 KV 和 Indexer，每次 GET 每张卡仅汇总一条（会影响计时）：
 # SGLANG_OCEANDISK_VERIFY_DATA=1 bash examples/runtime/engine/run_oceandisk_offline_tp8.sh oceandisk \
 #   2>&1 | tee oceandisk_verify.log
 # MATCH=同进程基线一致；MISMATCH=不一致；NO_BASELINE=旧对象或本 rank 未写出，无法比较。
@@ -28,6 +28,8 @@ OPEXTENSION="${OPEXTENSION:-/opt/oceandisk/libop_extension.so}"
 USE_SINGLE_PORT="${USE_SINGLE_PORT:-1}"
 GIDS_DIR="${GIDS_DIR:-/opt/oceandisk/config}"
 GIDS_CONFIG="${GIDS_CONFIG:-${GIDS_DIR%/}/gids_config.txt}"
+# OceanDisk trace：1 开启，0 关闭。
+export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-1}"
 
 mode=base
 if [[ "${1:-}" == base || "${1:-}" == oceandisk ]]; then
@@ -53,7 +55,6 @@ if [[ "$mode" == oceandisk ]]; then
             ;;
     esac
     export USE_SINGLE_PORT OPEXTENSION GIDS_DIR
-    export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-1}"
     export PYTHONPATH="$(dirname -- "$OPEXTENSION")${PYTHONPATH:+:${PYTHONPATH}}"
     linker_args=(
         --enable-unified-cache-external-linker

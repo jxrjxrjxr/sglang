@@ -70,16 +70,13 @@ class TestOceanDiskStorage(CustomTestCase):
 
         storage._debug_regions = {1000: ByteRegion()}
         ranges = [OceanDiskRange(7, 1000, 4), OceanDiskRange(7, 1008, 4)]
-        with self.assertLogs(level="INFO") as captured:
-            storage._debug_check_layer(0, ranges, write=True)
-            # Alignment padding is outside the logical payload being checked.
-            payload[4] ^= 1
-            storage._debug_check_layer(0, ranges, write=False)
-            payload[8] ^= 1
-            storage._debug_check_layer(0, ranges, write=False)
-            storage._debug_check_layer(1, ranges, write=False)
-        records = [json.loads(record.getMessage().split("] ", 1)[1])
-                   for record in captured.records]
+        records = storage._debug_check_layer(0, ranges, write=True)
+        # Alignment padding is outside the logical payload being checked.
+        payload[4] ^= 1
+        records.extend(storage._debug_check_layer(0, ranges, write=False))
+        payload[8] ^= 1
+        records.extend(storage._debug_check_layer(0, ranges, write=False))
+        records.extend(storage._debug_check_layer(1, ranges, write=False))
         self.assertEqual([r["status"] for r in records], [
             "BASELINE", "BASELINE", "MATCH", "MATCH",
             "MATCH", "MISMATCH", "NO_BASELINE", "NO_BASELINE",
@@ -88,6 +85,24 @@ class TestOceanDiskStorage(CustomTestCase):
         self.assertEqual(records[5]["pool"], "indexer")
         self.assertEqual(issue["key"], 7)
         self.assertNotEqual(issue["expected_sha256"], issue["actual_sha256"])
+
+        # Aggregate all GET results into one line, prioritizing a real mismatch
+        # over missing baselines and retaining the layer/key for diagnosis.
+        with self.assertLogs(level="INFO") as captured:
+            storage._debug_log_summary(records[2:])
+        self.assertEqual(len(captured.records), 1)
+        summary = json.loads(captured.records[0].getMessage().split("] ", 1)[1])
+        self.assertEqual(summary["status"], "MISMATCH")
+        self.assertEqual(summary["layers"], 2)
+        self.assertEqual(summary["pools"]["indexer"]["MATCH"], 1)
+        self.assertEqual(summary["pools"]["indexer"]["MISMATCH"], 1)
+        self.assertEqual(summary["pools"]["indexer"]["NO_BASELINE"], 1)
+        self.assertEqual(summary["first_mismatch"]["layer"], 0)
+
+        with self.assertLogs(level="INFO") as captured:
+            storage._debug_log_summary(records[6:])
+        summary = json.loads(captured.records[0].getMessage().split("] ", 1)[1])
+        self.assertEqual(summary["status"], "NO_BASELINE")
 
     def test_debug_get_checks_before_notifying_model(self):
         storage, trace, _ = self.make_storage()
@@ -201,6 +216,9 @@ class TestOceanDiskStorage(CustomTestCase):
             def to(self, _device):
                 return self
 
+            def __getitem__(self, selection):
+                return type(self)(self.values[selection])
+
         fake_torch = Mock()
         fake_torch.cuda.device.side_effect = lambda *_: nullcontext()
         fake_torch.cuda.stream.side_effect = lambda *_: nullcontext()
@@ -247,7 +265,7 @@ class TestOceanDiskStorage(CustomTestCase):
             for page in range(pages)
         ]
 
-    def test_get_submits_all_layers_before_waiting(self):
+    def test_get_publishes_each_layer_before_dispatching_the_next(self):
         storage, trace, events = self.make_storage()
         ready = []
         layers = [self.layer_ranges(2, layer) for layer in range(3)]
@@ -259,22 +277,26 @@ class TestOceanDiskStorage(CustomTestCase):
                 trace.append(("ready", layer)),
             ),
         )
-        self.od_utils.batch_dispatch_get.assert_called_once()
-        args = self.od_utils.batch_dispatch_get.call_args.args
-        self.assertEqual(args[0].shape, (3, 25))
-        self.assertEqual(args[1], 25)
-        self.assertEqual(args[4], [1, 2, 3])
-        self.assertEqual(args[5:], (123, 0, 0, 3, True, False))
-        for row in args[0].values:
+        calls = self.od_utils.batch_dispatch_get.call_args_list
+        self.assertEqual(len(calls), 3)
+        for layer, call in enumerate(calls):
+            args = call.args
+            self.assertEqual(args[0].shape, (1, 25))
+            self.assertEqual(args[1], 25)
+            self.assertEqual(args[2].values, args[0].values)
+            self.assertEqual(args[4], [layer + 1])
+            self.assertEqual(args[5:], (123, 0, 0, 1, True, False))
+            row = args[0].values[0]
             self.assertEqual(row[1:5], [0, 0, 1, 1])
             self.assertEqual(row[5:9], [1, 2, 1, 2])
             self.assertEqual(row[17:21], [512, 512, 512, 512])
             self.assertEqual(row[21:25], [5, 2, 5, 2])
+            self.assertEqual(row[13:17], [layer * 512] * 2 + [layer * 256] * 2)
         self.assertEqual(ready, [0, 1, 2])
         self.assertEqual(
             [kind for kind, _ in trace],
             ["record"] * 3
-            + ["dispatch", "wait", "ready", "wait", "ready", "wait", "ready"],
+            + ["dispatch", "wait", "ready"] * 3,
         )
         storage._ops.kvcache_load_v2.assert_not_called()
 
@@ -292,7 +314,8 @@ class TestOceanDiskStorage(CustomTestCase):
         )
         calls = self.od_utils.batch_dispatch_get.call_args_list
         self.assertEqual(
-            [call.args[0].shape for call in calls], [(2, 25), (2, 25), (2, 13)]
+            [call.args[0].shape for call in calls],
+            [(1, 25), (1, 25), (1, 13)] * 2,
         )
         task_ids = []
         for call in calls:
@@ -305,6 +328,11 @@ class TestOceanDiskStorage(CustomTestCase):
                 keys = row[1 + count : 1 + 2 * count]
                 self.assertEqual(keys[:half], keys[half:])
         self.assertEqual(len(task_ids), len(set(task_ids)))
+        dispatches = [i for i, event in enumerate(trace) if event[0] == "dispatch"]
+        # All three page batches of layer 0 must finish before publication,
+        # and publication must precede even a blocking layer 1 dispatch.
+        self.assertLess(dispatches[2], trace.index(("ready", 0)))
+        self.assertLess(trace.index(("ready", 0)), dispatches[3])
         first_wait = next(i for i, event in enumerate(trace) if event[0] == "wait")
         self.assertEqual(sum(event[0] == "dispatch" for event in trace[:first_wait]), 3)
         self.assertEqual(
@@ -409,9 +437,15 @@ class TestOceanDiskStorage(CustomTestCase):
             self.od_utils.batch_dispatch_put,
             self.od_utils.batch_dispatch_get,
         ):
-            self.assertEqual(dispatch.call_count, 2)
-            for page, call in enumerate(dispatch.call_args_list):
-                for layer, row in enumerate(call.args[0].values):
+            self.assertEqual(
+                dispatch.call_count, 2 if dispatch is self.od_utils.batch_dispatch_put else 4
+            )
+            for call_index, call in enumerate(dispatch.call_args_list):
+                for row_index, row in enumerate(call.args[0].values):
+                    if dispatch is self.od_utils.batch_dispatch_put:
+                        page, layer = call_index, row_index
+                    else:
+                        layer, page = divmod(call_index, 2)
                     self.assertEqual(row[1:3], [0, 1])
                     self.assertEqual(row[3:5], [page + 1, page + 1])
                     self.assertEqual(
@@ -441,6 +475,21 @@ class TestOceanDiskStorage(CustomTestCase):
                 on_layer_ready=ready,
             )
         ready.assert_not_called()
+        storage._stream.synchronize.assert_called_once()
+
+    def test_get_later_layer_failure_keeps_only_prior_layer_ready(self):
+        storage, _, _ = self.make_storage()
+        ready = Mock()
+        self.od_utils.batch_dispatch_get.side_effect = [
+            None,
+            RuntimeError("second layer failed"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "second layer failed"):
+            storage.get_layers(
+                [self.layer_ranges(1), self.layer_ranges(1, 1)],
+                on_layer_ready=ready,
+            )
+        ready.assert_called_once_with(0)
         storage._stream.synchronize.assert_called_once()
 
     def test_layerwise_put_waits_on_gpu_and_retains_metadata_until_final_wait(self):

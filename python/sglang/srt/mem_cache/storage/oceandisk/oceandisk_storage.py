@@ -375,7 +375,8 @@ class OceanDiskStorage(HiCacheStorage):
         are logged or retained. Debug copies synchronize and affect performance.
         """
         if not getattr(self, "_debug_verify", False):
-            return
+            return []
+        records = []
         half = len(ranges) // 2
         for pool, fragments in (("kv", ranges[:half]), ("indexer", ranges[half:])):
             counts = {"MATCH": 0, "MISMATCH": 0, "NO_BASELINE": 0}
@@ -397,7 +398,10 @@ class OceanDiskStorage(HiCacheStorage):
                     else "MATCH" if expected == digest else "MISMATCH"
                 )
                 counts[status] += 1
-                if status != "MATCH" and first_issue is None:
+                if status != "MATCH" and (
+                    first_issue is None
+                    or (status == "MISMATCH" and first_issue["status"] != "MISMATCH")
+                ):
                     first_issue = {
                         "status": status, "key": item.key,
                         "storage_offset": item.storage_offset, "bytes": item.size,
@@ -407,19 +411,57 @@ class OceanDiskStorage(HiCacheStorage):
                 "BASELINE" if write else "MISMATCH" if counts["MISMATCH"]
                 else "NO_BASELINE" if counts["NO_BASELINE"] else "MATCH"
             )
-            log = logger.error if status == "MISMATCH" else logger.info
-            log(
-                "[OceanDisk verify] %s",
-                json.dumps({
-                    "operation": "PUT" if write else "GET", "status": status,
-                    "pid": os.getpid(), "device": str(self.device),
-                    "layer": layer, "pool": pool, "fragments": len(fragments),
-                    "bytes": total_bytes, "counts": counts,
-                    "first_issue": first_issue,
-                }),
-            )
+            records.append({
+                "status": status, "layer": layer, "pool": pool,
+                "fragments": len(fragments), "bytes": total_bytes,
+                "counts": counts, "first_issue": first_issue,
+            })
+        return records
+
+    def _debug_log_summary(self, records):
+        """One result per GET per rank; absent baselines never count as a pass."""
+        if not records:
+            return
+        pools = {}
+        first_mismatch = None
+        for record in records:
+            pool = pools.setdefault(record["pool"], {
+                "fragments": 0, "bytes": 0,
+                "MATCH": 0, "MISMATCH": 0, "NO_BASELINE": 0,
+            })
+            pool["fragments"] += record["fragments"]
+            pool["bytes"] += record["bytes"]
+            for status, count in record["counts"].items():
+                pool[status] += count
+            if record["counts"]["MISMATCH"] and first_mismatch is None:
+                first_mismatch = {
+                    "layer": record["layer"], "pool": record["pool"],
+                    **record["first_issue"],
+                }
+        status = (
+            "MISMATCH" if first_mismatch is not None
+            else "NO_BASELINE" if any(p["NO_BASELINE"] for p in pools.values())
+            else "MATCH"
+        )
+        log = logger.error if status == "MISMATCH" else logger.info
+        log(
+            "[OceanDisk verify summary] %s",
+            json.dumps({
+                "operation": "GET", "status": status,
+                "pid": os.getpid(), "device": str(self.device),
+                "layers": len({r["layer"] for r in records}),
+                "pools": pools, "first_mismatch": first_mismatch,
+            }),
+        )
 
     def get_layers(self, layers, *, max_ranges=256, on_layer_ready=None) -> None:
+        """Publish each layer before calling the next layer's native GET.
+
+        Native GIDS builds may block inside GET. Passing all layers to one
+        dispatch would then delay every readiness notification until the last
+        layer finishes. Prepare metadata first, but dispatch one layer at a
+        time so model compute can start while subsequent layers are loaded.
+        """
         import od_utils
 
         torch = self._torch
@@ -431,10 +473,12 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             descriptors = self._pack_layer_batches(layers, max_ranges)
             submitted = []
+            verification = []
             trace_event(
                 "GET_BEGIN",
                 layers=len(layers),
                 batches=len(descriptors),
+                mode="layerwise_dispatch",
             )
             try:
                 for batch_index, batch in enumerate(descriptors):
@@ -445,33 +489,42 @@ class OceanDiskStorage(HiCacheStorage):
                         event.record(self._stream)
                     submitted.append((cpu, gpu, events))
                     trace_batch(
-                        "NATIVE_GET_CALL",
+                        "GET_METADATA_READY",
                         batch,
                         batch_index,
                         len(descriptors),
                         od_utils,
                     )
-                    od_utils.batch_dispatch_get(
-                        gpu,
-                        gpu.shape[1],
-                        cpu,
-                        self._output,
-                        [event.cuda_event for event in events],
-                        self._stream.stream_id,
-                        self.device.index,
-                        0,
-                        len(layers),
-                        True,
-                        False,
-                    )
                 for layer in range(len(layers)):
+                    for cpu, gpu, events in submitted:
+                        # Slice both metadata tensors and use local layer 0:
+                        # the native wrapper indexes GPU rows and CPU task IDs
+                        # differently when start_layer is nonzero.
+                        od_utils.batch_dispatch_get(
+                            gpu[layer : layer + 1],
+                            gpu.shape[1],
+                            cpu[layer : layer + 1],
+                            self._output,
+                            [events[layer].cuda_event],
+                            self._stream.stream_id,
+                            self.device.index,
+                            0,
+                            1,
+                            True,
+                            False,
+                        )
+                    # A layer is usable only after every I/O batch containing
+                    # its paired KV/Indexer fragments has completed.
                     for _, _, events in submitted:
                         events[layer].synchronize()
-                    self._debug_check_layer(layer, layers[layer], write=False)
+                    verification.extend(
+                        self._debug_check_layer(layer, layers[layer], write=False) or []
+                    )
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
                     if on_layer_ready is not None:
                         on_layer_ready(layer)
+                self._debug_log_summary(verification)
                 trace_event(
                     "GET_DONE",
                     layers=len(layers),
