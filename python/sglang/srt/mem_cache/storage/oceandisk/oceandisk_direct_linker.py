@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskRange,
     OceanDiskStorage,
     encode_key,
+    trace_event,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_model
@@ -240,6 +241,17 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self.offload_owner,
             list(self.pools),
         )
+        trace_event(
+            "LINKER_INIT",
+            source=__file__,
+            linker=type(self).__name__,
+            storage=type(self.storage).__name__,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            offload_owner=self.offload_owner,
+            layers=self.num_layers,
+        )
+
     def _validate_dsa_layout(self) -> None:
         if set(self.pools) != {PoolName.KV, PoolName.INDEXER}:
             raise ValueError(
@@ -314,6 +326,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 for key, hit in zip(keys, bitmap, strict=True)
             ]
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
+        trace_event(
+            "LOOKUP", rid=rid, pages=len(keys), prefix_pages=end, first_key=keys[0]
+        )
         return list(range(1, end + 1))
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -326,6 +341,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"OceanDisk load already queued for {rid!r}.")
         self.pending_loads[rid] = expanded
+        trace_event(
+            "LOAD_QUEUED",
+            rid=rid,
+            pools=[str(t.name) for t in expanded],
+            pages=[len(t.keys) for t in expanded],
+        )
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
@@ -346,6 +367,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         index = self.layer_done_counter.update_producer()
         pending, self.pending_loads = self.pending_loads, {}
         self.load_queue.put((index, pending, event))
+        trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
     def _transfer_layers(self, transfers, *, skip_scheduled=False):
@@ -407,6 +429,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if self.offload_owner:
             expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
             layers = self._transfer_layers(expanded, skip_scheduled=True)
+        trace_event(
+            "LAYERWISE_SAVE_BEGIN", pages=len(keys), layers=self.num_layers, phase=phase
+        )
         return LayerwiseSaveSession(self, layers, keys, phase)
 
     def get_layerwise_receipts(self, page_keys):
@@ -447,6 +472,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                             write=False,
                             counter_index=index,
                         )
+                        trace_event("LOAD_DONE", counter=index, rids=list(pending))
                     except BaseException as error:
                         self.layer_done_counter.fail(index, error)
                         logger.exception("OceanDisk load batch failed")
@@ -468,6 +494,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return False
         if not self.offload_owner:
             self.offload_results.put(True)
+            trace_event("OFFLOAD_SKIPPED", reason="non_owner_rank")
         else:
             # Layerwise mode only acknowledges existing saves; it never retries PUT.
             event = None if self.layerwise_save_enabled else self._ready_event()
@@ -477,6 +504,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             else:
                 payload = expanded
             self.offload_queue.put((payload, event))
+            trace_event(
+                "LAYERWISE_ACK_QUEUED"
+                if self.layerwise_save_enabled
+                else "OFFLOAD_QUEUED",
+                pages=[len(t.keys) for t in expanded],
+                pools=[str(t.name) for t in expanded],
+            )
         return True
 
     def _offload_worker(self) -> None:
@@ -493,6 +527,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                 task.finish_event = self.storage.record_save_event()
                                 task.finish_event.synchronize()
                             success = not task.aborted and not task.put_failed
+                            if self.offload_owner and success:
+                                trace_event(
+                                    "LAYERWISE_SAVE_DONE",
+                                    pages=len(task.keys),
+                                    layers=task.next_layer,
+                                    phase=task.phase,
+                                )
                         except BaseException:
                             logger.exception("OceanDisk layerwise offload failed")
                         finally:
@@ -521,11 +562,21 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                             )
                         else:
                             event.synchronize()
+                            trace_event(
+                                "OFFLOAD_BEGIN",
+                                first_key=self._object_key(transfers[0].keys[0]),
+                            )
                             self._run_transfers(transfers, write=True)
                             success = True
                     except BaseException:
                         logger.exception("OceanDisk offload failed")
                     self.offload_results.put(success)
+                    trace_event(
+                        "LAYERWISE_ACK_DONE"
+                        if self.layerwise_save_enabled
+                        else "OFFLOAD_DONE",
+                        success=success,
+                    )
                     del transfers
                 finally:
                     self.offload_queue.task_done()
