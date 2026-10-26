@@ -2751,6 +2751,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         host_hit_is_storage=req.host_hit_is_storage,
                     )
                     req._cache_breakdown_computed = True
+                    logger.info(
+                        "[Cache hit] rid=%s hbm=%d host=%d storage=%d",
+                        req.rid,
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    )
 
                 req.already_computed = seq_len
             req.is_retracted = False
