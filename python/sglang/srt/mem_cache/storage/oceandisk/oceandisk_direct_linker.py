@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
@@ -18,12 +19,56 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskStorage,
     encode_key,
 )
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_model
 
 logger = logging.getLogger(__name__)
 
 
-class OceanDiskBlockOffloader:
+class LayerWiseLoadCounter:
+    """Resolve layers only after every physical pool in that layer is readable."""
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.producer_index = -1
+        self.consumer_index = -1
+        self.futures: dict[int, list[Future]] = {}
+
+    def update_producer(self) -> int:
+        self.producer_index += 1
+        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
+        return self.producer_index
+
+    def set_consumer(self, index: int) -> None:
+        self.consumer_index = index
+
+    def complete(self, index: int, layer: int) -> None:
+        self.futures[index][layer].set_result(None)
+
+    def fail(self, index: int, error: BaseException) -> None:
+        for future in self.futures.get(index, ()):
+            if not future.done():
+                future.set_exception(error)
+
+    def wait_until(self, threshold: int) -> None:
+        index = self.consumer_index
+        futures = self.futures.get(index)
+        if futures is None:
+            return
+        try:
+            futures[threshold].result()
+        except BaseException as error:
+            raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
+        finally:
+            if threshold == self.num_layers - 1:
+                self.futures.pop(index, None)
+
+    def reset(self) -> None:
+        self.producer_index = self.consumer_index = -1
+        self.futures.clear()
+
+
+class OceanDiskDirectLinker(UnifiedCacheLinker):
     def __init__(self, server_args, params, *, components, storage=None):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
@@ -89,14 +134,22 @@ class OceanDiskBlockOffloader:
             if storage is None
             else storage
         )
+        self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.load_queue = Queue()
+        self.completed_loads: Queue[list[str]] = Queue()
         self.offload_queue = Queue()
         self.offload_results: Queue[bool] = Queue()
         self._closed = False
+        self._load_thread = threading.Thread(
+            target=self._load_worker, daemon=True, name=f"oceandisk-load-tp{tp_rank}"
+        )
         self._offload_thread = threading.Thread(
             target=self._offload_worker,
             daemon=True,
             name=f"oceandisk-offload-tp{tp_rank}",
         )
+        self._load_thread.start()
         self._offload_thread.start()
         logger.info(
             "OceanDisk direct linker: tp=%d/%d replicated=%s owner=%s pools=%s",
@@ -177,10 +230,37 @@ class OceanDiskBlockOffloader:
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         return list(range(1, end + 1))
 
+    def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        self._ensure_open()
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
+        if not expanded:
+            return False
+        if rid in self.pending_loads:
+            raise RuntimeError(f"OceanDisk load already queued for {rid!r}.")
+        self.pending_loads[rid] = expanded
+        return True
+
+    def cancel_queued_load(self, rid: str) -> bool:
+        # Wrapper has already published the tree; cancellation requires rollback.
+        return False
+
     def _ready_event(self):
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(self.device))
         return event
+
+    def start_layer_wise_loading(self) -> int:
+        self._ensure_open()
+        if not self.pending_loads:
+            return -1
+        # Preserve published requests if event creation/recording fails.
+        event = self._ready_event()
+        index = self.layer_done_counter.update_producer()
+        pending, self.pending_loads = self.pending_loads, {}
+        self.load_queue.put((index, pending, event))
+        return index
 
     def _transfer_layers(self, transfers):
         prepared = [
@@ -204,10 +284,52 @@ class OceanDiskBlockOffloader:
             layers.append(pools[PoolName.KV] + pools[PoolName.INDEXER])
         return layers
 
-    def _run_transfers(self, transfers) -> None:
+    def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
         layers = self._transfer_layers(transfers)
-        if layers and layers[0]:
-            self.storage.put_layers(layers, max_ranges=self.max_ranges)
+        if write:
+            if layers and layers[0]:
+                self.storage.put_layers(layers, max_ranges=self.max_ranges)
+        else:
+            self.storage.get_layers(
+                layers,
+                max_ranges=self.max_ranges,
+                on_layer_ready=(
+                    None
+                    if counter_index is None
+                    else lambda layer: self.layer_done_counter.complete(
+                        counter_index, layer
+                    )
+                ),
+            )
+
+    def _load_worker(self) -> None:
+        with torch.cuda.device(self.device):
+            while True:
+                task = self.load_queue.get()
+                try:
+                    if task is None:
+                        return
+                    index, pending, event = task
+                    try:
+                        event.synchronize()
+                        self._run_transfers(
+                            [t for transfers in pending.values() for t in transfers],
+                            write=False,
+                            counter_index=index,
+                        )
+                    except BaseException as error:
+                        self.layer_done_counter.fail(index, error)
+                        logger.exception("OceanDisk load batch failed")
+                    finally:
+                        self.completed_loads.put(list(pending))
+                finally:
+                    self.load_queue.task_done()
+
+    def num_completed_loads(self) -> int:
+        return self.completed_loads.qsize()
+
+    def pop_completed_load(self) -> list[str]:
+        return self.completed_loads.get_nowait()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         self._ensure_open()
@@ -231,7 +353,7 @@ class OceanDiskBlockOffloader:
                     success = False
                     try:
                         event.synchronize()
-                        self._run_transfers(transfers)
+                        self._run_transfers(transfers, write=True)
                         success = True
                     except BaseException:
                         logger.exception("OceanDisk offload failed")
@@ -252,18 +374,26 @@ class OceanDiskBlockOffloader:
             raise RuntimeError("OceanDisk linker is closed.")
 
     def reset(self) -> None:
+        # Even queued loads target published nodes; drain them before tree reset.
+        if self.pending_loads:
+            self.start_layer_wise_loading()
+        self.load_queue.join()
         self.offload_queue.join()
-        while True:
-            try:
-                self.offload_results.get_nowait()
-            except Empty:
-                break
+        for results in (self.completed_loads, self.offload_results):
+            while True:
+                try:
+                    results.get_nowait()
+                except Empty:
+                    break
+        self.layer_done_counter.reset()
 
     def close(self) -> None:
         if self._closed:
             return
         self.reset()
         self._closed = True
+        self.load_queue.put(None)
         self.offload_queue.put(None)
+        self._load_thread.join()
         self._offload_thread.join()
         self.storage.close()

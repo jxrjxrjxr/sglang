@@ -204,6 +204,12 @@ def _create_unified_radix_cache(
             )
 
             linker_cls = MooncakeDirectLinker
+        elif backend == "oceandisk":
+            from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
+                OceanDiskDirectLinker,
+            )
+
+            linker_cls = OceanDiskDirectLinker
         elif backend == "mori":
             from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
                 UMBPDirectLinker,

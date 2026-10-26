@@ -27,7 +27,8 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolGroup,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
-    OceanDiskBlockOffloader as OceanDiskDirectLinker,
+    LayerWiseLoadCounter,
+    OceanDiskDirectLinker,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskRange,
@@ -198,6 +199,90 @@ class TestOceanDiskStorage(CustomTestCase):
             for page in range(pages)
         ]
 
+    def test_get_publishes_each_layer_before_dispatching_the_next(self):
+        storage, trace, events = self.make_storage()
+        ready = []
+        layers = [self.layer_ranges(2, layer) for layer in range(3)]
+        storage.get_layers(
+            layers,
+            max_ranges=8,
+            on_layer_ready=lambda layer: (
+                ready.append(layer),
+                trace.append(("ready", layer)),
+            ),
+        )
+        calls = self.od_utils.batch_dispatch_get.call_args_list
+        self.assertEqual(len(calls), 3)
+        for layer, call in enumerate(calls):
+            args = call.args
+            self.assertEqual(args[0].shape, (1, 25))
+            self.assertEqual(args[1], 25)
+            self.assertEqual(args[2].values, args[0].values)
+            self.assertEqual(args[4], [layer + 1])
+            self.assertEqual(args[5:], (123, 0, 0, 1, True, False))
+            row = args[0].values[0]
+            self.assertEqual(row[1:5], [0, 0, 1, 1])
+            self.assertEqual(row[5:9], [1, 2, 1, 2])
+            self.assertEqual(row[17:21], [512, 512, 512, 512])
+            self.assertEqual(row[21:25], [5, 2, 5, 2])
+            self.assertEqual(row[13:17], [layer * 512] * 2 + [layer * 256] * 2)
+        self.assertEqual(ready, [0, 1, 2])
+        self.assertEqual(
+            [kind for kind, _ in trace],
+            ["record"] * 3
+            + ["dispatch", "wait", "ready"] * 3,
+        )
+        storage._ops.kvcache_load_v2.assert_not_called()
+
+    def test_get_chunks_keep_pairs_and_wait_for_every_batch(self):
+        storage, trace, events = self.make_storage()
+        ready = []
+        layers = [self.layer_ranges(5, layer) for layer in range(2)]
+        storage.get_layers(
+            layers,
+            max_ranges=5,
+            on_layer_ready=lambda layer: (
+                ready.append(layer),
+                trace.append(("ready", layer)),
+            ),
+        )
+        calls = self.od_utils.batch_dispatch_get.call_args_list
+        self.assertEqual(
+            [call.args[0].shape for call in calls],
+            [(1, 25), (1, 25), (1, 13)] * 2,
+        )
+        task_ids = []
+        for call in calls:
+            for row in call.args[0].values:
+                task_ids.append(row[0])
+                count = (len(row) - 1) // 6
+                half = count // 2
+                self.assertEqual(row[1 : 1 + half], [0] * half)
+                self.assertEqual(row[1 + half : 1 + count], [1] * half)
+                keys = row[1 + count : 1 + 2 * count]
+                self.assertEqual(keys[:half], keys[half:])
+        self.assertEqual(len(task_ids), len(set(task_ids)))
+        dispatches = [i for i, event in enumerate(trace) if event[0] == "dispatch"]
+        # All three page batches of layer 0 must finish before publication,
+        # and publication must precede even a blocking layer 1 dispatch.
+        self.assertLess(dispatches[2], trace.index(("ready", 0)))
+        self.assertLess(trace.index(("ready", 0)), dispatches[3])
+        first_wait = next(i for i, event in enumerate(trace) if event[0] == "wait")
+        self.assertEqual(sum(event[0] == "dispatch" for event in trace[:first_wait]), 3)
+        self.assertEqual(
+            [event for event in trace if event[0] in ("wait", "ready")],
+            [
+                ("wait", 1),
+                ("wait", 3),
+                ("wait", 5),
+                ("ready", 0),
+                ("wait", 2),
+                ("wait", 4),
+                ("wait", 6),
+                ("ready", 1),
+            ],
+        )
+
     def test_put_submits_all_layers_and_preserves_pairs_when_chunked(self):
         storage, trace, _ = self.make_storage()
         layers = [self.layer_ranges(3, layer) for layer in range(2)]
@@ -236,6 +321,110 @@ class TestOceanDiskStorage(CustomTestCase):
             self.od_utils.batch_dispatch_put.call_args.args[0].shape, (3, 25)
         )
         self.assertEqual([kind for kind, _ in trace], ["put", "record", "wait"])
+
+    def test_get_rejects_invalid_layers_before_dispatch(self):
+        storage, _, _ = self.make_storage()
+        for limit in (0, 1, True, 409601):
+            with self.assertRaises(ValueError):
+                storage.get_layers([self.layer_ranges(1)], max_ranges=limit)
+        for layers in (
+            [self.layer_ranges(1), self.layer_ranges(2)],
+            [self.layer_ranges(1)[:1]],
+            [
+                self.layer_ranges(1)
+                + [OceanDiskRange(8, 99999, 16), OceanDiskRange(8, 10000, 8)]
+            ],
+        ):
+            with self.assertRaises(ValueError):
+                storage.get_layers(layers)
+        self.od_utils.batch_dispatch_get.assert_not_called()
+
+    def test_legacy_direct_indexer_io_keeps_raw_offsets_and_pads_lengths(self):
+        storage, trace, _ = self.make_storage()
+        storage.regions = [(100000, 4 * 73728), (500000, 4 * 8448)]
+        layers = [
+            [
+                OceanDiskRange(
+                    page + 1,
+                    100000 + (2 * layer + page) * 73728,
+                    73728,
+                    layer * 73728,
+                )
+                for page in range(2)
+            ]
+            + [
+                OceanDiskRange(
+                    page + 1,
+                    500000 + (2 * layer + page) * 8448,
+                    8448,
+                    layer * 8704,
+                )
+                for page in range(2)
+            ]
+            for layer in range(2)
+        ]
+        ready = []
+        storage.put_layers(layers, max_ranges=2)
+        storage.get_layers(layers, max_ranges=2, on_layer_ready=ready.append)
+        self.assertEqual(ready, [0, 1])
+        for dispatch in (
+            self.od_utils.batch_dispatch_put,
+            self.od_utils.batch_dispatch_get,
+        ):
+            self.assertEqual(
+                dispatch.call_count, 2 if dispatch is self.od_utils.batch_dispatch_put else 4
+            )
+            for call_index, call in enumerate(dispatch.call_args_list):
+                for row_index, row in enumerate(call.args[0].values):
+                    if dispatch is self.od_utils.batch_dispatch_put:
+                        page, layer = call_index, row_index
+                    else:
+                        layer, page = divmod(call_index, 2)
+                    self.assertEqual(row[1:3], [0, 1])
+                    self.assertEqual(row[3:5], [page + 1, page + 1])
+                    self.assertEqual(
+                        row[5:7],
+                        [(2 * layer + page) * 73728, (2 * layer + page) * 8448],
+                    )
+                    self.assertEqual(row[7:9], [layer * 73728, layer * 8704])
+                    self.assertEqual(row[9:11], [73728, 8704])
+        # Intentionally reproduce legacy overrun: the last wire range exceeds
+        # the actual registered allocation. This test does not certify safety.
+        last = self.od_utils.batch_dispatch_get.call_args.args[0].values[-1]
+        self.assertEqual(last[6] + last[10] - storage.regions[1][1], 256)
+        self.assertFalse(hasattr(storage, "_staging"))
+        self.assertEqual(sum(kind == "wait" for kind, _ in trace), 5)
+
+    def test_get_error_drains_before_releasing_metadata(self):
+        storage, _, _ = self.make_storage()
+        ready = Mock()
+        self.od_utils.batch_dispatch_get.side_effect = [
+            None,
+            RuntimeError("dispatch failed"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+            storage.get_layers(
+                [self.layer_ranges(2), self.layer_ranges(2, 1)],
+                max_ranges=2,
+                on_layer_ready=ready,
+            )
+        ready.assert_not_called()
+        storage._stream.synchronize.assert_called_once()
+
+    def test_get_later_layer_failure_keeps_only_prior_layer_ready(self):
+        storage, _, _ = self.make_storage()
+        ready = Mock()
+        self.od_utils.batch_dispatch_get.side_effect = [
+            None,
+            RuntimeError("second layer failed"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "second layer failed"):
+            storage.get_layers(
+                [self.layer_ranges(1), self.layer_ranges(1, 1)],
+                on_layer_ready=ready,
+            )
+        ready.assert_called_once_with(0)
+        storage._stream.synchronize.assert_called_once()
 
     def test_descriptor_uses_paired_keys_and_registration_offsets(self):
         ranges = [
@@ -349,6 +538,8 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker.device = "cuda:0"
         linker.storage = Mock()
         linker.max_ranges = 3
+        linker.layer_done_counter = LayerWiseLoadCounter(2)
+        linker.pending_loads = {}
         linker.offload_results = Queue()
         return linker
 
@@ -426,6 +617,90 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         with self.assertRaises(ValueError):
             linker._validate_dsa_layout()
 
+    def test_load_submits_all_layers_with_kv_then_indexer_across_requests(self):
+        linker = self.make_linker()
+        transfers = []
+        for key, slots in (("p0", [0, 1]), ("p1", [2, 3])):
+            transfers.extend(
+                linker.pool_group.resolve_transfers(
+                    [
+                        PoolTransfer(
+                            name=PoolName.KV,
+                            keys=[key],
+                            device_indices=torch.tensor(slots),
+                        )
+                    ]
+                )
+            )
+        calls = []
+
+        def load(layers, *, max_ranges, on_layer_ready):
+            calls.append("load")
+            self.assertEqual(max_ranges, 3)
+            self.assertEqual(
+                [[r.storage_offset for r in ranges] for ranges in layers],
+                [[0, 0, 0, 0], [512, 512, 512, 512]],
+            )
+            for ranges in layers:
+                self.assertEqual(
+                    [r.key for r in ranges[:2]], [r.key for r in ranges[2:]]
+                )
+                self.assertEqual([r.size for r in ranges], [6, 6, 10, 10])
+            for layer in range(len(layers)):
+                on_layer_ready(layer)
+
+        linker.storage.get_layers.side_effect = load
+        linker.layer_done_counter.complete = lambda index, layer: calls.append(
+            (index, layer)
+        )
+        linker._run_transfers(transfers, write=False, counter_index=7)
+        self.assertEqual(calls, ["load", (7, 0), (7, 1)])
+        linker.storage.get_layers.assert_called_once()
+        linker.storage.put_layers.assert_not_called()
+        linker._run_transfers(transfers, write=True)
+        linker.storage.put_layers.assert_called_once()
+        written = linker.storage.put_layers.call_args.args[0]
+        self.assertEqual(len(written), 2)
+        self.assertEqual([len(layer) for layer in written], [4, 4])
+
+    def test_real_storage_events_resolve_linker_futures_in_layer_order(self):
+        linker = self.make_linker()
+        storage, trace, _ = TestOceanDiskStorage.make_storage(self)
+        storage.regions = [
+            (base, 16 * stride)
+            for entry in linker.pools.values()
+            for component in entry.buffer_meta
+            for base, stride, _ in component
+        ]
+        linker.storage = storage
+        index = linker.layer_done_counter.update_producer()
+        complete = linker.layer_done_counter.complete
+
+        def ready(batch, layer):
+            self.assertEqual(trace[-1][0], "wait")
+            complete(batch, layer)
+            trace.append(("complete", layer))
+
+        linker.layer_done_counter.complete = ready
+        transfers = linker.pool_group.resolve_transfers(
+            [
+                PoolTransfer(
+                    name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([2, 3])
+                )
+            ]
+        )
+        linker._run_transfers(transfers, write=False, counter_index=index)
+        self.od_utils.batch_dispatch_get.assert_called_once()
+        rows = self.od_utils.batch_dispatch_get.call_args.args[0].values
+        self.assertEqual([row[1:3] for row in rows], [[0, 2], [1, 3]])
+        self.assertEqual(
+            [event for event in trace if event[0] in ("wait", "complete")],
+            [("wait", 1), ("complete", 0), ("wait", 2), ("complete", 1)],
+        )
+        self.assertTrue(
+            all(future.done() for future in linker.layer_done_counter.futures[index])
+        )
+
     def test_lookup_probes_shared_dsa_keys_and_checks_holes(self):
         linker = self.make_linker()
         missing = linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 1)[0].key
@@ -440,10 +715,62 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             [linker._object_key(key) for key in ("p0", "p1", "p2")]
         )
 
+    def test_owner_ack_and_duplicate_load(self):
+        linker = self.make_linker()
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([2, 3])
+        )
+        self.assertTrue(linker.load("req", [transfer]))
+        self.assertEqual(
+            {t.name for t in linker.pending_loads["req"]},
+            {PoolName.KV, PoolName.INDEXER},
+        )
+        with self.assertRaisesRegex(RuntimeError, "already queued"):
+            linker.load("req", [transfer])
+        self.assertFalse(linker.cancel_queued_load("req"))
+        linker.offload_owner = False
+        linker._ready_event = Mock(side_effect=AssertionError("non-owner wrote"))
+        self.assertTrue(linker.offload([transfer]))
+        self.assertTrue(linker.pop_completed_offload())
+
+    def test_dsa_indexer_is_derived_from_logical_kv(self):
+        linker = self.make_linker()
+        self.assertFalse(
+            linker.load("req", [PoolTransfer(name=PoolName.INDEXER, keys=["p0"])])
+        )
+
+    def test_ready_event_failure_preserves_pending_requests(self):
+        linker = self.make_linker()
+        linker.pending_loads = {"req": []}
+        linker._ready_event = Mock(side_effect=RuntimeError("event failed"))
+        with self.assertRaisesRegex(RuntimeError, "event failed"):
+            linker.start_layer_wise_loading()
+        self.assertEqual(linker.pending_loads, {"req": []})
+        self.assertEqual(linker.layer_done_counter.producer_index, -1)
+
     def test_page_key_location_mismatch_is_rejected(self):
         linker = self.make_linker()
         with self.assertRaises(ValueError):
             linker._page_fragments(PoolName.KV, ["p0", "p1"], [0], 0)
+
+    def test_load_failure_resolves_counter_and_releases_completion(self):
+        linker = self.make_linker()
+        linker.device = "cpu"
+        linker.load_queue = Queue()
+        linker.completed_loads = Queue()
+        index = linker.layer_done_counter.update_producer()
+        linker.layer_done_counter.set_consumer(index)
+        linker._run_transfers = Mock(side_effect=RuntimeError("injected get failure"))
+        event = Mock()
+        linker.load_queue.put((index, {"req": []}, event))
+        linker.load_queue.put(None)
+        with patch("torch.cuda.device", return_value=nullcontext()):
+            linker._load_worker()
+        self.assertEqual(linker.pop_completed_load(), ["req"])
+        self.assertEqual(linker.load_queue.unfinished_tasks, 0)
+        with self.assertRaisesRegex(RuntimeError, "OceanDisk layer-wise"):
+            linker.layer_done_counter.wait_until(0)
+
 
 if __name__ == "__main__":
     unittest.main()

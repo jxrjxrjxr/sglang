@@ -302,6 +302,61 @@ class OceanDiskStorage(HiCacheStorage):
                     row[position] = (row[position] + 511) & ~511
         return batches
 
+    def get_layers(self, layers, *, max_ranges=256, on_layer_ready=None) -> None:
+        """Publish each layer before calling the next layer's native GET.
+
+        Native GIDS builds may block inside GET. Passing all layers to one
+        dispatch would then delay every readiness notification until the last
+        layer finishes. Prepare metadata first, but dispatch one layer at a
+        time so model compute can start while subsequent layers are loaded.
+        """
+        import od_utils
+
+        torch = self._torch
+        with (
+            self._lock,
+            torch.cuda.device(self.device),
+            torch.cuda.stream(self._stream),
+        ):
+            self._ensure_open()
+            descriptors = self._pack_layer_batches(layers, max_ranges)
+            submitted = []
+            try:
+                for batch_index, batch in enumerate(descriptors):
+                    cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                    gpu = cpu.to(self.device)
+                    events = [torch.cuda.Event() for _ in layers]
+                    for event in events:
+                        event.record(self._stream)
+                    submitted.append((cpu, gpu, events))
+                for layer in range(len(layers)):
+                    for cpu, gpu, events in submitted:
+                        # Slice both metadata tensors and use local layer 0:
+                        # the native wrapper indexes GPU rows and CPU task IDs
+                        # differently when start_layer is nonzero.
+                        od_utils.batch_dispatch_get(
+                            gpu[layer : layer + 1],
+                            gpu.shape[1],
+                            cpu[layer : layer + 1],
+                            self._output,
+                            [events[layer].cuda_event],
+                            self._stream.stream_id,
+                            self.device.index,
+                            0,
+                            1,
+                            True,
+                            False,
+                        )
+                    # A layer is usable only after every I/O batch containing
+                    # its paired KV/Indexer fragments has completed.
+                    for _, _, events in submitted:
+                        events[layer].synchronize()
+                    if on_layer_ready is not None:
+                        on_layer_ready(layer)
+            except BaseException:
+                self._stream.synchronize()
+                raise
+
     def put_layers(self, layers, *, max_ranges=256) -> None:
         import od_utils
 
