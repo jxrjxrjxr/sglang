@@ -51,7 +51,6 @@ class LayerwiseSaveSession:
             linker._layerwise_receipts[key] = self.completion
 
     def __enter__(self):
-        self.linker._unavailable_page_keys.update(self.keys)
         self.linker._layerwise_pending_keys.update(self.keys)
         return self
 
@@ -79,9 +78,7 @@ class LayerwiseSaveSession:
     def finish(self, success):
         """Called on the scheduler thread after TP-wide completion consensus."""
         self.linker._layerwise_pending_keys.difference_update(self.keys)
-        if success:
-            self.linker._unavailable_page_keys.difference_update(self.keys)
-        else:
+        if not success:
             for key in self.keys:
                 if self.linker._layerwise_receipts.get(key) is self.completion:
                     self.linker._layerwise_receipts.pop(key)
@@ -211,9 +208,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         # Requests and queued UC acknowledgements own completion receipts.
         self._layerwise_receipts = WeakValueDictionary()
         self._layerwise_pending_keys = set()
-        # Pending/failed writes are hidden in this engine, even if GIDS reports
-        # an object after its first layer. This is not a cross-engine commit log.
-        self._unavailable_page_keys = set()
         self.layerwise_save_enabled = config.get("layerwise_save", True)
         if self.layerwise_save_enabled and (
             params.pp_size != 1
@@ -320,11 +314,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
         bitmap = self.storage.exists_many(keys)
-        if self.layerwise_save_enabled:
-            bitmap = [
-                hit and key not in self._unavailable_page_keys
-                for key, hit in zip(keys, bitmap, strict=True)
-            ]
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         trace_event(
             "LOOKUP", rid=rid, pages=len(keys), prefix_pages=end, first_key=keys[0]

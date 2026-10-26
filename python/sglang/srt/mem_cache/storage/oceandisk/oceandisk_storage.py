@@ -295,32 +295,39 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int]) -> list[bool]:
-        """Singleton probes avoid mistaking a total hit count for a prefix."""
+        """Return a prefix-only bitmap from one native batch existence query.
+
+        kvcache_exist returns the contiguous hit prefix in input order, not
+        individual key statuses. Entries after the first miss remain False.
+        """
         torch = self._torch
-        result = []
         with (
             self._lock,
             torch.cuda.device(self.device),
             torch.cuda.stream(self._stream),
         ):
             self._ensure_open()
-            for key in keys:
-                conn = self.connection_indices[key % len(self.connection_indices)]
-                metadata = torch.tensor(
-                    [next(self._task_ids), key, conn],
-                    dtype=torch.int64,
-                    device=self.device,
+            if not keys:
+                return []
+            connections = [
+                self.connection_indices[key % len(self.connection_indices)]
+                for key in keys
+            ]
+            metadata = torch.tensor(
+                [next(self._task_ids), *keys, *connections],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            try:
+                prefix_hits = self._ops.kvcache_exist(metadata, self._output)
+            finally:
+                self._stream.synchronize()
+            if not isinstance(prefix_hits, int) or not 0 <= prefix_hits <= len(keys):
+                raise RuntimeError(
+                    f"OceanDisk batch exist returned invalid prefix length "
+                    f"{prefix_hits!r} for {len(keys)} keys."
                 )
-                try:
-                    status = self._ops.kvcache_exist(metadata, self._output)
-                finally:
-                    self._stream.synchronize()
-                if status not in (0, 1):
-                    raise RuntimeError(
-                        f"OceanDisk singleton exist returned {status!r}."
-                    )
-                result.append(status == 1)
-        return result
+        return [True] * prefix_hits + [False] * (len(keys) - prefix_hits)
 
     def _pack_layer_batches(self, layers, max_ranges):
         if type(max_ranges) is not int or not 2 <= max_ranges <= MAX_GIDS_RANGES:

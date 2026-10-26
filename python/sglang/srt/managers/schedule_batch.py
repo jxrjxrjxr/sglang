@@ -2752,11 +2752,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                     req._cache_breakdown_computed = True
                     logger.info(
-                        "[Cache hit] rid=%s hbm=%d host=%d storage=%d",
+                        "[Cache hit] rid=%s hbm=%d host=%d",
                         req.rid,
                         req.cached_tokens_device,
                         req.cached_tokens_host,
-                        req.cached_tokens_storage,
                     )
 
                 req.already_computed = seq_len

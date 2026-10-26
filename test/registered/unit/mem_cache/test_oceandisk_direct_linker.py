@@ -50,6 +50,55 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestOceanDiskStorage(CustomTestCase):
+    def test_exists_many_uses_one_batch_and_preserves_prefix_order(self):
+        storage = OceanDiskStorage.__new__(OceanDiskStorage)
+        storage._torch = SimpleNamespace(
+            tensor=lambda values, **kwargs: values,
+            int64="int64",
+            cuda=SimpleNamespace(
+                device=lambda device: nullcontext(),
+                stream=lambda stream: nullcontext(),
+            ),
+        )
+        storage._lock = threading.Lock()
+        storage.device = "cuda:0"
+        storage._stream = Mock()
+        storage._ensure_open = Mock()
+        storage._task_ids = itertools.count(10)
+        storage.connection_indices = [2, 5]
+        storage._output = object()
+        storage._ops = Mock()
+        keys = [11, 12, 13, 14]
+        for prefix in (0, 2, 4):
+            with self.subTest(prefix=prefix):
+                storage._ops.reset_mock()
+                storage._stream.reset_mock()
+                storage._ops.kvcache_exist.return_value = prefix
+                self.assertEqual(
+                    storage.exists_many(keys),
+                    [i < prefix for i in range(len(keys))],
+                )
+                storage._ops.kvcache_exist.assert_called_once()
+                metadata, output = storage._ops.kvcache_exist.call_args.args
+                self.assertEqual(metadata[1:], [11, 12, 13, 14, 5, 2, 5, 2])
+                self.assertIs(output, storage._output)
+                storage._stream.synchronize.assert_called_once()
+
+        storage._ops.reset_mock()
+        storage._stream.reset_mock()
+        self.assertEqual(storage.exists_many([]), [])
+        storage._ops.kvcache_exist.assert_not_called()
+        storage._stream.synchronize.assert_not_called()
+        for invalid in (-1, 5, None):
+            storage._ops.kvcache_exist.return_value = invalid
+            with self.assertRaisesRegex(RuntimeError, "invalid prefix length"):
+                storage.exists_many(keys)
+        storage._ops.kvcache_exist.side_effect = RuntimeError("native failure")
+        storage._stream.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "native failure"):
+            storage.exists_many(keys)
+        storage._stream.synchronize.assert_called_once()
+
     def test_hicache_contract_is_reserved_without_changing_uc_range_io(self):
         self.assertTrue(issubclass(OceanDiskStorage, HiCacheStorage))
         self.assertFalse(inspect.isabstract(OceanDiskStorage))
@@ -562,7 +611,6 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker.layerwise_save_enabled = False
         linker._layerwise_receipts = WeakValueDictionary()
         linker._layerwise_pending_keys = set()
-        linker._unavailable_page_keys = set()
         linker.offload_queue = Queue()
         linker.offload_results = Queue()
         linker.device = "cuda:0"
@@ -745,44 +793,17 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             [linker._object_key(key) for key in ("p0", "p1", "p2")]
         )
 
-    def test_lookup_hides_pending_or_failed_pages_even_when_remote_key_exists(self):
+    def test_lookup_uses_remote_prefix_even_with_pending_local_save(self):
         linker = self.make_linker()
-        linker.layerwise_save_enabled = True
-        linker.storage.exists_many.side_effect = lambda keys: [True] * len(keys)
-        transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1"])]
-        linker._unavailable_page_keys.add(linker._object_key("p1"))
-        self.assertEqual(linker.lookup("req", transfers), [1])
-        linker._unavailable_page_keys.clear()
-        self.assertEqual(linker.lookup("req", transfers), [1, 2])
-
-    def test_non_layerwise_lookup_uses_storage_result_without_local_filter(self):
-        linker = self.make_linker()
-        linker.layerwise_save_enabled = False
-        linker._unavailable_page_keys.add(linker._object_key("p1"))
-        linker.storage.exists_many.return_value = [True, True, False]
+        linker._layerwise_pending_keys.add(linker._object_key("p1"))
         transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2"])]
-        self.assertEqual(linker.lookup("req", transfers), [1, 2])
-
-    def test_non_layerwise_put_failure_does_not_add_local_key_filter(self):
-        linker = self.make_linker()
-        linker.storage.put_layers.side_effect = RuntimeError("PUT failed")
-        transfers = [
-            PoolTransfer(
-                name=PoolName.KV, keys=["p0"], device_indices=torch.tensor([0, 1])
-            )
-        ]
-        with self.assertRaisesRegex(RuntimeError, "PUT failed"):
-            linker._run_transfers(transfers, write=True)
-        self.assertFalse(linker._unavailable_page_keys)
-
-    def test_cache_reset_does_not_reenable_a_known_failed_page(self):
-        linker = self.make_linker()
-        linker.load_queue = Queue()
-        linker.offload_queue = Queue()
-        linker.completed_loads = Queue()
-        linker._unavailable_page_keys.add(linker._object_key("failed"))
-        linker.reset()
-        self.assertEqual(linker._unavailable_page_keys, {linker._object_key("failed")})
+        for layerwise_save in (False, True):
+            with self.subTest(layerwise_save=layerwise_save):
+                linker.layerwise_save_enabled = layerwise_save
+                linker.storage.exists_many.return_value = [True, True, False]
+                self.assertEqual(linker.lookup("req", transfers), [1, 2])
+                linker.storage.exists_many.return_value = [True, False, False]
+                self.assertEqual(linker.lookup("req", transfers), [1])
 
     def test_owner_ack_and_duplicate_load(self):
         linker = self.make_linker()
@@ -900,7 +921,6 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         linker.max_ranges = 256
         linker._layerwise_receipts = WeakValueDictionary()
         linker._layerwise_pending_keys = set()
-        linker._unavailable_page_keys = set()
         linker.offload_queue = Queue()
         linker.offload_results = Queue()
         linker.device = "cuda:0"
@@ -914,7 +934,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         session.on_submitted = on_submitted = Mock()
         session.release_source = Mock()
         with session:
-            self.assertEqual(linker._unavailable_page_keys, {7, 8})
+            self.assertEqual(linker._layerwise_pending_keys, {7, 8})
             session.save_layer(0)
             session.save_layer(1)
             linker.storage.submit_put_layer.assert_not_called()
@@ -930,7 +950,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertFalse(
             any(r.done() and r.result() for r in linker._layerwise_receipts.values())
         )
-        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        self.assertEqual(linker._layerwise_pending_keys, {7, 8})
         on_submitted.assert_called_once()
         self.assertIsNotNone(session.prepared)
         session.release_source.assert_not_called()
@@ -940,11 +960,11 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         session.finish_event.synchronize.assert_called_once()
         self.assertTrue(session.completion.result())
         self.assertEqual(set(linker._layerwise_receipts), {7, 8})
-        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        self.assertEqual(linker._layerwise_pending_keys, {7, 8})
         release = session.release_source
         session.finish(True)
         release.assert_called_once()
-        self.assertFalse(linker._unavailable_page_keys)
+        self.assertFalse(linker._layerwise_pending_keys)
         self.assertIsNone(session.prepared)
 
     @staticmethod
@@ -973,7 +993,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertFalse(
             any(r.done() and r.result() for r in linker._layerwise_receipts.values())
         )
-        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        self.assertFalse(linker._layerwise_pending_keys)
         self.assertIsNone(session.prepared)
 
     def test_failed_forward_drains_and_preserves_the_original_exception(self):
@@ -1006,7 +1026,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertFalse(
             any(r.done() and r.result() for r in linker._layerwise_receipts.values())
         )
-        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        self.assertFalse(linker._layerwise_pending_keys)
         self.assertFalse(linker.offload_results.qsize())
 
     def test_non_owner_runs_same_layer_lifecycle_without_native_puts(self):
@@ -1017,7 +1037,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertFalse(linker.storage.method_calls)
         self.run_worker(linker)
         self.assertEqual(set(linker._layerwise_receipts), {7, 8})
-        self.assertEqual(linker._unavailable_page_keys, {7, 8})
+        self.assertEqual(linker._layerwise_pending_keys, {7, 8})
 
     def test_non_owner_skips_all_pool_address_and_io_preparation(self):
         linker = TestOceanDiskDirectLinker().make_linker()
