@@ -176,6 +176,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        self.pending_layerwise_saves = []
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -186,6 +187,124 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def prepare_layerwise_save(self, batch):
+        """Plan full pages before forward; only OceanDisk opts into this hook."""
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        allocator = self.cache.token_to_kv_pool_allocator
+        # Other layouts need their own source-page lifetime integration.
+        if type(allocator) is not PagedTokenToKVPoolAllocator:
+            return None
+        mode = batch.forward_mode
+        if not (mode.is_decode() or mode.name == "EXTEND"):
+            return None
+        if not batch.spec_algorithm.is_none():
+            return None
+        if any(req.multimodal_inputs is not None for req in batch.reqs):
+            return None
+        lengths = batch.seq_lens_cpu.tolist()
+        counts = [1] * len(batch.reqs) if mode.is_decode() else batch.extend_lens
+        # Prefill uses the same CPU tokens as ScheduleBatch.prepare_for_extend.
+        # Decode must resolve actual inputs, not pending overlap-sampling outputs.
+        inputs = batch.input_ids.detach().cpu().tolist() if mode.is_decode() else None
+        cursor = 0
+        transfers, completed = [], []
+        page_size = self.cache.page_size
+        for req, end, count in zip(batch.reqs, lengths, counts, strict=True):
+            start = end - count
+            history = getattr(req, "_uc_layerwise_tokens", None)
+            if history is None or len(history) < start:
+                history = list(req.origin_input_ids[:start])
+                history.extend(req.output_ids[: max(0, start - len(history))])
+            if len(history) < start:
+                raise RuntimeError(
+                    "OceanDisk cannot reconstruct the forward's token prefix."
+                )
+            del history[start:]
+            if mode.is_decode():
+                history.extend(inputs[cursor : cursor + count])
+            else:
+                history.extend(req.get_fill_ids()[start:end])
+            tokens = history
+            cursor += count
+            req._uc_layerwise_tokens = tokens
+            first = max(
+                start // page_size,
+                req.kv.cache_protected_len // page_size,
+                getattr(req, "_uc_layerwise_submitted_tokens", 0) // page_size,
+            )
+            last = end // page_size
+            if first >= last:
+                continue
+            key = RadixKey(
+                tokens,
+                req.extra_key,
+                cache_salt=req.cache_salt,
+                is_bigram=self.cache.tree_core.is_eagle,
+            ).page_aligned(page_size)
+            hashes = get_storage_hash_str(key, page_size=page_size)
+            slots = self.cache.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, first * page_size : last * page_size
+            ].clone()
+            transfers.append(
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=hashes[first:last],
+                    device_indices=slots,
+                )
+            )
+            completed.append((req, last * page_size))
+        if not transfers:
+            return None
+        session = self.cache_linker.begin_layerwise_save(
+            transfers, phase="decode" if mode.is_decode() else "prefill"
+        )
+        for transfer, (req, _) in zip(transfers, completed, strict=True):
+            receipts = getattr(req, "_uc_layerwise_receipts", None)
+            if receipts is None:
+                receipts = req._uc_layerwise_receipts = set()
+            receipts.update(
+                receipt
+                for receipt in self.cache_linker.get_layerwise_receipts(transfer.keys)
+                if receipt is not None
+            )
+        if session is not None:
+            pages = torch.cat(
+                [
+                    transfer.device_indices[::page_size] // page_size
+                    for transfer in transfers
+                ]
+            )
+            lease = allocator.pin_pages_for_io(pages)
+            session.release_source = lambda: allocator.unpin_pages_for_io(lease)
+
+            def on_submitted():
+                if not session.aborted:
+                    for req, length in completed:
+                        req._uc_layerwise_submitted_tokens = length
+                self.pending_layerwise_saves.append(session)
+
+            session.on_submitted = on_submitted
+        return session
+
+    def num_completed_layerwise_saves(self):
+        count = 0
+        for session in self.pending_layerwise_saves:
+            if not session.completion.done():
+                break
+            count += 1
+        return count
+
+    def take_completed_layerwise_saves(self, count):
+        return [
+            session.completion.result()
+            for session in self.pending_layerwise_saves[:count]
+        ]
+
+    def commit_completed_layerwise_saves(self, successes):
+        for success in successes:
+            self.pending_layerwise_saves.pop(0).finish(success)
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -578,6 +697,9 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self.commit_completed_layerwise_saves(
+            self.take_completed_layerwise_saves(len(self.pending_layerwise_saves))
+        )
         self.hit_markers.clear()
         self._release_pending_locks()
 
@@ -602,4 +724,7 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
+        self.commit_completed_layerwise_saves(
+            self.take_completed_layerwise_saves(len(self.pending_layerwise_saves))
+        )
         self._release_pending_locks()

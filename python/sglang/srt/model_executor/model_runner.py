@@ -1782,14 +1782,16 @@ class ModelRunner:
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+        saver = getattr(forward_batch, "layerwise_kv_saver", None)
+        with ctx_mgr, saver if saver is not None else contextlib.nullcontext():
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                saver is None
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -1834,7 +1836,8 @@ class ModelRunner:
                     forward_count=split_forward_count,
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                saver is None
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

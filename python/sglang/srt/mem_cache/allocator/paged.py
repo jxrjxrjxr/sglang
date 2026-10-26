@@ -131,6 +131,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
+        self._io_page_pins = {}
+        self._io_deferred_pages = []
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
@@ -315,11 +317,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        if self._io_page_pins:
+            pages = torch.cat(page_ids)
+            pinned = torch.isin(pages, torch.cat(list(self._io_page_pins.values())))
+            self._io_deferred_pages.append(pages[pinned])
+            page_ids = (pages[~pinned],)
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
         else:
             self.free_pages = torch.cat((*page_ids, self.free_pages))
+
+    def pin_pages_for_io(self, page_ids: torch.Tensor):
+        """Keep source pages allocated until the scheduler acknowledges DMA."""
+        lease = object()
+        self._io_page_pins[lease] = page_ids.clone()
+        return lease
+
+    def pending_io_size(self) -> int:
+        return sum(pages.numel() for pages in self._io_deferred_pages) * self.page_size
+
+    def unpin_pages_for_io(self, lease):
+        del self._io_page_pins[lease]
+        pending, self._io_deferred_pages = self._io_deferred_pages, []
+        if pending:
+            self._release_page_ids(*pending)
 
     def free_group_begin(self):
         super().free_group_begin()
@@ -335,6 +357,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def clear(self):
+        self._io_page_pins = {}
+        self._io_deferred_pages = []
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device

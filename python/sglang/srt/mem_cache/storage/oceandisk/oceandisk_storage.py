@@ -401,6 +401,59 @@ class OceanDiskStorage(HiCacheStorage):
                 self._stream.synchronize()
                 raise
 
+    def prepare_layerwise_put(self, layers, *, max_ranges=256):
+        """Prepare descriptors before forward, retaining them through completion."""
+        torch = self._torch
+        with torch.cuda.device(self.device):
+            self._ensure_open()
+            batches = self._pack_layer_batches(layers, max_ranges)
+            prepared = [[] for _ in layers]
+            for batch in batches:
+                for layer, row in enumerate(batch):
+                    cpu = torch.tensor([row], dtype=torch.int64, device="cpu")
+                    gpu = cpu.to(self.device)
+                    lengths = torch.tensor([len(row)], dtype=torch.int64, device="cpu")
+                    indices = torch.tensor([0], dtype=torch.int64, device="cpu")
+                    prepared[layer].append((cpu, gpu, lengths, indices))
+            return prepared
+
+    def submit_put_layer(self, layer, prepared, ready_event):
+        import od_utils
+
+        torch = self._torch
+        with (
+            self._lock,
+            torch.cuda.device(self.device),
+            torch.cuda.stream(self._stream),
+        ):
+            self._ensure_open()
+            self._stream.wait_event(ready_event)
+            for cpu, gpu, lengths, indices in prepared:
+                od_utils.batch_dispatch_put(
+                    gpu,
+                    lengths,
+                    indices,
+                    cpu,
+                    self._output,
+                    [],
+                    self._stream.stream_id,
+                    self.device.index,
+                    0,
+                    1,
+                    False,
+                    False,
+                )
+    def record_save_event(self):
+        torch = self._torch
+        with (
+            self._lock,
+            torch.cuda.device(self.device),
+            torch.cuda.stream(self._stream),
+        ):
+            event = torch.cuda.Event()
+            event.record(self._stream)
+            return event
+
     @staticmethod
     def _unsupported_hicache() -> NotImplementedError:
         return NotImplementedError(

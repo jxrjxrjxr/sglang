@@ -1008,6 +1008,11 @@ def test_check_hicache_events_commits_common_rank_results():
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        num_completed_layerwise_saves=lambda: 2,
+        take_completed_layerwise_saves=lambda count: [True] * count,
+        commit_completed_layerwise_saves=lambda results: committed.append(
+            ("layerwise", results)
+        ),
     )
 
     reduce_calls = 0
@@ -1017,7 +1022,7 @@ def test_check_hicache_events_commits_common_rank_results():
         assert op == torch.distributed.ReduceOp.MIN
         reduce_calls += 1
         if reduce_calls == 1:
-            value.copy_(torch.tensor([1, 1]))
+            value.copy_(torch.tensor([1, 1, 1]))
         else:
             value.fill_(0)
 
@@ -1025,7 +1030,7 @@ def test_check_hicache_events_commits_common_rank_results():
 
     cache.check_hicache_events()
 
-    assert committed == [("load", 1), [False]]
+    assert committed == [("load", 1), ("layerwise", [False]), [False]]
 
 
 def test_component_commit_keeps_only_adopted_pages():

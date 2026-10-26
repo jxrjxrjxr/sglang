@@ -120,6 +120,7 @@ class SchedulerInvariantChecker:
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
         allocator = self.token_to_kv_pool_allocator
+        protected += allocator.pending_io_size()
         if get_parallel().dcp_enabled and allocator.page_size > 1:
             # DCP stores logical tokens in widened physical pages.  Prefix cache
             # counters are logical-token based, while the allocator frees whole

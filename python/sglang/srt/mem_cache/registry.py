@@ -228,6 +228,11 @@ def _create_unified_radix_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
+        if getattr(cache.linker.cache_linker, "layerwise_save_enabled", False):
+            # These decoder layers expose the paired KV/Indexer ready hook.
+            model_bases = type(ctx.tp_worker.model_runner.model).__mro__
+            if any(cls.__name__ == "DeepseekV2ForCausalLM" for cls in model_bases):
+                ctx.tp_worker.layerwise_cache_linker = cache.linker
     return cache
 
 

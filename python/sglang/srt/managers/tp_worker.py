@@ -621,6 +621,12 @@ class TpModelWorker(BaseTpWorker):
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
+        layerwise_linker = getattr(self, "layerwise_cache_linker", None)
+        if layerwise_linker is not None and batch is not None and not is_verify:
+            forward_batch.layerwise_kv_saver = layerwise_linker.prepare_layerwise_save(
+                batch
+            )
+
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
