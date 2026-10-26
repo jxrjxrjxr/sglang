@@ -26,6 +26,9 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
+from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
+    OceanDiskBlockOffloader as OceanDiskDirectLinker,
+)
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskRange,
     OceanDiskStorage,
@@ -292,6 +295,155 @@ class TestOceanDiskStorage(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, operation):
                 OceanDiskStorage._check_status(-1, operation)
 
+
+class TestOceanDiskDirectLinker(CustomTestCase):
+    def make_linker(
+        self, *, packed=True, independent_side_pool=False, multi_component=False
+    ):
+        linker = OceanDiskDirectLinker.__new__(OceanDiskDirectLinker)
+        entries = []
+        names = (
+            PoolName.KV,
+            PoolName.SWA if independent_side_pool else PoolName.INDEXER,
+        )
+        for name in names:
+            entries.append(
+                DevicePoolEntry(
+                    name=name,
+                    indices_from_pool=name if independent_side_pool else PoolName.KV,
+                    device_pool=None,
+                    # DSA exposes KV and Indexer as separate single-component pools.
+                    components=(
+                        [
+                            [
+                                torch.zeros((16, width), dtype=torch.uint8)
+                                for _ in range(2)
+                            ]
+                            for width in (3, 5)
+                        ]
+                        if multi_component
+                        else [
+                            [
+                                torch.zeros(
+                                    (16, 3 if name == PoolName.KV else 5),
+                                    dtype=torch.uint8,
+                                )
+                                for _ in range(2)
+                            ]
+                        ]
+                    ),
+                    layer_mapping={0: 0, 1: 1},
+                    page_size=2,
+                    rows_are_pages=False,
+                    packed=packed,
+                )
+            )
+        linker.pool_group = DevicePoolGroup(entries, 2, 2, rank_replicated=True)
+        linker.pools = linker.pool_group.entry_map
+        linker.num_layers = 2
+        linker._namespace = ("sglang-oceandisk-pool-pages", "test-model", 2, 1)
+        linker._validate_dsa_layout()
+        linker._closed = False
+        linker.offload_queue = Queue()
+        linker.offload_results = Queue()
+        linker.device = "cuda:0"
+        linker.storage = Mock()
+        linker.max_ranges = 3
+        linker.offload_results = Queue()
+        return linker
+
+    def test_fragment_keys_do_not_depend_on_gpu_slots(self):
+        linker = self.make_linker()
+        first = linker._page_fragments(PoolName.KV, ["p0", "p1"], [0, 2], 0)
+        second = linker._page_fragments(PoolName.KV, ["p0", "p1"], [4, 6], 0)
+        self.assertEqual([r.key for r in first], [r.key for r in second])
+        self.assertNotEqual([r.ptr for r in first], [r.ptr for r in second])
+        self.assertEqual([r.size for r in first], [6, 6])
+        other_pool = linker._page_fragments(PoolName.INDEXER, ["p0"], [0], 0)
+        other_layer = linker._page_fragments(PoolName.KV, ["p0"], [0], 1)
+        self.assertEqual(first[0].key, other_pool[0].key)
+        self.assertEqual(first[0].key, other_layer[0].key)
+        self.assertEqual([r.storage_offset for r in first], [0, 0])
+        self.assertEqual([r.storage_offset for r in other_layer], [512])
+
+    def test_offsets_pad_each_physical_buffer_for_multiple_components(self):
+        linker = self.make_linker(multi_component=True)
+        first = linker._page_fragments(PoolName.KV, ["p0"], [0], 0)
+        second = linker._page_fragments(PoolName.KV, ["p0"], [0], 1)
+        self.assertEqual([r.storage_offset for r in first], [0, 1024])
+        self.assertEqual([r.storage_offset for r in second], [512, 1536])
+
+    def test_keys_share_dsa_namespaces_without_layout_fingerprinting(self):
+        linker = self.make_linker()
+        other_layout = self.make_linker(multi_component=True)
+        key = linker._object_key("p0")
+        self.assertEqual(key, other_layout._object_key("p0"))
+        linker._validate_dsa_layout()
+        self.assertEqual(key, linker._object_key("p0"))
+        self.assertNotEqual(key, linker._object_key("p1"))
+        linker._namespace = (*linker._namespace, "other-model")
+        self.assertNotEqual(key, linker._object_key("p0"))
+
+    def test_glm_page_uses_raw_local_stride_and_padded_remote_stride(self):
+        linker = self.make_linker()
+        for name, width, rows_are_pages in (
+            (PoolName.KV, 1152, False),
+            (PoolName.INDEXER, 8448, True),
+        ):
+            linker.pools[name] = DevicePoolEntry(
+                name=name,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[
+                    [
+                        torch.zeros(
+                            (128 if not rows_are_pages else 2, width), dtype=torch.uint8
+                        )
+                        for _ in range(2)
+                    ]
+                ],
+                layer_mapping={0: 0, 1: 1},
+                page_size=64,
+                rows_are_pages=rows_are_pages,
+            )
+        linker._validate_dsa_layout()
+        kv = linker._page_fragments(PoolName.KV, ["p0"], [64], 1)[0]
+        indexer = linker._page_fragments(PoolName.INDEXER, ["p0"], [1], 1)[0]
+        self.assertEqual((kv.size, kv.storage_offset), (73728, 73728))
+        self.assertEqual((indexer.size, indexer.storage_offset), (8448, 8704))
+        self.assertEqual(
+            indexer.ptr, linker.pools[PoolName.INDEXER].buffer_meta[0][1][0] + 8448
+        )
+
+    def test_unpacked_layout_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "packed=True"):
+            self.make_linker(packed=False)
+
+    def test_nonuniform_draft_io_counts_are_rejected(self):
+        linker = self.make_linker()
+        for entry in linker.pools.values():
+            entry.layer_mapping = {0: (0, 1), 1: 1}
+        with self.assertRaises(ValueError):
+            linker._validate_dsa_layout()
+
+    def test_lookup_probes_shared_dsa_keys_and_checks_holes(self):
+        linker = self.make_linker()
+        missing = linker._page_fragments(PoolName.INDEXER, ["p1"], [0], 1)[0].key
+        linker.storage.exists_many.side_effect = lambda keys: [
+            k != missing for k in keys
+        ]
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2"])]
+        self.assertEqual(linker.lookup("req", transfers), [1])
+        linker.storage.exists_many.side_effect = lambda keys: [True] * len(keys)
+        self.assertEqual(linker.lookup("req", transfers), [1, 2, 3])
+        linker.storage.exists_many.assert_called_with(
+            [linker._object_key(key) for key in ("p0", "p1", "p2")]
+        )
+
+    def test_page_key_location_mismatch_is_rejected(self):
+        linker = self.make_linker()
+        with self.assertRaises(ValueError):
+            linker._page_fragments(PoolName.KV, ["p0", "p1"], [0], 0)
 
 if __name__ == "__main__":
     unittest.main()
