@@ -312,9 +312,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
 
     def _init_put_progress(self):
         self._put_progress_lock = threading.Lock()
-        self._pending_puts = {}
+        self._pending_puts = set()
         self._put_activity = None
-        self._put_last_pending_log = 0.0
 
     def _put_started(self, task_id, pages):
         if not self.offload_owner:
@@ -324,7 +323,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             if self._put_activity is None:
                 self._put_activity = dict(started_at=now, tasks=0, pages=0, failed=0)
                 logger.info("[OceanDisk PUT] busy: offload started")
-            self._pending_puts[task_id] = (pages, now)
+            self._pending_puts.add(task_id)
             self._put_activity["tasks"] += 1
             self._put_activity["pages"] += pages
 
@@ -332,7 +331,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if not self.offload_owner:
             return
         with self._put_progress_lock:
-            self._pending_puts.pop(task_id)
+            self._pending_puts.remove(task_id)
             self._put_activity["failed"] += int(not success)
             self._put_activity["last_finished_at"] = time.monotonic()
 
@@ -353,26 +352,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
             self._put_activity = None
 
-    def _report_pending_puts(self, rid):
-        if not self.offload_owner:
-            return
-        with self._put_progress_lock:
-            if not self._pending_puts:
-                return
-            now = time.monotonic()
-            if now - self._put_last_pending_log < 1.0:
-                return
-            self._put_last_pending_log = now
-            logger.info(
-                "[OceanDisk PUT] pending at lookup: rid=%s pending_tasks=%d "
-                "pending_pages=%d oldest_ms=%.1f",
-                rid,
-                len(self._pending_puts),
-                sum(pages for pages, _ in self._pending_puts.values()),
-                (now - min(started for _, started in self._pending_puts.values()))
-                * 1000,
-            )
-
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         self._ensure_open()
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -380,7 +359,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
-        self._report_pending_puts(rid)
         bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         trace_event(
