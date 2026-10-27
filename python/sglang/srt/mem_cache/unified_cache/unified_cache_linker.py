@@ -197,7 +197,7 @@ class UnifiedCacheLinkerWrapper:
         if type(allocator) is not PagedTokenToKVPoolAllocator:
             return None
         mode = batch.forward_mode
-        if not (mode.is_decode() or mode.name == "EXTEND"):
+        if not (mode.is_decode() or mode.name in ("EXTEND", "MIXED")):
             return None
         if not batch.spec_algorithm.is_none():
             return None
@@ -207,11 +207,25 @@ class UnifiedCacheLinkerWrapper:
         counts = [1] * len(batch.reqs) if mode.is_decode() else batch.extend_lens
         # Prefill uses the same CPU tokens as ScheduleBatch.prepare_for_extend.
         # Decode must resolve actual inputs, not pending overlap-sampling outputs.
-        inputs = batch.input_ids.detach().cpu().tolist() if mode.is_decode() else None
-        cursor = 0
+        if mode.is_decode():
+            decode_count = len(batch.reqs)
+            phase = "decode"
+        else:
+            decode_count = len(batch.decoding_reqs or ())
+            phase = "mixed" if mode.name == "MIXED" else "prefill"
+        prefill_count = len(batch.reqs) - decode_count
+        # Decode requests occupy the tail, including decode converted to EXTEND
+        # by DP sync. Prefill tokens already exist on the CPU.
+        inputs = (
+            batch.input_ids[-decode_count:].detach().cpu().tolist()
+            if decode_count
+            else None
+        )
         transfers, completed = [], []
         page_size = self.cache.page_size
-        for req, end, count in zip(batch.reqs, lengths, counts, strict=True):
+        for req_index, (req, end, count) in enumerate(
+            zip(batch.reqs, lengths, counts, strict=True)
+        ):
             start = end - count
             history = getattr(req, "_uc_layerwise_tokens", None)
             rebuild_history = history is None or len(history) < start
@@ -231,12 +245,11 @@ class UnifiedCacheLinkerWrapper:
                     "OceanDisk cannot reconstruct the forward's token prefix."
                 )
             del history[start:]
-            if mode.is_decode():
-                history.extend(inputs[cursor : cursor + count])
+            if req_index >= prefill_count:
+                history.append(inputs[req_index - prefill_count])
             else:
                 history.extend(req.get_fill_ids()[start:end])
             tokens = history
-            cursor += count
             req._uc_layerwise_tokens = tokens
             first = max(
                 start // page_size,
@@ -274,9 +287,7 @@ class UnifiedCacheLinkerWrapper:
             completed.append((req, last * page_size))
         if not transfers:
             return None
-        session = self.cache_linker.begin_layerwise_save(
-            transfers, phase="decode" if mode.is_decode() else "prefill"
-        )
+        session = self.cache_linker.begin_layerwise_save(transfers, phase=phase)
         for transfer, (req, _) in zip(transfers, completed, strict=True):
             receipts = getattr(req, "_uc_layerwise_receipts", None)
             if receipts is None:

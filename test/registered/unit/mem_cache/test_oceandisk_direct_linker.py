@@ -1132,6 +1132,80 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertEqual(set(linker._layerwise_receipts), {7, 8})
         self.assertEqual(linker._layerwise_pending_keys, {7, 8})
 
+    def test_multi_request_session_preserves_all_pages_and_receipts(self):
+        for owner in (True, False):
+            with self.subTest(owner=owner):
+                linker = TestOceanDiskDirectLinker().make_linker()
+                linker.offload_owner = owner
+                linker.storage.prepare_layerwise_put.return_value = [[], []]
+                linker._ready_event = Mock()
+                transfers = [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=[f"p{i}"],
+                        device_indices=torch.tensor([2 * i, 2 * i + 1]),
+                    )
+                    for i in range(3)
+                ]
+                expected_keys = [linker._object_key(f"p{i}") for i in range(3)]
+                with patch.object(
+                    linker, "_object_key", wraps=linker._object_key
+                ) as encode:
+                    session = linker.begin_layerwise_save(transfers)
+                    self.assertEqual(encode.call_count, 3)
+                self.assertEqual(session.keys, expected_keys)
+                for transfer in transfers:
+                    self.assertEqual(
+                        linker.get_layerwise_receipts(transfer.keys),
+                        [session.completion],
+                    )
+                if owner:
+                    layers = linker.storage.prepare_layerwise_put.call_args.args[0]
+                    for layer_index, ranges in enumerate(layers):
+                        expected = []
+                        for pool in (PoolName.KV, PoolName.INDEXER):
+                            for i in range(3):
+                                expected.extend(
+                                    linker._page_fragments(
+                                        pool, [f"p{i}"], [2 * i], layer_index
+                                    )
+                                )
+                        self.assertEqual(ranges, expected)
+                else:
+                    linker.storage.prepare_layerwise_put.assert_not_called()
+                with session:
+                    self.assertEqual(linker._layerwise_pending_keys, set(expected_keys))
+                    session.save_layer(0)
+                    session.save_layer(1)
+                self.assertFalse(session.completion.done())
+                self.run_worker(linker)
+                self.assertTrue(session.completion.result())
+                session.finish(True)
+                self.assertFalse(linker._layerwise_pending_keys)
+
+    def test_pending_first_request_does_not_skip_later_requests(self):
+        linker = TestOceanDiskDirectLinker().make_linker()
+        linker.storage.prepare_layerwise_put.return_value = [[], []]
+        pending_key = linker._object_key("p0")
+        old_receipt = Future()
+        linker._layerwise_pending_keys.add(pending_key)
+        linker._layerwise_receipts[pending_key] = old_receipt
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=[f"p{i}"],
+                device_indices=torch.tensor([2 * i, 2 * i + 1]),
+            )
+            for i in range(2)
+        ]
+        session = linker.begin_layerwise_save(transfers)
+        new_key = linker._object_key("p1")
+        self.assertEqual(session.keys, [new_key])
+        self.assertIs(linker._layerwise_receipts[pending_key], old_receipt)
+        self.assertIs(linker._layerwise_receipts[new_key], session.completion)
+        for ranges in linker.storage.prepare_layerwise_put.call_args.args[0]:
+            self.assertEqual([r.key for r in ranges], [new_key, new_key])
+
     def test_non_owner_skips_all_pool_address_and_io_preparation(self):
         linker = TestOceanDiskDirectLinker().make_linker()
         linker.offload_owner = False
@@ -1480,6 +1554,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             req.get_fill_ids = Mock(return_value=prefix[: end - len(tokens)] + tokens)
         return SimpleNamespace(
             reqs=[req],
+            decoding_reqs=None,
             seq_lens_cpu=torch.tensor([end]),
             extend_lens=[len(tokens)],
             input_ids=torch.tensor(tokens),
@@ -1630,6 +1705,66 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertEqual(transfer.keys, ["new-page"])
         self.assertEqual(transfer.device_indices.tolist(), list(range(64, 128)))
         batch.input_ids.detach.assert_not_called()
+
+    def test_mixed_saves_prefill_and_complete_decode_pages_in_one_session(self):
+        wrapper, prefill = self.make_planner()
+        _, decode = self.make_planner()
+        _, partial = self.make_planner()
+        wrapper.cache.req_to_token_pool.req_to_token = torch.arange(384).reshape(3, 128)
+        batch = self.make_batch(prefill, list(range(64)), 64)
+        decode.origin_input_ids = list(range(60))
+        decode.output_ids = [-1] * 4
+        decode._uc_layerwise_tokens = list(range(63))
+        decode.kv.req_pool_idx = 1
+        partial.origin_input_ids = list(range(64))
+        partial.output_ids = [-1]
+        partial._uc_layerwise_tokens = list(range(64))
+        partial.kv.req_pool_idx = 2
+        batch.reqs = [prefill, decode, partial]
+        batch.decoding_reqs = [decode, partial]
+        batch.seq_lens_cpu = torch.tensor([64, 64, 65])
+        batch.extend_lens = [64, 1, 1]
+        batch.input_ids = torch.tensor(list(range(64)) + [999, 1000])
+        batch.forward_mode = SimpleNamespace(name="MIXED", is_decode=lambda: False)
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__,
+            {"get_storage_hash_str": Mock(side_effect=[["prefill"], ["decode"]])},
+        ) as env:
+            session = wrapper.prepare_layerwise_save(batch)
+            calls = env["get_storage_hash_str"].call_args_list
+            self.assertEqual(list(calls[0].args[0]), list(range(64)))
+            self.assertEqual(list(calls[1].args[0]), list(range(63)) + [999])
+        begin = wrapper.cache_linker.begin_layerwise_save
+        begin.assert_called_once()
+        self.assertEqual(begin.call_args.kwargs, {"phase": "mixed"})
+        transfers = begin.call_args.args[0]
+        self.assertEqual([t.keys for t in transfers], [["prefill"], ["decode"]])
+        self.assertEqual(transfers[0].device_indices.tolist(), list(range(64)))
+        self.assertEqual(transfers[1].device_indices.tolist(), list(range(128, 192)))
+        self.assertEqual(partial._uc_layerwise_tokens, list(range(64)) + [1000])
+        session.on_submitted()
+        self.assertEqual(prefill._uc_layerwise_submitted_tokens, 64)
+        self.assertEqual(decode._uc_layerwise_submitted_tokens, 64)
+        self.assertFalse(hasattr(partial, "_uc_layerwise_submitted_tokens"))
+
+    def test_decode_converted_to_extend_uses_actual_input(self):
+        wrapper, req = self.make_planner()
+        req.origin_input_ids = list(range(60))
+        req.output_ids = [-1] * 4
+        req._uc_layerwise_tokens = list(range(63))
+        batch = self.make_batch(req, [999], 64)
+        batch.decoding_reqs = [req]
+        req.get_fill_ids.side_effect = AssertionError(
+            "decode has unresolved CPU tokens"
+        )
+        hasher = Mock(return_value=["decoded-page"])
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__, {"get_storage_hash_str": hasher}
+        ):
+            wrapper.prepare_layerwise_save(batch)
+        self.assertEqual(list(hasher.call_args.args[0]), list(range(63)) + [999])
+        self.assertEqual(req._uc_layerwise_tokens, list(range(63)) + [999])
+        req.get_fill_ids.assert_not_called()
 
     def test_decode_uses_actual_input_instead_of_unresolved_output_and_skips_partial_page(
         self,

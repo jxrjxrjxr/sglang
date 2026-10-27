@@ -432,9 +432,10 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
-    def _transfer_layers(self, transfers, *, skip_scheduled=False):
+    def _transfer_layers(self, transfers, *, skip_scheduled=False, object_keys=None):
         # A page uses the same object key across layers and physical pools.
-        object_keys = {}
+        if object_keys is None:
+            object_keys = {}
         prepared = []
         for transfer in transfers:
             locations = self.pools[transfer.name].prepare_locations(
@@ -468,23 +469,34 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         return layers
 
     def begin_layerwise_save(self, transfers, *, phase="prefill"):
-        kv = next((t for t in transfers if t.name == PoolName.KV), None)
-        if kv is None:
-            return None
+        kv_transfers = [t for t in transfers if t.name == PoolName.KV]
+        object_keys = dict.fromkeys(
+            page_key for transfer in kv_transfers for page_key in transfer.keys
+        )
+        for page_key in object_keys:
+            object_keys[page_key] = self._object_key(page_key)
         keys = list(
             dict.fromkeys(
                 key
-                for page_key in kv.keys
-                if (key := self._object_key(page_key))
-                not in self._layerwise_pending_keys
+                for key in object_keys.values()
+                if key not in self._layerwise_pending_keys
             )
         )
         if not keys:
             return None
         layers = None
         if self.offload_owner:
-            expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
-            layers = self._transfer_layers(expanded, skip_scheduled=True)
+            # resolve_transfers accepts one transfer per pool, not per request.
+            expanded = [
+                pool_transfer
+                for transfer in kv_transfers
+                for pool_transfer in self.pool_group.resolve_transfers(
+                    [transfer], allow_partial=True
+                )
+            ]
+            layers = self._transfer_layers(
+                expanded, skip_scheduled=True, object_keys=object_keys
+            )
         trace_event(
             "LAYERWISE_SAVE_BEGIN", pages=len(keys), layers=self.num_layers, phase=phase
         )
