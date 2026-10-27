@@ -414,11 +414,17 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         # A page uses the same object key across layers and physical pools.
         if object_keys is None:
             object_keys = {}
+        cpu_indices = {}
         prepared = []
         for transfer in transfers:
-            locations = self.pools[transfer.name].prepare_locations(
-                transfer.host_indices
-            )
+            source = id(transfer.host_indices)
+            if source not in cpu_indices:
+                cpu_indices[source] = transfer.host_indices.detach().to(
+                    device="cpu", dtype=torch.int64
+                )
+            # KV and Indexer share slots, but use token rows and page rows
+            # respectively. Convert the slots once, then map each pool on CPU.
+            locations = self.pools[transfer.name].prepare_locations(cpu_indices[source])
             page_keys, encoded_keys, page_locations = [], [], []
             for page_key, location in zip(transfer.keys, locations, strict=True):
                 if page_key not in object_keys:

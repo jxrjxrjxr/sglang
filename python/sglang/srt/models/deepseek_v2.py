@@ -2445,6 +2445,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
+        graph_hooks = forward_batch.layerwise_kv_graph_hooks
+        if graph_hooks is not None:
+            graph_hooks.wait_for_layer(self.layer_id)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 positions=positions,
@@ -2460,7 +2463,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
         saver = getattr(forward_batch, "layerwise_kv_saver", None)
-        if saver is not None:
+        if graph_hooks is not None:
+            graph_hooks.save_layer(self.layer_id)
+        elif saver is not None:
             saver.save_layer(self.layer_id)
         get_attn_tp_context().clear_attn_inputs()
 

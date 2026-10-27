@@ -48,6 +48,12 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
+from sglang.srt.model_executor.runner_utils.layerwise_kv_graph import (
+    LayerwiseKVGraphHooks,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -677,7 +683,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker._layerwise_pending_keys = {22}
         linker.pools = {
             name: SimpleNamespace(
-                prepare_locations=lambda indices: indices,
+                prepare_locations=lambda indices: indices.tolist(),
                 get_prepared_layer_range_meta=lambda locations, layer: (
                     [[1000 + location + layer * 100] for location in locations],
                     [[16] for _ in locations],
@@ -687,8 +693,9 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             for name in (PoolName.KV, PoolName.INDEXER)
         }
         linker._storage_offsets = {name: [0, 512, 1024] for name in linker.pools}
+        indices = torch.tensor([0, 16])
         transfers = [
-            SimpleNamespace(name=name, keys=["a", "b"], host_indices=[0, 16])
+            SimpleNamespace(name=name, keys=["a", "b"], host_indices=indices)
             for name in linker.pools
         ]
         for skip in (False, True):
@@ -698,7 +705,10 @@ class TestOceanDiskDirectLinker(CustomTestCase):
                         item
                         for transfer in transfers
                         for item in linker._page_fragments(
-                            transfer.name, transfer.keys, transfer.host_indices, layer
+                            transfer.name,
+                            transfer.keys,
+                            transfer.host_indices.tolist(),
+                            layer,
                         )
                         if not skip or item.key != 22
                     ]
@@ -709,6 +719,35 @@ class TestOceanDiskDirectLinker(CustomTestCase):
                     linker._transfer_layers(transfers, skip_scheduled=skip), expected
                 )
                 self.assertEqual(linker._object_key.call_count, 2)
+
+    def test_shared_slots_are_copied_once_and_mapped_to_each_pool_layout(self):
+        linker = self.make_linker()
+        linker.pools[PoolName.INDEXER] = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]],
+            layer_mapping={0: 0, 1: 1},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        linker._validate_dsa_layout()
+        slots = Mock()
+        slots.detach.return_value.to.return_value = torch.tensor([0, 1, 4, 5])
+        transfers = [
+            SimpleNamespace(name=name, keys=["p0", "p1"], host_indices=slots)
+            for name in (PoolName.KV, PoolName.INDEXER)
+        ]
+        layers = linker._transfer_layers(transfers)
+        slots.detach.assert_called_once()
+        slots.detach.return_value.to.assert_called_once_with(
+            device="cpu", dtype=torch.int64
+        )
+        for layer, ranges in enumerate(layers):
+            kv_base = linker.pools[PoolName.KV].kv_buffer[layer].data_ptr()
+            indexer_base = linker.pools[PoolName.INDEXER].kv_buffer[layer].data_ptr()
+            self.assertEqual([r.ptr - kv_base for r in ranges[:2]], [0, 12])
+            self.assertEqual([r.ptr - indexer_base for r in ranges[2:]], [0, 10])
 
     def test_offsets_pad_each_physical_buffer_for_multiple_components(self):
         linker = self.make_linker(multi_component=True)
@@ -1787,6 +1826,111 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             )
             self.assertEqual(req._uc_layerwise_tokens, list(range(65)))
             self.assertEqual(hasher.call_count, 1)
+
+
+class TestOceanDiskBreakableGraph(CustomTestCase):
+    def capture_callbacks(self):
+        counter = Mock()
+        runner = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+        )
+        hooks = LayerwiseKVGraphHooks(runner)
+        capture = SimpleNamespace(
+            cuda_graph=SimpleNamespace(_break_fns=[]),
+            _end_current_segment=Mock(),
+            _begin_new_segment=Mock(),
+            _barrier_fn=None,
+        )
+        token = bcg._current_capture_var.set(capture)
+        try:
+            for layer in range(2):
+                hooks.wait_for_layer(layer)
+                hooks.save_layer(layer)
+        finally:
+            bcg._current_capture_var.reset(token)
+        counter.wait_until.assert_not_called()
+        self.assertIsNone(hooks._saver)
+        return hooks, counter, capture.cuda_graph._break_fns
+
+    def test_captured_callbacks_use_each_live_session_and_wait_layer_by_layer(self):
+        hooks, counter, callbacks = self.capture_callbacks()
+        first, second = Mock(), Mock()
+        for saver in (first, second):
+            order = Mock()
+            counter.wait_until.side_effect = lambda layer: order("load", layer)
+            saver.save_layer.side_effect = lambda layer: order("put", layer)
+            with hooks.replay_session(saver):
+                for callback in callbacks:
+                    callback()
+            self.assertEqual(
+                order.call_args_list,
+                [
+                    unittest.mock.call("load", 0),
+                    unittest.mock.call("put", 0),
+                    unittest.mock.call("load", 1),
+                    unittest.mock.call("put", 1),
+                ],
+            )
+        self.assertEqual(first.save_layer.call_count, 2)
+        self.assertEqual(second.save_layer.call_count, 2)
+        self.assertIsNone(hooks._saver)
+
+    def test_replay_without_new_puts_still_waits_for_loaded_layers(self):
+        hooks, counter, callbacks = self.capture_callbacks()
+        with hooks.replay_session(None):
+            for callback in callbacks:
+                callback()
+        self.assertEqual(
+            counter.wait_until.call_args_list,
+            [unittest.mock.call(0), unittest.mock.call(1)],
+        )
+        self.assertIsNone(hooks._saver)
+
+    def test_replay_load_failure_clears_session_and_does_not_publish_later_layers(self):
+        hooks, counter, callbacks = self.capture_callbacks()
+        saver = Mock()
+        counter.wait_until.side_effect = [None, RuntimeError("GET failed")]
+        with self.assertRaisesRegex(RuntimeError, "GET failed"):
+            with hooks.replay_session(saver):
+                for callback in callbacks:
+                    callback()
+        saver.save_layer.assert_called_once_with(0)
+        self.assertIsNone(hooks._saver)
+        self.assertFalse(hooks._replaying)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_real_breakable_graph_runs_layer_callbacks_on_each_replay(self):
+        runner = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None)
+        )
+        hooks = LayerwiseKVGraphHooks(runner)
+        values = torch.zeros(2, device="cuda")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = bcg.BreakableCUDAGraph()
+        with bcg.BreakableCUDAGraphCapture(
+            cuda_graph=graph, pool=torch.cuda.graph_pool_handle(), stream=stream
+        ):
+            for layer in range(2):
+                hooks.wait_for_layer(layer)
+                values[layer : layer + 1].add_(1)
+                hooks.save_layer(layer)
+        self.assertIsNone(hooks._saver)
+        for step in (1, 2):
+            seen = []
+
+            def save(layer):
+                self.assertFalse(torch.cuda.is_current_stream_capturing())
+                ready = torch.cuda.Event()
+                ready.record()
+                ready.synchronize()
+                self.assertEqual(values[layer].item(), step)
+                seen.append(layer)
+
+            saver = SimpleNamespace(save_layer=save)
+            with hooks.replay_session(saver):
+                graph.replay()
+            self.assertEqual(seen, [0, 1])
 
 
 class TestOceanDiskPrecomputedTreeHashes(CustomTestCase):

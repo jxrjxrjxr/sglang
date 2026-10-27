@@ -71,6 +71,8 @@ class DevicePoolEntry:
                 offset += size
             self._component_offsets.append(offsets)
 
+        self._layer_range_items = {}
+
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
         return self.kv_buffer
 
@@ -130,13 +132,14 @@ class DevicePoolEntry:
         mapped = self.layer_mapping.get(layer)
         if mapped is None:
             return None
-        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
-
-        items = []
-        for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            for buffer_index in buffer_indices:
-                base_ptr, row_stride, size = component[buffer_index]
-                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+        buffer_indices = (mapped,) if isinstance(mapped, int) else tuple(mapped)
+        if buffer_indices not in self._layer_range_items:
+            self._layer_range_items[buffer_indices] = tuple(
+                (*component[index], offsets[index])
+                for component, offsets in zip(self.buffer_meta, self._component_offsets)
+                for index in buffer_indices
+            )
+        items = self._layer_range_items[buffer_indices]
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
