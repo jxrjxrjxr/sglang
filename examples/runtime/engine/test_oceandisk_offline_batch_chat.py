@@ -1,4 +1,4 @@
-"""CPU-only checks: python -m unittest discover -s examples/runtime/engine -p test_oceandisk_offline_batch_chat.py"""
+"""CPU-only regression checks for the two-round batch script."""
 
 import io
 import json
@@ -7,97 +7,71 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import oceandisk_offline_batch_chat as chat
 
 
-class Tokenizer:
-    def apply_chat_template(self, messages, **kwargs):
-        return json.dumps(messages, ensure_ascii=False)
-
-    def encode(self, prompt, **kwargs):
-        return list(prompt.encode("utf-8"))
-
-
-class Engine:
-    def __init__(self, remote=False):
-        self.remote = remote
-        self.calls = []
-        self.flushes = 0
-
-    def flush_cache(self):
-        self.flushes += 1
-        return SimpleNamespace(success=True)
-
-    def generate(self, **kwargs):
-        self.calls.append(kwargs)
-        return [
-            {
-                "text": f"{'different' if self.remote else 'answer'}-{len(self.calls)}-{index}",
-                "output_ids": [len(self.calls), index, int(self.remote)],
-                "meta_info": {
-                    "completion_tokens": 3,
-                    "cached_tokens_details": {
-                        "host": 64 if self.remote and len(self.calls) > 1 else 0
-                    },
-                    "finish_reason": {"type": "length" if index == 0 else "stop"},
-                },
-            }
-            for index in range(len(kwargs["input_ids"]))
-        ]
-
-
 class BatchChatTests(unittest.TestCase):
-    def test_five_conversations_three_rounds_replay_identical_inputs(self):
+    def test_identical_batches_flush_and_save_separate_results(self):
         cases = [
-            {"context": f"article-{i}", "input": "question", "answers": ["answer"]}
-            for i in range(5)
+            {"context": f"article-{i}", "input": f"question-{i}"} for i in range(5)
         ]
-        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
-            with (
-                patch.object(chat, "REFERENCE_PATH", Path(directory) / "base.json"),
-                patch.object(chat, "REPORT_PATH", Path(directory) / "report.json"),
-            ):
-                base, remote = Engine(), Engine(remote=True)
-                reference = chat.run_chat(base, Tokenizer(), cases, {})
-                report = chat.run_chat(remote, Tokenizer(), cases, {}, reference)
-                self.assertEqual([len(batch) for batch in report["rounds"]], [5, 5, 5])
-                self.assertEqual(base.flushes, 4)
-                self.assertEqual(remote.flushes, 4)
-                self.assertEqual(
-                    [c["input_ids"] for c in base.calls],
-                    [c["input_ids"] for c in remote.calls],
-                )
-                self.assertEqual(len({c["cache_salt"] for c in remote.calls}), 1)
-                self.assertNotEqual(
-                    base.calls[0]["cache_salt"], remote.calls[0]["cache_salt"]
-                )
-                self.assertEqual(base.calls[0]["sampling_params"]["temperature"], 0)
-                self.assertIn("answer-1-0", reference["rounds"][1][0]["prompt"])
-                self.assertNotIn("different-1-0", report["rounds"][1][0]["prompt"])
-                self.assertEqual(
-                    [r[0]["cache_check"] for r in report["rounds"]],
-                    ["COLD", "REMOTE_HIT", "REMOTE_HIT"],
-                )
-                self.assertFalse(report["rounds"][0][0]["text_equal"])
-                self.assertTrue(report["rounds"][0][0]["truncated"])
-                saved = json.loads(chat.REPORT_PATH.read_text(encoding="utf-8"))
-                self.assertEqual(len(saved["rounds"]), 3)
+        tokenizer = SimpleNamespace(
+            apply_chat_template=lambda messages, **kw: json.dumps(messages),
+            encode=lambda prompt, **kw: list(prompt.encode()),
+        )
+        engine = Mock()
+        calls = []
+        flush_count = 0
 
-    def test_replay_rejects_changed_tokenization(self):
-        reference = {"rounds": [[{"prompt": "text", "input_ids": [999]}] * 5]}
+        def flush():
+            nonlocal flush_count
+            flush_count += 1
+            return SimpleNamespace(success=True)
+
+        def generate(**kwargs):
+            self.assertEqual(flush_count, len(calls) + 1)
+            calls.append(kwargs)
+            return [
+                {
+                    "text": "different"
+                    if len(calls) == 2 and i == 0
+                    else f"answer-{i}",
+                    "output_ids": [i, len(calls) if i == 0 else 0],
+                    "meta_info": {
+                        "cached_tokens_details": {"host": 64 if len(calls) == 2 else 0},
+                        "finish_reason": {"type": "length" if i == 1 else "stop"},
+                    },
+                }
+                for i in range(5)
+            ]
+
+        engine.generate.side_effect = generate
+        engine.flush_cache.side_effect = flush
         with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(chat, "OUTPUT_DIR", Path(directory)),
             redirect_stdout(io.StringIO()),
-            self.assertRaisesRegex(ValueError, "token IDs differ"),
         ):
-            chat.run_chat(
-                Engine(True),
-                Tokenizer(),
-                [{"context": "a", "input": "q"}] * 5,
-                {},
-                reference,
+            rounds = chat.run_two_rounds(engine, tokenizer, cases)
+            first = json.loads(
+                (Path(directory) / "oceandisk_batch_round1.json").read_text()
             )
+            second = json.loads(
+                (Path(directory) / "oceandisk_batch_round2.json").read_text()
+            )
+            self.assertEqual(first["round"], 1)
+            self.assertEqual(second["round"], 2)
+            self.assertEqual(len(first["results"]), 5)
+            self.assertEqual(second["summary"]["text_equal"], 4)
+            self.assertEqual(second["summary"]["remote_hits_without_hbm"], 5)
+            self.assertEqual(second["summary"]["truncated_outputs"], 2)
+            self.assertFalse(rounds[1]["comparison"][0]["token_ids_equal"])
+        self.assertEqual(calls[0]["input_ids"], calls[1]["input_ids"])
+        self.assertEqual(calls[0]["cache_salt"], calls[1]["cache_salt"])
+        self.assertEqual(len(set(calls[0]["cache_salt"])), 5)
+        self.assertEqual(flush_count, 3)
 
     def test_flush_failure_stops_test(self):
         engine = SimpleNamespace(
@@ -106,25 +80,19 @@ class BatchChatTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "busy"):
             chat.flush_local_cache(engine)
 
-    def test_scores_do_not_treat_missing_gold_as_a_pass(self):
-        self.assertIsNone(chat.score_answer("anything", {})["gold_contained"])
-        score = chat.score_answer(
-            "analysis</think>厦门大学。", {"answers": ["厦门大学"]}
-        )
-        self.assertTrue(score["gold_exact"])
-        self.assertEqual(score["token_f1"], 1)
-
-    def test_token_difference_includes_shorter_output(self):
-        self.assertEqual(
-            chat.first_token_difference([1, 2], [1]),
-            {"index": 1, "reference": 2, "actual": None},
-        )
-        self.assertIsNone(chat.first_token_difference(None, [1]))
+    def test_read_first_n_cases_ignores_blank_lines(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(chat, "BATCH_SIZE", 2),
+        ):
+            path = Path(directory) / "qa.jsonl"
+            path.write_text('\n{"input":"a"}\n{"input":"b"}\n{"input":"c"}\n')
+            self.assertEqual([c["input"] for c in chat.read_cases(path)], ["a", "b"])
 
     def test_dataset_must_have_enough_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "qa.jsonl"
-            path.write_text("{}\n", encoding="utf-8")
+            path.write_text("{}\n")
             with self.assertRaisesRegex(ValueError, "at least 5"):
                 chat.read_cases(path)
 
