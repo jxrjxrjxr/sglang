@@ -1,4 +1,4 @@
-"""Tests dLLM FDFO KV slot reuse in alloc_for_extend."""
+"""Tests dLLM FDFO and linker decode KV slot reuse in alloc_for_extend."""
 
 import unittest
 from array import array
@@ -203,6 +203,77 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         batch = _make_batch(self.pool, allocator, [reused], [2])
         with self.assertRaisesRegex(RuntimeError, "full block"):
             alloc_for_extend(batch)
+
+    def _make_linker_batch(self, allocator, reqs, extend_lens, backend="linker"):
+        override = get_context().override_server_args(
+            disaggregation_mode="decode", disaggregation_transfer_backend=backend
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        for req, extend_len in zip(reqs, extend_lens):
+            req.extend_range = SimpleNamespace(end=len(req.prefix_indices) + extend_len)
+        batch = _make_batch(self.pool, allocator, reqs, extend_lens)
+        batch.is_dllm = lambda: False
+        return batch
+
+    def test_linker_extend_reuses_preallocated_tail(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                allocator = _FakeAllocator(page_size=page_size)
+                req = _make_req("linker", [10, 11, 12, 13], 4, req_pool_idx=1)
+                _remove_allocated_req_slots(self.pool, req)
+                _seed_retained_block(self.pool, req, [100, 101, 102, 103])
+                batch = self._make_linker_batch(allocator, [req], [4])
+
+                out, _, indices = alloc_for_extend(batch)
+
+                self.assertEqual(out.tolist(), [100, 101, 102, 103])
+                self.assertEqual(indices.tolist(), [1])
+                self.assertEqual(allocator.alloc_calls, [])
+                self.assertEqual(allocator.extend_calls, [])
+                self.assertEqual(req.kv.kv_committed_len, 8)
+
+    def test_linker_mixed_extend_allocates_only_unallocated_tail(self):
+        allocator = _FakeAllocator(base=200)
+        reused = _make_req("linker", [10, 11, 12, 13], 4, req_pool_idx=1)
+        fresh = _make_req("fresh", [], 4)
+        _remove_allocated_req_slots(self.pool, reused)
+        _seed_retained_block(self.pool, reused, [100, 101, 102, 103])
+        batch = self._make_linker_batch(allocator, [reused, fresh], [4, 4])
+
+        out, _, _ = alloc_for_extend(batch)
+
+        self.assertEqual(out.tolist(), [100, 101, 102, 103, 200, 201, 202, 203])
+        self.assertEqual(allocator.alloc_calls, [4])
+
+    def test_linker_chunk_continuation_allocates_new_tail(self):
+        allocator = _FakeAllocator(base=300)
+        req = _make_req("chunk", [10, 11, 12, 13], 4, req_pool_idx=1)
+        req.kv.kv_allocated_len = 4
+        _remove_allocated_req_slots(self.pool, req)
+        batch = self._make_linker_batch(allocator, [req], [4])
+
+        out, _, indices = alloc_for_extend(batch)
+
+        self.assertEqual(indices.tolist(), [1])
+        self.assertEqual(out.tolist(), [300, 301, 302, 303])
+        self.assertEqual(allocator.alloc_calls, [4])
+        self.assertEqual(
+            self.pool.req_to_token[1, :8].tolist(),
+            [10, 11, 12, 13, 300, 301, 302, 303],
+        )
+
+    def test_other_decode_backend_does_not_reuse_preallocated_tail(self):
+        allocator = _FakeAllocator(base=400)
+        req = _make_req("native", [10, 11, 12, 13], 4, req_pool_idx=1)
+        _remove_allocated_req_slots(self.pool, req)
+        _seed_retained_block(self.pool, req, [100, 101, 102, 103])
+        batch = self._make_linker_batch(allocator, [req], [4], backend="mooncake")
+
+        out, _, _ = alloc_for_extend(batch)
+
+        self.assertEqual(out.tolist(), [400, 401, 402, 403])
+        self.assertEqual(allocator.alloc_calls, [4])
 
     def test_dllm_manager_pop_aborted_reqs_removes_waiting_and_staging(self):
         manager = DllmManager(SimpleNamespace(max_running_requests=4))

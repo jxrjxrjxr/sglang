@@ -19,6 +19,7 @@ from test_unified_radix_cache_unittest import (
 )
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
@@ -1148,6 +1149,88 @@ def full_linker_component():
             transfer
         ),
     )
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+@pytest.mark.parametrize(
+    "extra_key,cache_salt", [(None, None), ("tenant", None), ("tenant", "salt")]
+)
+@pytest.mark.parametrize("num_pages", [0, 1, 4])
+def test_handoff_lookup_uses_prefill_page_hashes(
+    full_linker_component, is_bigram, extra_key, cache_salt, num_pages
+):
+    allocator = PagedTokenToKVPoolAllocator.__new__(PagedTokenToKVPoolAllocator)
+    cache = _cache_for_wrapper(
+        _components_tuple=(full_linker_component,),
+        page_size=2,
+        tree_core=SimpleNamespace(is_eagle=is_bigram),
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(10).reshape(1, 10)),
+        _all_reduce_attn_groups=MagicMock(
+            side_effect=AssertionError("handoff lookup must remain rank-local")
+        ),
+    )
+    backend = _FakeLinker()
+    backend.begin_layerwise_save = MagicMock(return_value=None)
+    backend.get_layerwise_receipts = MagicMock(return_value=[])
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    req = SimpleNamespace(
+        origin_input_ids=array("q", range(9)),
+        output_ids=[],
+        extra_key=extra_key,
+        cache_salt=cache_salt,
+        multimodal_inputs=None,
+        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=0),
+    )
+    req.get_fill_ids = lambda: req.origin_input_ids
+    batch = SimpleNamespace(
+        reqs=[req],
+        decoding_reqs=None,
+        seq_lens_cpu=torch.tensor([9]),
+        extend_lens=[9],
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        forward_mode=SimpleNamespace(name="EXTEND", is_decode=lambda: False),
+    )
+
+    wrapper.prepare_layerwise_save(batch)
+    saved = backend.begin_layerwise_save.call_args.args[0][0]
+    transfers = wrapper.build_handoff_lookup(req, num_pages)
+
+    if num_pages == 0:
+        assert transfers == []
+    else:
+        assert len(transfers) == 1
+        assert transfers[0].name == PoolName.KV
+        assert transfers[0].keys == saved.keys[:num_pages]
+        assert transfers[0].device_indices is None
+    assert not wrapper.hit_markers
+    assert not wrapper.pending_loads
+    cache._all_reduce_attn_groups.assert_not_called()
+
+
+def test_handoff_lookup_preserves_component_hit_policy(full_linker_component):
+    swa = SWAComponent.__new__(SWAComponent)
+    swa.sliding_window_size = 4
+    cache = _cache_for_wrapper(
+        _components_tuple=(full_linker_component, swa),
+        components={ComponentType.FULL: full_linker_component, ComponentType.SWA: swa},
+        page_size=2,
+        tree_core=SimpleNamespace(is_eagle=False),
+        token_to_kv_pool_allocator=_swa_allocator(False),
+    )
+    swa.cache = cache
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    req = SimpleNamespace(
+        origin_input_ids=array("q", range(9)), extra_key=None, cache_salt=None
+    )
+
+    full, trailing = wrapper.build_handoff_lookup(req, 3)
+
+    assert len(full.keys) == 3
+    assert trailing.keys == full.keys[-2:]
+    assert trailing.hit_policy == PoolHitPolicy.TRAILING_PAGES
+    assert full.device_indices is None
+    assert trailing.device_indices is None
 
 
 def test_linker_filters_request_relative_swa_from_lookup(

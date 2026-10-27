@@ -554,7 +554,7 @@ class TestDecodePrebuilt(unittest.TestCase):
                 scheduler, scheduler.running_batch
             )
 
-        self.assertIs(ret, new_batch)
+        self.assertEqual(ret, (new_batch, None))
         scheduler.policy.calc_priority.assert_called_once_with(
             original_waiting_queue, scheduler.running_batch
         )
@@ -589,7 +589,7 @@ class TestDecodePrebuilt(unittest.TestCase):
                 scheduler, scheduler.running_batch
             )
 
-        self.assertIs(ret, new_batch)
+        self.assertEqual(ret, (new_batch, None))
         scheduler.schedule_stream.wait_stream.assert_called_once_with(
             scheduler.forward_stream
         )

@@ -209,6 +209,13 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
+def _is_linker_handoff(req: Req) -> bool:
+    return (
+        not _is_fake_transfer(req)
+        and get_disagg().disaggregation_transfer_backend == "linker"
+    )
+
+
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
 
@@ -218,7 +225,7 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     for i, poll_val in enumerate(polls):
         if poll_val == int(KVPoll.Success):
             decode_req = decode_reqs[i]
-            if _is_fake_transfer(decode_req.req):
+            if _is_fake_transfer(decode_req.req) or _is_linker_handoff(decode_req.req):
                 continue
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0
@@ -599,6 +606,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    LINKER = "linker"
 
 
 class KVClassType(Enum):
@@ -708,6 +716,17 @@ def get_kv_class(
             KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: FakeKVReceiver,
+        }
+    elif transfer_backend == TransferBackend.LINKER:
+        from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+        from sglang.srt.disaggregation.fake import FakeKVManager, FakeKVSender
+        from sglang.srt.disaggregation.linker import LinkerKVReceiver
+
+        class_mapping = {
+            KVClassType.MANAGER: FakeKVManager,
+            KVClassType.SENDER: FakeKVSender,
+            KVClassType.RECEIVER: LinkerKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: CommonKVBootstrapServer,
         }
     else:
         raise ValueError(f"Unsupported transfer backend: {transfer_backend}")

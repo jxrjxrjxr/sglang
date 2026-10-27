@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+    _install_decode_prefix,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -52,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    _is_linker_handoff,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -80,6 +82,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
     EvictParams,
+    InitLoadBackParams,
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
@@ -127,6 +130,10 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _linker_handoff_prefix_len(req: Req) -> int:
+    return req._compute_max_prefix_len(len(req.origin_input_ids))
 
 
 class DecodeReqToTokenPool:
@@ -665,6 +672,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.kv_receiver.init(0)
                 return
 
+            if _is_linker_handoff(req):
+                num_pages = _linker_handoff_prefix_len(req) // self.tree_cache.page_size
+                linker = self.tree_cache.linker
+                transfers = linker.build_handoff_lookup(req, num_pages)
+                decode_req.kv_receiver.set_ready_probe(
+                    lambda: num_pages == 0
+                    or len(linker.cache_linker.lookup(req.rid, transfers)) == num_pages
+                )
+                decode_req.kv_receiver.init(0)
+                return
+
             # Fast path: cache-only lookup, no network calls
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
@@ -679,10 +697,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        tokens = req.origin_input_ids
+        if _is_linker_handoff(req):
+            tokens = tokens[: _linker_handoff_prefix_len(req)]
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
+            tokens,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
@@ -2129,6 +2150,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        if _is_linker_handoff(decode_req.req):
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            decode_req.req.time_stats.set_wait_queue_entry_time()
+            return
+
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -2647,9 +2674,29 @@ class SchedulerDisaggregationDecodeMixin:
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
-        """Process prebuilt batch and schedule the next decode batch."""
+        """Process prebuilt batch and schedule the next decode batch.
+
+        With the linker backend, a pending EXTEND batch runs before decode advances.
+        """
+        if (
+            get_disagg().disaggregation_transfer_backend == "linker"
+            and self.last_batch
+            and self.last_batch.forward_mode.is_extend()
+        ):
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch()
+            if self.last_batch.batch_size() < last_bs:
+                running_batch.batch_is_full = False
+            if not self.last_batch.is_empty():
+                if running_batch.is_empty():
+                    running_batch = self.last_batch
+                else:
+                    running_batch.merge_batch(self.last_batch)
+
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        new_prebuilt_batch, linker_extend_batch = self.get_new_prebuilt_batch(
+            running_batch
+        )
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -2664,8 +2711,10 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
 
-        # Schedule decode batch
-        if running_batch.is_empty():
+        # Run linker EXTEND before advancing the running decode batch.
+        if linker_extend_batch is not None:
+            ret = linker_extend_batch
+        elif running_batch.is_empty():
             ret = None
         else:
             running_batch = self.update_running_batch(running_batch)
@@ -2676,17 +2725,73 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _build_linker_extend_batch(self: Scheduler, reqs: List[Req]) -> ScheduleBatch:
+        for req in reqs:
+            if req.needs_host_load_back():
+                previous_node = req.last_node
+                prefix_indices = req.prefix_indices
+                loaded = self.tree_cache.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=req.best_match_node,
+                        host_hit_length=req.host_hit_length,
+                        req=req,
+                    )
+                )
+                if loaded is None:
+                    raise RuntimeError(
+                        "Linker load-back must commit all promised tokens: "
+                        f"req={req.rid} promised={req.host_hit_length} loaded=None"
+                    )
+                new_indices, restored_node = loaded
+                req.host_loaded_length = len(new_indices)
+                # The prefix gap was reserved during preallocation; it must be
+                # fully materialized before the tail reuses that request row.
+                if req.host_loaded_length != req.host_hit_length:
+                    raise RuntimeError(
+                        "Linker load-back must commit all promised tokens: "
+                        f"req={req.rid} promised={req.host_hit_length} "
+                        f"loaded={req.host_loaded_length}"
+                    )
+                restored_lock_receipt = self.tree_cache.inc_lock_ref(
+                    restored_node
+                ).to_dec_params()
+                _install_decode_prefix(
+                    self.tree_cache,
+                    req,
+                    start=len(prefix_indices),
+                    end=len(prefix_indices) + len(new_indices),
+                    prefix_indices=prefix_indices,
+                    restored_indices=new_indices,
+                    previous_node=previous_node,
+                    restored_node=restored_node,
+                    restored_lock_receipt=restored_lock_receipt,
+                )
+            req.set_extend_range(len(req.prefix_indices), req.kv.kv_committed_len)
+
+        new_batch = ScheduleBatch.init_new(
+            reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
+        new_batch.prepare_for_extend()
+        return new_batch
+
     def get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
-    ) -> Optional[ScheduleBatch]:
-        """Create a schedulebatch for fake completed prefill"""
+    ) -> Tuple[Optional[ScheduleBatch], Optional[ScheduleBatch]]:
+        """Select waiting requests for prebuilt or linker EXTEND batches."""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
-            return None
+            return None, None
 
         if self.enable_priority_scheduling:
             self.policy.calc_priority(self.waiting_queue, running_batch)
@@ -2726,13 +2831,25 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
-            return None
+            return None, None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        linker_reqs = []
+        prebuilt_reqs = []
+        for req in can_run_list:
+            if _is_linker_handoff(req) and not req.output_ids:
+                linker_reqs.append(req)
+            else:
+                prebuilt_reqs.append(req)
+        linker_extend_batch = (
+            self._build_linker_extend_batch(linker_reqs) if linker_reqs else None
+        )
+        if not prebuilt_reqs:
+            return None, linker_extend_batch
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
-            can_run_list,
+            prebuilt_reqs,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.tree_cache,
@@ -2749,11 +2866,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.schedule_stream.wait_stream(self.forward_stream)
         new_batch.process_prebuilt(self.future_map)
 
-        return new_batch
+        return new_batch, linker_extend_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
-        if self.enable_decode_hicache:
+        if self.enable_decode_hicache or (
+            get_disagg().disaggregation_transfer_backend == "linker"
+            and self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

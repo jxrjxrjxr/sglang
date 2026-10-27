@@ -74,6 +74,35 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "--enable-hierarchical-cache is not supported."
             )
 
+    if cfg.disaggregation_transfer_backend == "linker":
+        if not cfg.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--disaggregation-transfer-backend linker requires "
+                "--enable-unified-cache-external-linker on both prefill and decode"
+            )
+        if resolved_view(server_args).enable_dp_attention:
+            raise ValueError(
+                "--disaggregation-transfer-backend linker does not support "
+                "--enable-dp-attention"
+            )
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--disaggregation-transfer-backend linker requires --pp-size 1"
+            )
+        if cfg.disaggregation_decode_retraction_backup == "host_pool":
+            raise ValueError(
+                "--disaggregation-transfer-backend linker is incompatible with "
+                "--disaggregation-decode-retraction-backup host_pool"
+            )
+        if (
+            cfg.disaggregation_mode == "decode"
+            and not cfg.disaggregation_decode_enable_radix_cache
+        ):
+            raise ValueError(
+                "--disaggregation-transfer-backend linker requires "
+                "--disaggregation-decode-enable-radix-cache on decode"
+            )
+
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
             if cfg.enable_hisparse:

@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import attention_backends, get_parallel
+from sglang.srt.runtime_context import attention_backends, get_disagg, get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -359,6 +359,14 @@ def alloc_for_extend(
     reuse_kv = None
     if batch.is_dllm():
         reuse_kv = [r.kv.holds_kv and bool(r.dllm_incomplete_ids) for r in batch.reqs]
+    elif (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_transfer_backend == "linker"
+    ):
+        reuse_kv = [
+            r.kv.holds_kv and r.kv.kv_allocated_len >= r.extend_range.end
+            for r in batch.reqs
+        ]
 
     # Create tensors for allocation
     pin_memory = is_pin_memory_available(batch.device)
@@ -468,11 +476,10 @@ def _alloc_extend_loc_with_kv_reuse(
             continue
         prefix_len = int(prefix_lens_cpu[i])
         extend_len = int(extend_lens_cpu[i])
-        retained_len = len(req.dllm_incomplete_ids)
-        if extend_len != retained_len:
+        if batch.is_dllm() and extend_len != len(req.dllm_incomplete_ids):
             raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
         if prefix_len + extend_len > req.kv.kv_allocated_len:
-            raise RuntimeError("dLLM FDFO retained KV is missing.")
+            raise RuntimeError("Retained KV is missing.")
 
     alloc_extend_lens = [
         0 if reuse_kv[i] else int(extend_lens_cpu[i]) for i in range(len(reuse_kv))

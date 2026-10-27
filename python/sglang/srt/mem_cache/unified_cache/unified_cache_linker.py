@@ -446,6 +446,28 @@ class UnifiedCacheLinkerWrapper:
             page_size=page,
         )
 
+    def build_handoff_lookup(self, req: Req, num_pages: int) -> list[PoolTransfer]:
+        """Build rank-local lookup transfers using prefill's page hash chain."""
+        if num_pages == 0:
+            return []
+        page = self.cache.page_size
+        key = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+        )[: num_pages * page]
+        hashes = get_storage_hash_str(key, prior_hash=None, page_size=page)
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return []
+            transfers.append(transfer)
+        return transfers
+
     # ---- init_load_back: remote -> device, then insert ----
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:

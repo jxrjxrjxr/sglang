@@ -12,9 +12,12 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
     CacheRequestOutcome,
+    DecLockRefParams,
     InitLoadBackParams,
 )
+from sglang.srt.runtime_context import get_disagg
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -56,6 +59,34 @@ class HiCacheRestoreResult(Enum):
     PENDING = "pending"
     READY = "ready"
     FAILED = "failed"
+
+
+def _install_decode_prefix(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    *,
+    start: int,
+    end: int,
+    prefix_indices: torch.Tensor,
+    restored_indices: torch.Tensor,
+    previous_node: Any,
+    restored_node: Any,
+    restored_lock_receipt: DecLockRefParams,
+) -> None:
+    """Hand the preallocation lock and request row over to a restored prefix."""
+    # Release preallocation before installing the restored lock receipt.
+    tree_cache.dec_lock_ref(
+        previous_node,
+        req.lock_receipt,
+        skip_swa=req.swa_prefix_lock_released,
+    )
+    tree_cache.req_to_token_pool.write(
+        (req.kv.req_pool_idx, slice(start, end)), restored_indices
+    )
+    req.prefix_indices = torch.cat([prefix_indices, restored_indices])
+    req.last_node = restored_node
+    req.lock_receipt = restored_lock_receipt
+    req.swa_prefix_lock_released = False
 
 
 class DecodeHiCachePreallocMixin:
@@ -151,7 +182,13 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = False
 
     def _hicache_pending_restore_tokens(self) -> int:
-        """Total device tokens reserved for pending HiCache L2/L3 load_back."""
+        """Total device tokens reserved for pending prefix load_back."""
+        if get_disagg().disaggregation_transfer_backend == "linker":
+            return sum(
+                req.host_hit_length
+                for req in self.scheduler.waiting_queue
+                if self.tree_cache.linker.has_hit(req.rid)
+            )
         if not self.scheduler.enable_decode_hicache:
             return 0
         return sum(
@@ -327,26 +364,17 @@ class DecodeHiCacheTransferMixin:
         restored_lock_receipt = decode_req.hicache_restore_lock_receipt
         assert restored_node is not None
         assert restored_lock_receipt is not None
-        # Release preallocation before installing the restored lock receipt.
-        self.tree_cache.dec_lock_ref(
-            prefix_match.last_device_node,
-            req.lock_receipt,
-            skip_swa=req.swa_prefix_lock_released,
+        _install_decode_prefix(
+            self.tree_cache,
+            req,
+            start=prefix_match.l1_prefix_len,
+            end=prefix_match.decode_prefix_len,
+            prefix_indices=prefix_match.prefix_indices,
+            restored_indices=decode_req.hicache_restored_kv_indices,
+            previous_node=prefix_match.last_device_node,
+            restored_node=restored_node,
+            restored_lock_receipt=restored_lock_receipt,
         )
-
-        self.tree_cache.req_to_token_pool.write(
-            (
-                decode_req.req.kv.req_pool_idx,
-                slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
-            ),
-            decode_req.hicache_restored_kv_indices,
-        )
-        req.prefix_indices = torch.cat(
-            [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
-        )
-        req.last_node = restored_node
-        req.lock_receipt = restored_lock_receipt
-        req.swa_prefix_lock_released = False
         # Prevent abort cleanup from releasing the transferred lock.
         decode_req.hicache_restored_node = None
         decode_req.hicache_restore_lock_receipt = None
