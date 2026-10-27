@@ -52,15 +52,12 @@ class BatchChatTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(chat, "OUTPUT_DIR", Path(directory)),
+            patch.object(chat.time, "sleep") as sleep,
             redirect_stdout(io.StringIO()),
         ):
             rounds = chat.run_two_rounds(engine, tokenizer, cases)
-            first = json.loads(
-                (Path(directory) / "oceandisk_batch_round1.json").read_text()
-            )
-            second = json.loads(
-                (Path(directory) / "oceandisk_batch_round2.json").read_text()
-            )
+            first, second = rounds
+            self.assertEqual(list(Path(directory).glob("*.json")), [])
             self.assertEqual(first["round"], 1)
             self.assertEqual(second["round"], 2)
             self.assertEqual(len(first["results"]), 5)
@@ -68,7 +65,20 @@ class BatchChatTests(unittest.TestCase):
             self.assertEqual(second["summary"]["remote_hits_without_hbm"], 5)
             self.assertEqual(second["summary"]["truncated_outputs"], 2)
             self.assertFalse(rounds[1]["comparison"][0]["token_ids_equal"])
+            sleep.assert_called_once_with(chat.INTER_ROUND_SLEEP)
+            for number, expected in ((1, "answer-0"), (2, "different")):
+                text = (
+                    Path(directory) / f"oceandisk_batch_round{number}.txt"
+                ).read_text(encoding="utf-8")
+                self.assertEqual(text.count("===== QA "), 5)
+                self.assertIn(f"===== QA 1 =====\n{expected}", text)
         self.assertEqual(calls[0]["input_ids"], calls[1]["input_ids"])
+        prefixes = []
+        for ids in calls[0]["input_ids"]:
+            prompt = bytes(ids).decode()
+            self.assertRegex(prompt, r"^[0-9a-f]{32}\n")
+            prefixes.append(prompt.split("\n", 1)[0])
+        self.assertEqual(len(set(prefixes)), 5)
         self.assertEqual(calls[0]["cache_salt"], calls[1]["cache_salt"])
         self.assertEqual(len(set(calls[0]["cache_salt"])), 5)
         self.assertEqual(flush_count, 3)
