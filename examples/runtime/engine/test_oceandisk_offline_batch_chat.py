@@ -53,7 +53,7 @@ class BatchChatTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as directory,
             patch.object(chat, "OUTPUT_DIR", Path(directory)),
             patch.object(chat.time, "sleep") as sleep,
-            redirect_stdout(io.StringIO()),
+            redirect_stdout(io.StringIO()) as console,
         ):
             rounds = chat.run_two_rounds(engine, tokenizer, cases)
             first, second = rounds
@@ -61,10 +61,17 @@ class BatchChatTests(unittest.TestCase):
             self.assertEqual(first["round"], 1)
             self.assertEqual(second["round"], 2)
             self.assertEqual(len(first["results"]), 5)
-            self.assertEqual(second["summary"]["text_equal"], 4)
-            self.assertEqual(second["summary"]["remote_hits_without_hbm"], 5)
+            self.assertNotIn("text_equal", second["summary"])
+            self.assertNotIn("comparison", second)
+            self.assertEqual(second["summary"]["host_hits_without_hbm"], 5)
             self.assertEqual(second["summary"]["truncated_outputs"], 2)
-            self.assertFalse(rounds[1]["comparison"][0]["token_ids_equal"])
+            self.assertNotIn("token_ids_equal", console.getvalue())
+            for number in (1, 2):
+                for index, ids in enumerate(calls[number - 1]["input_ids"]):
+                    self.assertIn(
+                        f"QA {index + 1}: input_tokens={len(ids)}",
+                        console.getvalue(),
+                    )
             sleep.assert_called_once_with(chat.INTER_ROUND_SLEEP)
             for number, expected in ((1, "answer-0"), (2, "different")):
                 text = (

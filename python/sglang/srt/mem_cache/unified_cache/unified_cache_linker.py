@@ -19,12 +19,14 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
+logger = logging.getLogger(__name__)
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
@@ -177,6 +180,7 @@ class UnifiedCacheLinkerWrapper:
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
         self.pending_layerwise_saves = []
+        self._mixed_logged = False
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -214,6 +218,14 @@ class UnifiedCacheLinkerWrapper:
             decode_count = len(batch.decoding_reqs or ())
             phase = "mixed" if mode.name == "MIXED" else "prefill"
         prefill_count = len(batch.reqs) - decode_count
+        if phase == "mixed" and not self._mixed_logged:
+            self._mixed_logged = True
+            if get_tensor_model_parallel_rank() == 0:
+                logger.info(
+                    "[OceanDisk] MIXED confirmed: prefill_requests=%d decode_requests=%d",
+                    prefill_count,
+                    decode_count,
+                )
         # Decode requests occupy the tail, including decode converted to EXTEND
         # by DP sync. Prefill tokens already exist on the CPU.
         inputs = (

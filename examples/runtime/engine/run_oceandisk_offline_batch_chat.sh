@@ -54,5 +54,8 @@ exec "${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_offline_batch_chat.py"
     --data-parallel-size 1 \
     --moe-a2a-backend none \
     --disable-prefill-cuda-graph \
+    --enable-mixed-chunk \
+    --chunked-prefill-size 2048 \
+    --max-prefill-tokens 4096 \
     --mem-fraction-static 0.85 \
     "$@"

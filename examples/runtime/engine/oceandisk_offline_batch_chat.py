@@ -52,6 +52,7 @@ def run_two_rounds(engine, tokenizer, cases):
     flush_local_cache(engine)
     for number in (1, 2):
         print(f"\n=== Round {number}/2, batch={len(cases)} ===", flush=True)
+        rids = [f"batch-{run_id}-r{number}-qa{i + 1}" for i in range(len(cases))]
         started = time.perf_counter()
         outputs = engine.generate(
             input_ids=input_ids,
@@ -61,6 +62,7 @@ def run_two_rounds(engine, tokenizer, cases):
                 "max_new_tokens": MAX_NEW_TOKENS,
             },
             cache_salt=salts,
+            rid=rids,
         )
         elapsed = time.perf_counter() - started
         if len(outputs) != len(cases):
@@ -73,21 +75,23 @@ def run_two_rounds(engine, tokenizer, cases):
             details = meta.get("cached_tokens_details") or {}
             record = {
                 "case": index + 1,
+                "rid": rids[index],
+                "prompt_tokens": len(ids),
                 "question": case["input"],
                 "answers": case.get("answers"),
                 "prompt": prompt,
                 "input_ids": ids,
                 "text": output["text"],
-                "output_ids": output.get("output_ids"),
                 "meta_info": meta,
                 "truncated": (meta.get("finish_reason") or {}).get("type") == "length",
                 "device_cached_tokens": int(details.get("device", 0)),
-                "remote_cached_tokens": int(details.get("host", 0))
-                + int(details.get("storage", 0)),
+                "host_cached_tokens": int(details.get("host", 0)),
             }
             records.append(record)
             print(
-                f"Case {index + 1}: cached={meta.get('cached_tokens', 0)}, remote={record['remote_cached_tokens']}, truncated={record['truncated']}\nOutput: {output['text']!r}",
+                f"QA {index + 1}: input_tokens={len(ids)} "
+                f"host_hit_tokens={record['host_cached_tokens']} hbm_hit_tokens={record['device_cached_tokens']} "
+                f"truncated={record['truncated']}\nOutput: {output['text']!r}",
                 flush=True,
             )
         result = {
@@ -99,28 +103,11 @@ def run_two_rounds(engine, tokenizer, cases):
             "results": records,
         }
         if number == 2:
-            comparisons = []
-            for first, second in zip(rounds[0]["results"], records, strict=True):
-                comparison = {
-                    "case": second["case"],
-                    "text_equal": first["text"] == second["text"],
-                    "token_ids_equal": (
-                        first["output_ids"] == second["output_ids"]
-                        if first["output_ids"] is not None
-                        and second["output_ids"] is not None
-                        else None
-                    ),
-                    "remote_hit_without_hbm": second["remote_cached_tokens"] > 0
-                    and second["device_cached_tokens"] == 0,
-                }
-                comparisons.append(comparison)
-                print(f"Compare: {json.dumps(comparison)}", flush=True)
-            result["comparison"] = comparisons
             result["summary"] = {
                 "cases": len(cases),
-                "text_equal": sum(c["text_equal"] for c in comparisons),
-                "remote_hits_without_hbm": sum(
-                    c["remote_hit_without_hbm"] for c in comparisons
+                "host_hits_without_hbm": sum(
+                    r["host_cached_tokens"] > 0 and r["device_cached_tokens"] == 0
+                    for r in records
                 ),
                 "truncated_outputs": sum(
                     r["truncated"]

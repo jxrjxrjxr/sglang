@@ -1400,6 +1400,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
 
     def make_planner(self):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper._mixed_logged = False
         allocator = PagedTokenToKVPoolAllocator.__new__(PagedTokenToKVPoolAllocator)
         allocator.pin_pages_for_io = Mock(return_value=object())
         allocator.unpin_pages_for_io = Mock()
