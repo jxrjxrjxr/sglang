@@ -45,6 +45,9 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -281,8 +284,7 @@ class TestOceanDiskStorage(CustomTestCase):
         self.assertEqual(ready, [0, 1, 2])
         self.assertEqual(
             [kind for kind, _ in trace],
-            ["record"] * 3
-            + ["dispatch", "wait", "ready"] * 3,
+            ["record"] * 3 + ["dispatch", "wait", "ready"] * 3,
         )
         storage._ops.kvcache_load_v2.assert_not_called()
 
@@ -424,7 +426,8 @@ class TestOceanDiskStorage(CustomTestCase):
             self.od_utils.batch_dispatch_get,
         ):
             self.assertEqual(
-                dispatch.call_count, 2 if dispatch is self.od_utils.batch_dispatch_put else 4
+                dispatch.call_count,
+                2 if dispatch is self.od_utils.batch_dispatch_put else 4,
             )
             for call_index, call in enumerate(dispatch.call_args_list):
                 for row_index, row in enumerate(call.args[0].values):
@@ -1485,9 +1488,12 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         wrapper, req = self.make_planner()
         hash_calls = []
 
-        def hashes(key, **kwargs):
+        def hashes(key, prior_hash=None, **kwargs):
             hash_calls.append(key)
-            return [f"page{i}" for i in range(len(key) // 64)]
+            start = (
+                0 if prior_hash is None else int(prior_hash.removeprefix("page")) + 1
+            )
+            return [f"page{i}" for i in range(start, start + len(key) // 64)]
 
         with patch.dict(
             wrapper.prepare_layerwise_save.__globals__, {"get_storage_hash_str": hashes}
@@ -1508,7 +1514,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             self.assertEqual(transfer.keys, ["page1"])
             self.assertEqual(transfer.device_indices.tolist(), list(range(64, 128)))
         self.assertEqual(list(hash_calls[0]), list(range(64)))
-        self.assertEqual(list(hash_calls[1]), list(range(128)))
+        self.assertEqual(list(hash_calls[1]), list(range(64, 128)))
         self.assertEqual(
             (hash_calls[0].extra_key, hash_calls[0].cache_salt), ("tenant", "salt")
         )
@@ -1526,6 +1532,83 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertEqual(req._uc_layerwise_tokens, list(range(65)))
         self.assertEqual(list(hasher.call_args.args[0]), list(range(64)))
         batch.input_ids.detach.assert_not_called()
+
+    def test_incremental_hashes_match_tree_hashes_without_token_rescan(self):
+        wrapper, req = self.make_planner()
+        req.origin_input_ids = list(range(128))
+        with patch.dict(
+            wrapper.prepare_layerwise_save.__globals__,
+            {"get_storage_hash_str": Mock(wraps=get_storage_hash_str)},
+        ) as patched:
+            hasher = patched["get_storage_hash_str"]
+            for start, end in ((0, 65), (65, 128)):
+                session = wrapper.prepare_layerwise_save(
+                    self.make_batch(req, list(range(start, end)), end)
+                )
+                session.on_submitted()
+            key = RadixKey(
+                array("q", range(128)), req.extra_key, cache_salt=req.cache_salt
+            )
+            incremental_call = hasher.call_args
+            expected = get_storage_hash_str(key, page_size=64)
+            self.assertEqual(req._uc_layerwise_hashes, expected)
+            self.assertEqual(wrapper.get_layerwise_page_hashes(req, key), expected)
+            self.assertEqual(list(incremental_call.args[0]), list(range(64, 128)))
+            self.assertEqual(incremental_call.kwargs["prior_hash"], expected[0])
+            self.assertEqual(
+                wrapper.get_layerwise_page_hashes(req, key[:64]), expected[:1]
+            )
+
+            class LengthOnlyKey:
+                def __len__(self):
+                    return 128
+
+                @property
+                def token_ids(self):
+                    raise AssertionError("Hash reuse must not rescan tokens")
+
+            self.assertIs(
+                wrapper.get_layerwise_page_hashes(req, LengthOnlyKey()),
+                req._uc_layerwise_hashes,
+            )
+            self.assertIsNone(
+                wrapper.get_layerwise_page_hashes(
+                    req,
+                    RadixKey(
+                        array("q", range(192)), req.extra_key, cache_salt=req.cache_salt
+                    ),
+                )
+            )
+
+    def test_replayed_forward_rehashes_only_changed_suffix(self):
+        wrapper, req = self.make_planner()
+        req.origin_input_ids = list(range(128))
+        wrapper.prepare_layerwise_save(self.make_batch(req, list(range(128)), 128))
+        prefix_hash = req._uc_layerwise_hashes[0]
+        # Replay the second page with different tokens, as after a retraction.
+        replacement = list(range(1000, 1064))
+        wrapper.prepare_layerwise_save(self.make_batch(req, replacement, 128))
+        key = RadixKey(
+            array("q", list(range(64)) + replacement),
+            req.extra_key,
+            cache_salt=req.cache_salt,
+        )
+        expected = get_storage_hash_str(key, page_size=64)
+        self.assertEqual(req._uc_layerwise_hashes, expected)
+        self.assertEqual(expected[0], prefix_hash)
+        self.assertEqual(wrapper.get_layerwise_page_hashes(req, key), expected)
+
+    def test_missing_history_rebuilds_hashes(self):
+        wrapper, req = self.make_planner()
+        req.origin_input_ids = list(range(128))
+        wrapper.prepare_layerwise_save(self.make_batch(req, list(range(65)), 65))
+        del req._uc_layerwise_tokens
+        wrapper.prepare_layerwise_save(self.make_batch(req, list(range(65, 128)), 128))
+        key = RadixKey(array("q", range(128)), req.extra_key, cache_salt=req.cache_salt)
+        self.assertEqual(
+            wrapper.get_layerwise_page_hashes(req, key),
+            get_storage_hash_str(key, page_size=64),
+        )
 
     def test_prefill_with_cached_prefix_hashes_full_cpu_prefix(self):
         wrapper, req = self.make_planner()
@@ -1567,6 +1650,97 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             )
             self.assertEqual(req._uc_layerwise_tokens, list(range(65)))
             self.assertEqual(hasher.call_count, 1)
+
+
+class TestOceanDiskPrecomputedTreeHashes(CustomTestCase):
+    def make_core(self):
+        from sglang.srt.mem_cache.unified_cache.component_type import (
+            BASE_COMPONENT_TYPE,
+        )
+
+        core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        core.page_size = 4
+        core.components = ()
+        core.enable_storage = False
+        core.enable_external_cache_linker = True
+        core.component_evictable_size_ = {BASE_COMPONENT_TYPE: 0}
+        nodes = itertools.count()
+
+        def new_node(priority=0):
+            return SimpleNamespace(
+                id=next(nodes),
+                children={},
+                priority=priority,
+                component_data={BASE_COMPONENT_TYPE: SimpleNamespace(value=None)},
+                hit_count=0,
+                external_cache_stored=False,
+                creation_time=0,
+                load_back_pending_id=None,
+                rotation_base=None,
+                event_hash_value=None,
+                write_through_pending_id=None,
+            )
+
+        core._new_node = new_node
+        core._update_evictable_leaf_sets = Mock()
+        core._update_duplicate_tracking = Mock()
+        core._for_each_component_lru = Mock()
+        core.kv_events = Mock()
+        core.root_node = new_node()
+        core.root_node.parent = None
+        core.root_node.key = RadixKey(array("q"))
+        core.root_node.hash_value = []
+        return core
+
+    def test_new_node_reuses_hashes_and_split_keeps_page_mapping(self):
+        core = self.make_core()
+        key = RadixKey(array("q", range(12)), "tenant", cache_salt="salt")
+        hashes = get_storage_hash_str(key, page_size=4)
+        with patch.dict(
+            UnifiedTreeCore._add_new_node.__globals__,
+            {"compute_node_hash_values": Mock(side_effect=AssertionError("rehash"))},
+        ):
+            node = core._add_new_node(
+                core.root_node, key, torch.arange(12), page_hashes=hashes
+            )
+        self.assertEqual(node.hash_value, hashes)
+        self.assertIsNot(node.hash_value, hashes)
+        prefix, action = core._split_node(key, node, 4)
+        self.assertIsNone(action)
+        self.assertEqual(prefix.hash_value, hashes[:1])
+        self.assertEqual(node.hash_value, hashes[1:])
+
+    def test_commit_selects_hashes_after_matched_prefix(self):
+        core = self.make_core()
+        key = RadixKey(array("q", range(12)), "tenant", cache_salt="salt")
+        hashes = get_storage_hash_str(key, page_size=4)
+        parent = core._add_new_node(
+            core.root_node, key[:4], torch.arange(4), page_hashes=hashes[:1]
+        )
+        state = SimpleNamespace(
+            node=parent,
+            key=key[4:],
+            value=torch.arange(4, 12),
+            total_prefix_length=4,
+            priority=0,
+            params=SimpleNamespace(
+                session_id=None, rotation_base=None, page_hashes=hashes
+            ),
+            result=Mock(),
+            pending_actions=[],
+        )
+        with patch.dict(
+            UnifiedTreeCore._add_new_node.__globals__,
+            {"compute_node_hash_values": Mock(side_effect=AssertionError("rehash"))},
+        ):
+            core._insert_commit_step(state)
+        self.assertEqual(state.target_node.hash_value, hashes[1:])
+
+    def test_without_precomputed_hashes_keeps_normal_tree_hashing(self):
+        core = self.make_core()
+        key = RadixKey(array("q", range(8)), "tenant", cache_salt="salt")
+        node = core._add_new_node(core.root_node, key, torch.arange(8))
+        self.assertEqual(node.hash_value, get_storage_hash_str(key, page_size=4))
 
 
 if __name__ == "__main__":

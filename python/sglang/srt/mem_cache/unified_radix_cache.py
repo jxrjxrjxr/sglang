@@ -1016,6 +1016,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
             insert_params.key = radix_key
             insert_params.value = values
+            if self.linker is not None:
+                insert_params.page_hashes = self.linker.get_layerwise_page_hashes(
+                    req, radix_key
+                )
             result = self.insert(insert_params)
 
             # Keep the prompt as an independent radix node. Finished requests
@@ -1163,6 +1167,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
+        if self.linker is not None:
+            insert_params.page_hashes = self.linker.get_layerwise_page_hashes(
+                req, radix_key
+            )
         result = self.insert(insert_params)
 
         if result.rotation_tail_declined:

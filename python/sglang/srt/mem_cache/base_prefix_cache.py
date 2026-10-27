@@ -100,6 +100,11 @@ class InsertParams:
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
 
+    # Optional storage hashes for the complete page-aligned key, from its root.
+    # Callers must use the same tokens and namespace as key. A shorter insert
+    # may reuse the corresponding prefix (e.g. a topology-only prompt split).
+    page_hashes: Optional[list[str]] = None
+
 
 @dataclasses.dataclass
 class InsertResult:

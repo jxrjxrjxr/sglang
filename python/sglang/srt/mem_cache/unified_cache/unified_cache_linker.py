@@ -214,7 +214,16 @@ class UnifiedCacheLinkerWrapper:
         for req, end, count in zip(batch.reqs, lengths, counts, strict=True):
             start = end - count
             history = getattr(req, "_uc_layerwise_tokens", None)
-            if history is None or len(history) < start:
+            rebuild_history = history is None or len(history) < start
+            hashes = getattr(req, "_uc_layerwise_hashes", None)
+            if rebuild_history or hashes is None:
+                hashes = req._uc_layerwise_hashes = []
+            else:
+                # Replayed/retracted forwards can replace tokens from start.
+                # A bigram also depends on the next raw token.
+                unchanged = max(0, start - int(self.cache.tree_core.is_eagle))
+                del hashes[unchanged // page_size :]
+            if rebuild_history:
                 history = list(req.origin_input_ids[:start])
                 history.extend(req.output_ids[: max(0, start - len(history))])
             if len(history) < start:
@@ -243,7 +252,15 @@ class UnifiedCacheLinkerWrapper:
                 cache_salt=req.cache_salt,
                 is_bigram=self.cache.tree_core.is_eagle,
             ).page_aligned(page_size)
-            hashes = get_storage_hash_str(key, page_size=page_size)
+            hashed_tokens = len(hashes) * page_size
+            if hashed_tokens < len(key):
+                hashes.extend(
+                    get_storage_hash_str(
+                        key[hashed_tokens:],
+                        prior_hash=hashes[-1] if hashes else None,
+                        page_size=page_size,
+                    )
+                )
             slots = self.cache.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, first * page_size : last * page_size
             ].clone()
@@ -287,6 +304,20 @@ class UnifiedCacheLinkerWrapper:
 
             session.on_submitted = on_submitted
         return session
+
+    def get_layerwise_page_hashes(self, req, key: RadixKey) -> list[str] | None:
+        """Reuse this request's planned hashes for its inserted page prefix.
+
+        The request namespace is fixed. Replayed token suffixes invalidate
+        their hashes in prepare_layerwise_save, so no token rescan is needed.
+        """
+        hashes = getattr(req, "_uc_layerwise_hashes", None)
+        if hashes is None:
+            return None
+        pages = len(key) // self.cache.page_size
+        if len(hashes) < pages:
+            return None
+        return hashes if len(hashes) == pages else hashes[:pages]
 
     def num_completed_layerwise_saves(self):
         count = 0

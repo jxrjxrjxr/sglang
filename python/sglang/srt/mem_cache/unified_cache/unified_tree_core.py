@@ -1043,6 +1043,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         value = params.value
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
+        if (
+            params.page_hashes is not None
+            and len(params.page_hashes) < len(key) // self.page_size
+        ):
+            raise ValueError("Precomputed page hashes do not cover the inserted key.")
         if value is not None:
             value = value[: len(key)]
         else:
@@ -1283,6 +1288,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 priority=state.priority,
                 session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
+                page_hashes=(
+                    None
+                    if state.params.page_hashes is None
+                    else state.params.page_hashes[
+                        state.total_prefix_length // self.page_size : (
+                            state.total_prefix_length + len(state.key)
+                        )
+                        // self.page_size
+                    ]
+                ),
             )
             state.is_new_leaf = True
         else:
@@ -1409,6 +1424,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         priority: int = 0,
         session_id: Optional[str] = None,
         rotation_base: Optional[int] = None,
+        page_hashes: Optional[list[str]] = None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
@@ -1422,7 +1438,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage or self.enable_external_cache_linker:
-            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+            new_node.hash_value = (
+                list(page_hashes)
+                if page_hashes is not None
+                else compute_node_hash_values(new_node, self.page_size)
+            )
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
