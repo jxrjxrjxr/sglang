@@ -198,12 +198,14 @@ class TestOceanDiskStorage(CustomTestCase):
                 )
 
             def to(self, _device):
+                fake_torch.metadata_uploads.append(self)
                 return self
 
             def __getitem__(self, selection):
                 return type(self)(self.values[selection])
 
         fake_torch = Mock()
+        fake_torch.metadata_uploads = []
         fake_torch.cuda.device.side_effect = lambda *_: nullcontext()
         fake_torch.cuda.stream.side_effect = lambda *_: nullcontext()
         fake_torch.tensor.side_effect = lambda values, **_: Metadata(values)
@@ -501,6 +503,34 @@ class TestOceanDiskStorage(CustomTestCase):
         storage.record_save_event().synchronize()
         self.assertEqual([kind for kind, _ in trace][-2:], ["record", "wait"])
 
+    def test_layerwise_put_uploads_batches_once_and_dispatches_matching_rows(self):
+        storage, _, _ = self.make_storage()
+        layers = [self.layer_ranges(3, layer) for layer in range(3)]
+        prepared = storage.prepare_layerwise_put(layers, max_ranges=4)
+        uploads = storage._torch.metadata_uploads
+        self.assertEqual([tensor.shape for tensor in uploads], [(3, 25), (3, 13)])
+        self.od_utils.batch_dispatch_put.assert_not_called()
+        for layer in range(3):
+            for batch_index, (cpu, gpu, lengths, indices) in enumerate(prepared[layer]):
+                self.assertEqual(cpu.values, [uploads[batch_index].values[layer]])
+                self.assertEqual(gpu.values, cpu.values)
+                self.assertEqual(lengths.values, [cpu.shape[1]])
+                self.assertEqual(indices.values, [0])
+                row = cpu.values[0]
+                count = (len(row) - 1) // 6
+                self.assertEqual(
+                    row[1 + 3 * count : 1 + 4 * count],
+                    [layer * 512] * (count // 2) + [layer * 256] * (count // 2),
+                )
+            storage.submit_put_layer(layer, prepared[layer], Mock())
+        calls = self.od_utils.batch_dispatch_put.call_args_list
+        self.assertEqual(len(calls), 6)
+        for index, call in enumerate(calls):
+            layer, batch_index = divmod(index, 2)
+            self.assertIs(call.args[0], prepared[layer][batch_index][1])
+            self.assertIs(call.args[3], prepared[layer][batch_index][0])
+            self.assertEqual(call.args[8:10], (0, 1))
+
     def test_descriptor_uses_paired_keys_and_registration_offsets(self):
         ranges = [
             OceanDiskRange(7, 1032, 16, 64),
@@ -634,6 +664,46 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         self.assertEqual(first[0].key, other_layer[0].key)
         self.assertEqual([r.storage_offset for r in first], [0, 0])
         self.assertEqual([r.storage_offset for r in other_layer], [512])
+
+    def test_transfer_encodes_each_page_once_across_layers_and_pools(self):
+        linker = OceanDiskDirectLinker.__new__(OceanDiskDirectLinker)
+        linker.num_layers = 3
+        linker._object_key = Mock(side_effect=lambda key: {"a": 11, "b": 22}[key])
+        linker._layerwise_pending_keys = {22}
+        linker.pools = {
+            name: SimpleNamespace(
+                prepare_locations=lambda indices: indices,
+                get_prepared_layer_range_meta=lambda locations, layer: (
+                    [[1000 + location + layer * 100] for location in locations],
+                    [[16] for _ in locations],
+                    [[layer] for _ in locations],
+                ),
+            )
+            for name in (PoolName.KV, PoolName.INDEXER)
+        }
+        linker._storage_offsets = {name: [0, 512, 1024] for name in linker.pools}
+        transfers = [
+            SimpleNamespace(name=name, keys=["a", "b"], host_indices=[0, 16])
+            for name in linker.pools
+        ]
+        for skip in (False, True):
+            with self.subTest(skip_scheduled=skip):
+                expected = [
+                    [
+                        item
+                        for transfer in transfers
+                        for item in linker._page_fragments(
+                            transfer.name, transfer.keys, transfer.host_indices, layer
+                        )
+                        if not skip or item.key != 22
+                    ]
+                    for layer in range(3)
+                ]
+                linker._object_key.reset_mock()
+                self.assertEqual(
+                    linker._transfer_layers(transfers, skip_scheduled=skip), expected
+                )
+                self.assertEqual(linker._object_key.call_count, 2)
 
     def test_offsets_pad_each_physical_buffer_for_multiple_components(self):
         linker = self.make_linker(multi_component=True)
@@ -914,6 +984,23 @@ class TestOceanDiskDirectLinker(CustomTestCase):
 
 
 class TestOceanDiskLayerwiseSave(CustomTestCase):
+    def test_receipts_deduplicate_sessions_but_keep_missing_page_failure(self):
+        first, second = Future(), Future()
+        first.set_result(True)
+        second.set_result(False)
+        linker = SimpleNamespace(
+            _object_key=lambda key: key,
+            _layerwise_receipts=WeakValueDictionary(
+                {"a": first, "b": first, "c": second}
+            ),
+        )
+        get_receipts = OceanDiskDirectLinker.get_layerwise_receipts
+        self.assertEqual(get_receipts(linker, ["a", "b", "c"]), [first, second])
+        receipts = get_receipts(linker, ["a", "b", "missing", "also_missing"])
+        self.assertEqual(receipts, [first, None])
+        self.assertFalse(all(r is not None and r.result() for r in receipts))
+        self.assertEqual(get_receipts(linker, []), [])
+
     def make_session(self, owner=True):
         linker = Mock()
         linker.offload_owner = owner

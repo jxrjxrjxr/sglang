@@ -513,12 +513,16 @@ class OceanDiskStorage(HiCacheStorage):
             batches = self._pack_layer_batches(layers, max_ranges)
             prepared = [[] for _ in layers]
             for batch in batches:
-                for layer, row in enumerate(batch):
-                    cpu = torch.tensor([row], dtype=torch.int64, device="cpu")
-                    gpu = cpu.to(self.device)
-                    lengths = torch.tensor([len(row)], dtype=torch.int64, device="cpu")
-                    indices = torch.tensor([0], dtype=torch.int64, device="cpu")
-                    prepared[layer].append((cpu, gpu, lengths, indices))
+                cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                gpu = cpu.to(self.device)
+                lengths = torch.tensor([cpu.shape[1]], dtype=torch.int64, device="cpu")
+                indices = torch.tensor([0], dtype=torch.int64, device="cpu")
+                for layer in range(len(batch)):
+                    # Single-row views retain the full allocations through the
+                    # session's completion and keep native layer indices local.
+                    prepared[layer].append(
+                        (cpu[layer : layer + 1], gpu[layer : layer + 1], lengths, indices)
+                    )
             return prepared
 
     def submit_put_layer(self, layer, prepared, ready_event):

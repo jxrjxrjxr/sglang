@@ -280,19 +280,20 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         return encode_key((self._namespace, page_key))
 
     def _page_fragments(
-        self, name, page_keys, locations, layer
+        self, name, page_keys, locations, layer, *, object_keys=None
     ) -> list[OceanDiskRange]:
         """Map a pool/page object's layer to local ranges and remote offsets."""
         if not page_keys:
             return []
+        if object_keys is None:
+            object_keys = [self._object_key(key) for key in page_keys]
         ptrs, sizes, offsets = self.pools[name].get_prepared_layer_range_meta(
             locations, layer
         )
         ranges = []
-        for page_key, pointers, lengths, positions in zip(
-            page_keys, ptrs, sizes, offsets, strict=True
+        for key, pointers, lengths, positions in zip(
+            object_keys, ptrs, sizes, offsets, strict=True
         ):
-            key = self._object_key(page_key)
             ranges.extend(
                 OceanDiskRange(
                     key,
@@ -360,41 +361,33 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         return index
 
     def _transfer_layers(self, transfers, *, skip_scheduled=False):
-        prepared = [
-            (
-                transfer,
-                self.pools[transfer.name].prepare_locations(transfer.host_indices),
-            )
-            for transfer in transfers
-        ]
-        if skip_scheduled:
-            scheduled = self._layerwise_pending_keys
-            prepared = [
-                (
-                    transfer,
-                    [
-                        (key, location)
-                        for key, location in zip(transfer.keys, locations, strict=True)
-                        if self._object_key(key) not in scheduled
-                    ],
-                )
-                for transfer, locations in prepared
-            ]
-        else:
-            prepared = [
-                (transfer, list(zip(transfer.keys, locations, strict=True)))
-                for transfer, locations in prepared
-            ]
+        # A page uses the same object key across layers and physical pools.
+        object_keys = {}
+        prepared = []
+        for transfer in transfers:
+            locations = self.pools[transfer.name].prepare_locations(transfer.host_indices)
+            page_keys, encoded_keys, page_locations = [], [], []
+            for page_key, location in zip(transfer.keys, locations, strict=True):
+                if page_key not in object_keys:
+                    object_keys[page_key] = self._object_key(page_key)
+                key = object_keys[page_key]
+                if skip_scheduled and key in self._layerwise_pending_keys:
+                    continue
+                page_keys.append(page_key)
+                encoded_keys.append(key)
+                page_locations.append(location)
+            prepared.append((transfer.name, page_keys, encoded_keys, page_locations))
         layers = []
         for layer in range(self.num_layers):
             pools = {PoolName.KV: [], PoolName.INDEXER: []}
-            for transfer, pages in prepared:
-                pools[transfer.name].extend(
+            for name, page_keys, encoded_keys, locations in prepared:
+                pools[name].extend(
                     self._page_fragments(
-                        transfer.name,
-                        [key for key, _ in pages],
-                        [location for _, location in pages],
+                        name,
+                        page_keys,
+                        locations,
                         layer,
+                        object_keys=encoded_keys,
                     )
                 )
             layers.append(pools[PoolName.KV] + pools[PoolName.INDEXER])
@@ -424,9 +417,14 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         return LayerwiseSaveSession(self, layers, keys, phase)
 
     def get_layerwise_receipts(self, page_keys):
-        return [
-            self._layerwise_receipts.get(self._object_key(key)) for key in page_keys
-        ]
+        # Pages saved by one session share a Future; check each session once.
+        # Keep None so a page with no receipt still makes its UC ack fail.
+        return list(
+            dict.fromkeys(
+                self._layerwise_receipts.get(self._object_key(key))
+                for key in page_keys
+            )
+        )
 
     def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
         layers = self._transfer_layers(transfers)
