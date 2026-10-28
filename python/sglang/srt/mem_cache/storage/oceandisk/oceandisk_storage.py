@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 import hashlib
 import itertools
 import json
@@ -138,6 +139,8 @@ def pack_io(
     ranges: list[OceanDiskRange],
     regions: list[tuple[int, int]],
     connection_indices: tuple[int, ...],
+    *,
+    resolve=None,
 ) -> list[int]:
     """Column-major ABI used by od/cache_controller.py, with remote offsets."""
     half = len(ranges) // 2
@@ -147,7 +150,12 @@ def pack_io(
         or [r.key for r in ranges[:half]] != [r.key for r in ranges[half:]]
     ):
         raise ValueError("OceanDisk requires matching KV and Indexer halves.")
-    mr_offsets = [resolve_mr(regions, item.ptr, item.size) for item in ranges]
+    mr_offsets = [
+        resolve(item.ptr, item.size)
+        if resolve is not None
+        else resolve_mr(regions, item.ptr, item.size)
+        for item in ranges
+    ]
     if any(item.storage_offset < 0 for item in ranges):
         raise ValueError("OceanDisk storage offsets must be nonnegative.")
     return [
@@ -337,6 +345,23 @@ class OceanDiskStorage(HiCacheStorage):
         count = len(layers[0])
         if count % 2 or any(len(layer) != count for layer in layers):
             raise ValueError("OceanDisk layers require equal, even IO counts.")
+        # Index registrations once per batch instead of scanning all layer MRs
+        # for every KV/Indexer range. Preserve first-match behavior for overlaps.
+        ordered = sorted(
+            (base, length, mr) for mr, (base, length) in enumerate(self.regions)
+        )
+        starts = [base for base, _, _ in ordered]
+        disjoint = all(a + n <= b for (a, n, _), (b, _, _) in zip(ordered, ordered[1:]))
+
+        def resolve(ptr, size):
+            if disjoint and size > 0:
+                index = bisect_right(starts, ptr) - 1
+                if index >= 0:
+                    base, length, mr = ordered[index]
+                    if ptr + size <= base + length:
+                        return mr, ptr - base
+            return resolve_mr(self.regions, ptr, size)
+
         half = count // 2
         batch_pages = max_ranges // 2
         batches = [
@@ -347,6 +372,7 @@ class OceanDiskStorage(HiCacheStorage):
                     + ranges[half + start : half + min(start + batch_pages, half)],
                     self.regions,
                     self.connection_indices,
+                    resolve=resolve,
                 )
                 for ranges in layers
             ]
@@ -505,30 +531,49 @@ class OceanDiskStorage(HiCacheStorage):
                 self._stream.synchronize()
                 raise
 
-    def prepare_layerwise_put(self, layers, *, max_ranges=256):
+    def prepare_layerwise_put(self, layers, *, max_ranges=256, timings=None):
         """Prepare descriptors before forward, retaining them through completion."""
         torch = self._torch
         with torch.cuda.device(self.device):
             self._ensure_open()
+            pack_start = time.perf_counter()
             batches = self._pack_layer_batches(layers, max_ranges)
+            pack_ms = (time.perf_counter() - pack_start) * 1000
+            cpu_ms = upload_ms = views_ms = 0.0
             prepared = [[] for _ in layers]
             for batch in batches:
+                step = time.perf_counter()
                 cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                cpu_ms += (time.perf_counter() - step) * 1000
+                step = time.perf_counter()
                 gpu = cpu.to(self.device)
+                upload_ms += (time.perf_counter() - step) * 1000
+                step = time.perf_counter()
                 lengths = torch.tensor([cpu.shape[1]], dtype=torch.int64, device="cpu")
                 indices = torch.tensor([0], dtype=torch.int64, device="cpu")
                 for layer in range(len(batch)):
                     # Single-row views retain the full allocations through the
                     # session's completion and keep native layer indices local.
                     prepared[layer].append(
-                        (cpu[layer : layer + 1], gpu[layer : layer + 1], lengths, indices)
+                        (
+                            cpu[layer : layer + 1],
+                            gpu[layer : layer + 1],
+                            lengths,
+                            indices,
+                        )
                     )
+                views_ms += (time.perf_counter() - step) * 1000
+            if timings is not None:
+                timings.update(
+                    pack=pack_ms, cpu_tensor=cpu_ms, upload=upload_ms, views=views_ms
+                )
             return prepared
 
     def submit_put_layer(self, layer, prepared, ready_event):
         import od_utils
 
         torch = self._torch
+        call_times = []
         with (
             self._lock,
             torch.cuda.device(self.device),
@@ -537,6 +582,7 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             self._stream.wait_event(ready_event)
             for cpu, gpu, lengths, indices in prepared:
+                call_start = time.perf_counter()
                 od_utils.batch_dispatch_put(
                     gpu,
                     lengths,
@@ -551,7 +597,10 @@ class OceanDiskStorage(HiCacheStorage):
                     False,
                     False,
                 )
+                call_ms = (time.perf_counter() - call_start) * 1000
+                call_times.append(call_ms)
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
+        return call_times
 
     def record_save_event(self):
         torch = self._torch

@@ -117,6 +117,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
+from sglang.srt.model_executor.runner_utils.layerwise_kv_graph import (
+    LayerwiseKVGraphHooks,
+)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -302,6 +305,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        self.layerwise_kv_hooks = (
+            LayerwiseKVGraphHooks.create(model_runner)
+            if self.prefill_backend_name == Backend.BREAKABLE
+            else None
+        )
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -1456,6 +1464,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        forward_batch.layerwise_kv_graph_hooks = self.layerwise_kv_hooks
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1812,7 +1821,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            with (
+                self.layerwise_kv_hooks.replay_session(forward_batch.layerwise_kv_saver)
+                if self.layerwise_kv_hooks is not None
+                else nullcontext()
+            ):
+                hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward

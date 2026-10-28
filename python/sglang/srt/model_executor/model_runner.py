@@ -1836,10 +1836,13 @@ class ModelRunner:
                     forward_count=split_forward_count,
                 )
             elif (
-                saver is None
-                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
+                and (
+                    saver is None
+                    or self.prefill_cuda_graph_runner.layerwise_kv_hooks is not None
+                )
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch

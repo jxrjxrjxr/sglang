@@ -43,8 +43,14 @@ class LayerwiseSaveSession:
         self.aborted = False
         self.put_failed = False
         self.ready_events = []
+        self.prepare_ms = 0.0
+        self.native_call_times = []
+        self.prepare_details = {}
+        self.hook_cpu_ms = 0.0
         self.prepared = (
-            linker.storage.prepare_layerwise_put(layers, max_ranges=linker.max_ranges)
+            linker.storage.prepare_layerwise_put(
+                layers, max_ranges=linker.max_ranges, timings=self.prepare_details
+            )
             if linker.offload_owner
             else None
         )
@@ -53,17 +59,31 @@ class LayerwiseSaveSession:
         linker._put_started(id(self), len(keys))
 
     def __enter__(self):
+        self.forward_start = time.perf_counter()
         self.linker._layerwise_pending_keys.update(self.keys)
         return self
 
     def save_layer(self, layer):
         if self.linker.offload_owner:
+            hook_start = time.perf_counter()
             event = self.linker._ready_event()
             self.ready_events.append(event)
             self.linker.offload_queue.put((self, layer, event))
+            self.hook_cpu_ms += (time.perf_counter() - hook_start) * 1000
         self.next_layer += 1
 
     def __exit__(self, exc_type, exc, tb):
+        if self.linker.offload_owner:
+            logger.info(
+                "[OceanDisk timing] phase=%s pages=%d prepare_cpu_ms=%.3f "
+                "forward_scope_cpu_ms=%.3f hook_cpu_ms=%.3f prepare_parts_ms=%s",
+                self.phase,
+                len(self.keys),
+                self.prepare_ms,
+                (time.perf_counter() - self.forward_start) * 1000,
+                self.hook_cpu_ms,
+                {k: round(v, 3) for k, v in self.prepare_details.items()},
+            )
         self.aborted = exc_type is not None or self.next_layer != self.linker.num_layers
         # The FIFO keeps the completion task after this session's layer tasks.
         # Even aborted forwards retain source pages until queued I/O is drained.
@@ -294,27 +314,24 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             locations, layer
         )
         ranges = []
+        storage_offsets = self._storage_offsets[name]
         for key, pointers, lengths, positions in zip(
             object_keys, ptrs, sizes, offsets, strict=True
         ):
-            ranges.extend(
-                OceanDiskRange(
-                    key,
-                    int(ptr),
-                    int(size),
-                    self._storage_offsets[name][storage_offset],
+            for ptr, size, storage_offset in zip(
+                pointers, lengths, positions, strict=True
+            ):
+                ranges.append(
+                    OceanDiskRange(
+                        key, int(ptr), int(size), storage_offsets[storage_offset]
+                    )
                 )
-                for ptr, size, storage_offset in zip(
-                    pointers, lengths, positions, strict=True
-                )
-            )
         return ranges
 
     def _init_put_progress(self):
         self._put_progress_lock = threading.Lock()
-        self._pending_puts = {}
+        self._pending_puts = set()
         self._put_activity = None
-        self._put_last_pending_log = 0.0
 
     def _put_started(self, task_id, pages):
         if not self.offload_owner:
@@ -324,7 +341,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             if self._put_activity is None:
                 self._put_activity = dict(started_at=now, tasks=0, pages=0, failed=0)
                 logger.info("[OceanDisk PUT] busy: offload started")
-            self._pending_puts[task_id] = (pages, now)
+            self._pending_puts.add(task_id)
             self._put_activity["tasks"] += 1
             self._put_activity["pages"] += pages
 
@@ -332,7 +349,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if not self.offload_owner:
             return
         with self._put_progress_lock:
-            self._pending_puts.pop(task_id)
+            self._pending_puts.remove(task_id)
             self._put_activity["failed"] += int(not success)
             self._put_activity["last_finished_at"] = time.monotonic()
 
@@ -353,26 +370,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
             self._put_activity = None
 
-    def _report_pending_puts(self, rid):
-        if not self.offload_owner:
-            return
-        with self._put_progress_lock:
-            if not self._pending_puts:
-                return
-            now = time.monotonic()
-            if now - self._put_last_pending_log < 1.0:
-                return
-            self._put_last_pending_log = now
-            logger.info(
-                "[OceanDisk PUT] pending at lookup: rid=%s pending_tasks=%d "
-                "pending_pages=%d oldest_ms=%.1f",
-                rid,
-                len(self._pending_puts),
-                sum(pages for pages, _ in self._pending_puts.values()),
-                (now - min(started for _, started in self._pending_puts.values()))
-                * 1000,
-            )
-
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         self._ensure_open()
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -380,7 +377,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
-        self._report_pending_puts(rid)
         bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         trace_event(
@@ -432,15 +428,27 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
-    def _transfer_layers(self, transfers, *, skip_scheduled=False, object_keys=None):
+    def _transfer_layers(
+        self, transfers, *, skip_scheduled=False, object_keys=None, timings=None
+    ):
         # A page uses the same object key across layers and physical pools.
         if object_keys is None:
             object_keys = {}
+        address_start = time.perf_counter()
+        copy_ms = 0.0
+        cpu_indices = {}
         prepared = []
         for transfer in transfers:
-            locations = self.pools[transfer.name].prepare_locations(
-                transfer.host_indices
-            )
+            source = id(transfer.host_indices)
+            if source not in cpu_indices:
+                copy_start = time.perf_counter()
+                cpu_indices[source] = transfer.host_indices.detach().to(
+                    device="cpu", dtype=torch.int64
+                )
+                copy_ms += (time.perf_counter() - copy_start) * 1000
+            # KV and Indexer share slots, but use token rows and page rows
+            # respectively. Convert the slots once, then map each pool on CPU.
+            locations = self.pools[transfer.name].prepare_locations(cpu_indices[source])
             page_keys, encoded_keys, page_locations = [], [], []
             for page_key, location in zip(transfer.keys, locations, strict=True):
                 if page_key not in object_keys:
@@ -466,9 +474,15 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     )
                 )
             layers.append(pools[PoolName.KV] + pools[PoolName.INDEXER])
+        if timings is not None:
+            timings.update(
+                address_copy=copy_ms,
+                address_build=(time.perf_counter() - address_start) * 1000 - copy_ms,
+            )
         return layers
 
     def begin_layerwise_save(self, transfers, *, phase="prefill"):
+        begin_start = time.perf_counter()
         kv_transfers = [t for t in transfers if t.name == PoolName.KV]
         object_keys = dict.fromkeys(
             page_key for transfer in kv_transfers for page_key in transfer.keys
@@ -484,7 +498,10 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         )
         if not keys:
             return None
+        keys_done = time.perf_counter()
         layers = None
+        resolve_ms = 0.0
+        address_timings = {}
         if self.offload_owner:
             # resolve_transfers accepts one transfer per pool, not per request.
             expanded = [
@@ -494,13 +511,24 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     [transfer], allow_partial=True
                 )
             ]
+            resolve_done = time.perf_counter()
+            resolve_ms = (resolve_done - keys_done) * 1000
             layers = self._transfer_layers(
-                expanded, skip_scheduled=True, object_keys=object_keys
+                expanded,
+                skip_scheduled=True,
+                object_keys=object_keys,
+                timings=address_timings,
             )
         trace_event(
             "LAYERWISE_SAVE_BEGIN", pages=len(keys), layers=self.num_layers, phase=phase
         )
-        return LayerwiseSaveSession(self, layers, keys, phase)
+        session = LayerwiseSaveSession(self, layers, keys, phase)
+        session.prepare_details.update(
+            keys=(keys_done - begin_start) * 1000,
+            assembler=resolve_ms,
+            **address_timings,
+        )
+        return session
 
     def get_layerwise_receipts(self, page_keys):
         # Pages saved by one session share a Future; check each session once.
@@ -604,7 +632,22 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         try:
                             if self.offload_owner:
                                 task.finish_event = self.storage.record_save_event()
+                                wait_start = time.perf_counter()
                                 task.finish_event.synchronize()
+                                wait_ms = (time.perf_counter() - wait_start) * 1000
+                                calls = task.native_call_times
+                                logger.info(
+                                    "[OceanDisk PUT timing] phase=%s pages=%d calls=%d "
+                                    "native_total_ms=%.3f native_min_ms=%.3f "
+                                    "native_max_ms=%.3f final_event_wait_ms=%.3f",
+                                    task.phase,
+                                    len(task.keys),
+                                    len(calls),
+                                    sum(calls),
+                                    min(calls, default=0.0),
+                                    max(calls, default=0.0),
+                                    wait_ms,
+                                )
                             success = not task.aborted and not task.put_failed
                             if self.offload_owner and success:
                                 trace_event(
@@ -623,9 +666,10 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         session, layer, ready_event = task
                         if not session.put_failed:
                             try:
-                                self.storage.submit_put_layer(
+                                calls = self.storage.submit_put_layer(
                                     layer, session.prepared[layer], ready_event
                                 )
+                                session.native_call_times.extend(calls)
                             except BaseException:
                                 session.put_failed = True
                                 logger.exception("OceanDisk layer %d PUT failed", layer)
