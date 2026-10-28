@@ -428,18 +428,24 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
-    def _transfer_layers(self, transfers, *, skip_scheduled=False, object_keys=None):
+    def _transfer_layers(
+        self, transfers, *, skip_scheduled=False, object_keys=None, timings=None
+    ):
         # A page uses the same object key across layers and physical pools.
         if object_keys is None:
             object_keys = {}
+        address_start = time.perf_counter()
+        copy_ms = 0.0
         cpu_indices = {}
         prepared = []
         for transfer in transfers:
             source = id(transfer.host_indices)
             if source not in cpu_indices:
+                copy_start = time.perf_counter()
                 cpu_indices[source] = transfer.host_indices.detach().to(
                     device="cpu", dtype=torch.int64
                 )
+                copy_ms += (time.perf_counter() - copy_start) * 1000
             # KV and Indexer share slots, but use token rows and page rows
             # respectively. Convert the slots once, then map each pool on CPU.
             locations = self.pools[transfer.name].prepare_locations(cpu_indices[source])
@@ -468,6 +474,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     )
                 )
             layers.append(pools[PoolName.KV] + pools[PoolName.INDEXER])
+        if timings is not None:
+            timings.update(
+                address_copy=copy_ms,
+                address_build=(time.perf_counter() - address_start) * 1000 - copy_ms,
+            )
         return layers
 
     def begin_layerwise_save(self, transfers, *, phase="prefill"):
@@ -490,6 +501,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         keys_done = time.perf_counter()
         layers = None
         resolve_ms = 0.0
+        address_timings = {}
         if self.offload_owner:
             # resolve_transfers accepts one transfer per pool, not per request.
             expanded = [
@@ -502,9 +514,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             resolve_done = time.perf_counter()
             resolve_ms = (resolve_done - keys_done) * 1000
             layers = self._transfer_layers(
-                expanded, skip_scheduled=True, object_keys=object_keys
+                expanded,
+                skip_scheduled=True,
+                object_keys=object_keys,
+                timings=address_timings,
             )
-        addresses_done = time.perf_counter()
         trace_event(
             "LAYERWISE_SAVE_BEGIN", pages=len(keys), layers=self.num_layers, phase=phase
         )
@@ -512,7 +526,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         session.prepare_details.update(
             keys=(keys_done - begin_start) * 1000,
             assembler=resolve_ms,
-            addresses=(addresses_done - keys_done) * 1000 - resolve_ms,
+            **address_timings,
         )
         return session
 

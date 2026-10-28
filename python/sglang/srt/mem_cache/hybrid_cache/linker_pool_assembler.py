@@ -141,21 +141,25 @@ class DevicePoolEntry:
             )
         items = self._layer_range_items[buffer_indices]
 
-        ptrs, sizes, offsets = [], [], []
-        for row in locations:
-            row_ptrs = [
-                base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
+        # Lengths and remote offsets are identical for every page in a layer.
+        # Reuse those read-only rows instead of rebuilding them per page.
+        if self.packed:
+            sizes_row = [size for _, _, size, _ in items]
+            offsets_row = [offset for _, _, _, offset in items]
+            ptrs = [
+                [base + row * stride for base, stride, _, _ in items]
+                for row in locations
             ]
-            row_sizes = [size for _, _, size, _ in items]
-            row_offsets = [offset for _, _, _, offset in items]
-            if self.packed:
-                ptrs.append(row_ptrs)
-                sizes.append(row_sizes)
-                offsets.append(row_offsets)
-            else:
-                ptrs.extend([[value] for value in row_ptrs])
-                sizes.extend([[value] for value in row_sizes])
-                offsets.extend([[value] for value in row_offsets])
+            sizes = [sizes_row] * len(locations)
+            offsets = [offsets_row] * len(locations)
+        else:
+            ptrs = [
+                [base + row * stride]
+                for row in locations
+                for base, stride, _, _ in items
+            ]
+            sizes = [[size] for _ in locations for _, _, size, _ in items]
+            offsets = [[offset] for _ in locations for _, _, _, offset in items]
         return ptrs, sizes, offsets
 
 
