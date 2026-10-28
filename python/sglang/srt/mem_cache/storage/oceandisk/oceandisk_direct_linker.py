@@ -45,6 +45,8 @@ class LayerwiseSaveSession:
         self.ready_events = []
         self.prepare_ms = 0.0
         self.native_call_times = []
+        self.last_put_events = None
+        self.last_put_return = None
         self.prepared = (
             linker.storage.prepare_layerwise_put(layers, max_ranges=linker.max_ranges)
             if linker.offload_owner
@@ -599,15 +601,36 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         success = False
                         try:
                             if self.offload_owner:
-                                task.finish_event = self.storage.record_save_event()
+                                diagnostics = {}
+                                return_gap_ms = (
+                                    (time.perf_counter() - task.last_put_return) * 1000
+                                    if task.last_put_return is not None
+                                    else -1.0
+                                )
+                                task.finish_event = self.storage.record_save_event(
+                                    diagnostics
+                                )
+                                query_start = time.perf_counter()
+                                done_before_wait = task.finish_event.query()
+                                query_ms = (time.perf_counter() - query_start) * 1000
                                 wait_start = time.perf_counter()
+                                thread_start = time.thread_time()
                                 task.finish_event.synchronize()
                                 wait_ms = (time.perf_counter() - wait_start) * 1000
+                                thread_ms = (time.thread_time() - thread_start) * 1000
+                                last_put_gpu_ms = tail_gpu_ms = -1.0
+                                if task.last_put_events is not None:
+                                    begin, end = task.last_put_events
+                                    last_put_gpu_ms = begin.elapsed_time(end)
+                                    tail_gpu_ms = end.elapsed_time(task.finish_event)
                                 calls = task.native_call_times
                                 logger.info(
                                     "[OceanDisk PUT timing] phase=%s pages=%d calls=%d "
                                     "native_total_ms=%.3f native_min_ms=%.3f "
-                                    "native_max_ms=%.3f final_event_wait_ms=%.3f",
+                                    "native_max_ms=%.3f final_event_wait_ms=%.3f "
+                                    "return_to_finish_ms=%.3f finish_lock_ms=%.3f "
+                                    "finish_record_ms=%.3f done_before_wait=%s query_ms=%.3f "
+                                    "wait_thread_cpu_ms=%.3f last_put_gpu_ms=%.3f tail_gpu_ms=%.3f",
                                     task.phase,
                                     len(task.keys),
                                     len(calls),
@@ -615,6 +638,14 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                     min(calls, default=0.0),
                                     max(calls, default=0.0),
                                     wait_ms,
+                                    return_gap_ms,
+                                    diagnostics["lock_ms"],
+                                    diagnostics["record_ms"],
+                                    done_before_wait,
+                                    query_ms,
+                                    thread_ms,
+                                    last_put_gpu_ms,
+                                    tail_gpu_ms,
                                 )
                             success = not task.aborted and not task.put_failed
                             if self.offload_owner and success:
@@ -634,9 +665,20 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         session, layer, ready_event = task
                         if not session.put_failed:
                             try:
+                                timing_events = None
+                                if layer == self.num_layers - 1:
+                                    timing_events = tuple(
+                                        torch.cuda.Event(enable_timing=True)
+                                        for _ in range(2)
+                                    )
+                                    session.last_put_events = timing_events
                                 calls = self.storage.submit_put_layer(
-                                    layer, session.prepared[layer], ready_event
+                                    layer,
+                                    session.prepared[layer],
+                                    ready_event,
+                                    timing_events=timing_events,
                                 )
+                                session.last_put_return = time.perf_counter()
                                 session.native_call_times.extend(calls)
                             except BaseException:
                                 session.put_failed = True

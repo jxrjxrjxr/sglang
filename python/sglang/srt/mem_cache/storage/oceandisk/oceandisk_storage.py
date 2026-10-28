@@ -521,11 +521,16 @@ class OceanDiskStorage(HiCacheStorage):
                     # Single-row views retain the full allocations through the
                     # session's completion and keep native layer indices local.
                     prepared[layer].append(
-                        (cpu[layer : layer + 1], gpu[layer : layer + 1], lengths, indices)
+                        (
+                            cpu[layer : layer + 1],
+                            gpu[layer : layer + 1],
+                            lengths,
+                            indices,
+                        )
                     )
             return prepared
 
-    def submit_put_layer(self, layer, prepared, ready_event):
+    def submit_put_layer(self, layer, prepared, ready_event, timing_events=None):
         import od_utils
 
         torch = self._torch
@@ -537,6 +542,8 @@ class OceanDiskStorage(HiCacheStorage):
         ):
             self._ensure_open()
             self._stream.wait_event(ready_event)
+            if timing_events is not None:
+                timing_events[0].record(self._stream)
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
                 od_utils.batch_dispatch_put(
@@ -556,17 +563,24 @@ class OceanDiskStorage(HiCacheStorage):
                 call_ms = (time.perf_counter() - call_start) * 1000
                 call_times.append(call_ms)
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
+            if timing_events is not None:
+                timing_events[1].record(self._stream)
         return call_times
 
-    def record_save_event(self):
+    def record_save_event(self, diagnostics=None):
         torch = self._torch
-        with (
-            self._lock,
-            torch.cuda.device(self.device),
-            torch.cuda.stream(self._stream),
-        ):
-            event = torch.cuda.Event()
-            event.record(self._stream)
+        lock_start = time.perf_counter()
+        with self._lock:
+            lock_ms = (time.perf_counter() - lock_start) * 1000
+            record_start = time.perf_counter()
+            with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
+                event = torch.cuda.Event(enable_timing=diagnostics is not None)
+                event.record(self._stream)
+            if diagnostics is not None:
+                diagnostics.update(
+                    lock_ms=lock_ms,
+                    record_ms=(time.perf_counter() - record_start) * 1000,
+                )
             return event
 
     @staticmethod
