@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 import hashlib
 import itertools
 import json
@@ -138,6 +139,8 @@ def pack_io(
     ranges: list[OceanDiskRange],
     regions: list[tuple[int, int]],
     connection_indices: tuple[int, ...],
+    *,
+    resolve=None,
 ) -> list[int]:
     """Column-major ABI used by od/cache_controller.py, with remote offsets."""
     half = len(ranges) // 2
@@ -147,7 +150,12 @@ def pack_io(
         or [r.key for r in ranges[:half]] != [r.key for r in ranges[half:]]
     ):
         raise ValueError("OceanDisk requires matching KV and Indexer halves.")
-    mr_offsets = [resolve_mr(regions, item.ptr, item.size) for item in ranges]
+    mr_offsets = [
+        resolve(item.ptr, item.size)
+        if resolve is not None
+        else resolve_mr(regions, item.ptr, item.size)
+        for item in ranges
+    ]
     if any(item.storage_offset < 0 for item in ranges):
         raise ValueError("OceanDisk storage offsets must be nonnegative.")
     return [
@@ -337,6 +345,23 @@ class OceanDiskStorage(HiCacheStorage):
         count = len(layers[0])
         if count % 2 or any(len(layer) != count for layer in layers):
             raise ValueError("OceanDisk layers require equal, even IO counts.")
+        # Index registrations once per batch instead of scanning all layer MRs
+        # for every KV/Indexer range. Preserve first-match behavior for overlaps.
+        ordered = sorted(
+            (base, length, mr) for mr, (base, length) in enumerate(self.regions)
+        )
+        starts = [base for base, _, _ in ordered]
+        disjoint = all(a + n <= b for (a, n, _), (b, _, _) in zip(ordered, ordered[1:]))
+
+        def resolve(ptr, size):
+            if disjoint and size > 0:
+                index = bisect_right(starts, ptr) - 1
+                if index >= 0:
+                    base, length, mr = ordered[index]
+                    if ptr + size <= base + length:
+                        return mr, ptr - base
+            return resolve_mr(self.regions, ptr, size)
+
         half = count // 2
         batch_pages = max_ranges // 2
         batches = [
@@ -347,6 +372,7 @@ class OceanDiskStorage(HiCacheStorage):
                     + ranges[half + start : half + min(start + batch_pages, half)],
                     self.regions,
                     self.connection_indices,
+                    resolve=resolve,
                 )
                 for ranges in layers
             ]

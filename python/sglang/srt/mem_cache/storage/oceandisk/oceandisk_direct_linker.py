@@ -314,20 +314,18 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             locations, layer
         )
         ranges = []
+        storage_offsets = self._storage_offsets[name]
         for key, pointers, lengths, positions in zip(
             object_keys, ptrs, sizes, offsets, strict=True
         ):
-            ranges.extend(
-                OceanDiskRange(
-                    key,
-                    int(ptr),
-                    int(size),
-                    self._storage_offsets[name][storage_offset],
+            for ptr, size, storage_offset in zip(
+                pointers, lengths, positions, strict=True
+            ):
+                ranges.append(
+                    OceanDiskRange(
+                        key, int(ptr), int(size), storage_offsets[storage_offset]
+                    )
                 )
-                for ptr, size, storage_offset in zip(
-                    pointers, lengths, positions, strict=True
-                )
-            )
         return ranges
 
     def _init_put_progress(self):
