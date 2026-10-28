@@ -505,16 +505,24 @@ class OceanDiskStorage(HiCacheStorage):
                 self._stream.synchronize()
                 raise
 
-    def prepare_layerwise_put(self, layers, *, max_ranges=256):
+    def prepare_layerwise_put(self, layers, *, max_ranges=256, timings=None):
         """Prepare descriptors before forward, retaining them through completion."""
         torch = self._torch
         with torch.cuda.device(self.device):
             self._ensure_open()
+            pack_start = time.perf_counter()
             batches = self._pack_layer_batches(layers, max_ranges)
+            pack_ms = (time.perf_counter() - pack_start) * 1000
+            cpu_ms = upload_ms = views_ms = 0.0
             prepared = [[] for _ in layers]
             for batch in batches:
+                step = time.perf_counter()
                 cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                cpu_ms += (time.perf_counter() - step) * 1000
+                step = time.perf_counter()
                 gpu = cpu.to(self.device)
+                upload_ms += (time.perf_counter() - step) * 1000
+                step = time.perf_counter()
                 lengths = torch.tensor([cpu.shape[1]], dtype=torch.int64, device="cpu")
                 indices = torch.tensor([0], dtype=torch.int64, device="cpu")
                 for layer in range(len(batch)):
@@ -528,9 +536,14 @@ class OceanDiskStorage(HiCacheStorage):
                             indices,
                         )
                     )
+                views_ms += (time.perf_counter() - step) * 1000
+            if timings is not None:
+                timings.update(
+                    pack=pack_ms, cpu_tensor=cpu_ms, upload=upload_ms, views=views_ms
+                )
             return prepared
 
-    def submit_put_layer(self, layer, prepared, ready_event, timing_events=None):
+    def submit_put_layer(self, layer, prepared, ready_event):
         import od_utils
 
         torch = self._torch
@@ -542,8 +555,6 @@ class OceanDiskStorage(HiCacheStorage):
         ):
             self._ensure_open()
             self._stream.wait_event(ready_event)
-            if timing_events is not None:
-                timing_events[0].record(self._stream)
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
                 od_utils.batch_dispatch_put(
@@ -563,24 +574,17 @@ class OceanDiskStorage(HiCacheStorage):
                 call_ms = (time.perf_counter() - call_start) * 1000
                 call_times.append(call_ms)
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
-            if timing_events is not None:
-                timing_events[1].record(self._stream)
         return call_times
 
-    def record_save_event(self, diagnostics=None):
+    def record_save_event(self):
         torch = self._torch
-        lock_start = time.perf_counter()
-        with self._lock:
-            lock_ms = (time.perf_counter() - lock_start) * 1000
-            record_start = time.perf_counter()
-            with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
-                event = torch.cuda.Event(enable_timing=diagnostics is not None)
-                event.record(self._stream)
-            if diagnostics is not None:
-                diagnostics.update(
-                    lock_ms=lock_ms,
-                    record_ms=(time.perf_counter() - record_start) * 1000,
-                )
+        with (
+            self._lock,
+            torch.cuda.device(self.device),
+            torch.cuda.stream(self._stream),
+        ):
+            event = torch.cuda.Event()
+            event.record(self._stream)
             return event
 
     @staticmethod

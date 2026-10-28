@@ -301,6 +301,7 @@ class UnifiedCacheLinkerWrapper:
             completed.append((req, last * page_size))
         if not transfers:
             return None
+        plan_done = time.perf_counter()
         session = self.cache_linker.begin_layerwise_save(transfers, phase=phase)
         for transfer, (req, _) in zip(transfers, completed, strict=True):
             receipts = getattr(req, "_uc_layerwise_receipts", None)
@@ -312,6 +313,7 @@ class UnifiedCacheLinkerWrapper:
                 if receipt is not None
             )
         if session is not None:
+            pin_start = time.perf_counter()
             pages = torch.cat(
                 [
                     transfer.device_indices[::page_size] // page_size
@@ -319,6 +321,7 @@ class UnifiedCacheLinkerWrapper:
                 ]
             )
             lease = allocator.pin_pages_for_io(pages)
+            pin_ms = (time.perf_counter() - pin_start) * 1000
             session.release_source = lambda: allocator.unpin_pages_for_io(lease)
 
             def on_submitted():
@@ -329,6 +332,13 @@ class UnifiedCacheLinkerWrapper:
 
             session.on_submitted = on_submitted
             session.prepare_ms = (time.perf_counter() - prepare_start) * 1000
+            session.prepare_details.update(
+                plan=(plan_done - prepare_start) * 1000,
+                pin=pin_ms,
+            )
+            session.prepare_details["other"] = session.prepare_ms - sum(
+                session.prepare_details.values()
+            )
         return session
 
     def get_layerwise_page_hashes(self, req, key: RadixKey) -> list[str] | None:
