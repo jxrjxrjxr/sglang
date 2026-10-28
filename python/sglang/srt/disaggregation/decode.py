@@ -2726,7 +2726,11 @@ class SchedulerDisaggregationDecodeMixin:
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def _build_linker_extend_batch(self: Scheduler, reqs: List[Req]) -> ScheduleBatch:
+        device = self.token_to_kv_pool_allocator.device
         for req in reqs:
+            # Prealloc leaves an empty CPU prefix when decode matched nothing
+            # locally; load-back concatenates it with device indices.
+            req.prefix_indices = req.prefix_indices.to(device)
             if req.needs_host_load_back():
                 previous_node = req.last_node
                 prefix_indices = req.prefix_indices

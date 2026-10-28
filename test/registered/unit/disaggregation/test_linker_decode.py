@@ -59,7 +59,7 @@ def make_scheduler():
     scheduler.waiting_queue = []
     scheduler.enable_priority_scheduling = False
     scheduler.req_to_token_pool = SimpleNamespace(size=4)
-    scheduler.token_to_kv_pool_allocator = MagicMock()
+    scheduler.token_to_kv_pool_allocator = MagicMock(device=torch.device("cpu"))
     scheduler.tree_cache = MagicMock()
     scheduler.model_config = MagicMock()
     scheduler.enable_overlap = False
@@ -262,6 +262,25 @@ class TestLinkerDecode(unittest.TestCase):
             )
             req.set_extend_range.assert_called_once_with(6, 7)
             self.assertEqual(req.lock_receipt, "restored-lock")
+
+    def test_extend_moves_empty_cpu_prefix_to_kv_device(self):
+        # "meta" stands in for the rank's GPU on CPU-only runners.
+        scheduler = make_scheduler()
+        scheduler.token_to_kv_pool_allocator.device = torch.device("meta")
+        req = make_req(host_hit=4)
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        seen = []
+
+        def load(params):
+            seen.append(params.req.prefix_indices.device)
+            return torch.arange(4, device="meta"), "restored"
+
+        scheduler.tree_cache.init_load_back.side_effect = load
+        with patch.object(decode.ScheduleBatch, "init_new", return_value=MagicMock()):
+            scheduler._build_linker_extend_batch([req])
+        self.assertEqual(seen, [torch.device("meta")])
+        self.assertEqual(req.prefix_indices.device, torch.device("meta"))
+        self.assertEqual(len(req.prefix_indices), 4)
 
     def test_hicache_restore_uses_same_lock_handoff(self):
         req = make_req(host_hit=4)
