@@ -1,24 +1,27 @@
 """OceanDisk PD checks and benchmark through the router, with the offline prompts.
 
 Prompts come from build_prompt() in oceandisk_offline_tp8.py and the same
-dataset, so answers line up with the offline TP8 runs.
+dataset, so answers line up with the offline TP8 runs. As in
+oceandisk_offline_batch_chat.py, each prompt starts with a uuid so pages
+cached by earlier runs cannot be hit.
 """
 
 import argparse
 import json
 import statistics
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
 from oceandisk_offline_tp8 import build_prompt
 
-# Same sampling as oceandisk_offline_tp8.py.
+# Sampling of oceandisk_offline_tp8.py, with room for the thinking output.
 SAMPLING_PARAMS = {
     "temperature": 0,
     "top_p": 0.95,
-    "max_new_tokens": 16,
+    "max_new_tokens": 600,
     "stream_interval": 1,
 }
 CONCURRENT_REQUESTS = 8
@@ -108,7 +111,8 @@ def flush_decode_cache(decode_url):
 
 def check(args, tokenizer, rows):
     url = args.router_url
-    prompt = build_prompt(tokenizer, rows[0])
+    head = uuid.uuid4().hex
+    prompt = f"{head}\n{build_prompt(tokenizer, rows[0])}"
     answers = rows[0].get("answers")
 
     first = generate(url, prompt, SAMPLING_PARAMS)
@@ -124,10 +128,9 @@ def check(args, tokenizer, rows):
     print_result("THIRD REQUEST - D OCEANDISK LOAD-BACK TEST", third, answers)
     require_source("Third request", third, expect_hbm=False)
 
-    # Fresh lines at once form one linker EXTEND batch on D. Lines share the
-    # template head, so only the OceanDisk part is required.
+    # Fresh lines at once form one linker EXTEND batch on D.
     batch = rows[1 : 1 + CONCURRENT_REQUESTS]
-    prompts = [build_prompt(tokenizer, row) for row in batch]
+    prompts = [f"{uuid.uuid4().hex}\n{build_prompt(tokenizer, row)}" for row in batch]
     with ThreadPoolExecutor(len(prompts)) as pool:
         results = list(pool.map(lambda p: generate(url, p, SAMPLING_PARAMS), prompts))
     for line, (row, result) in enumerate(zip(batch, results), start=2):
@@ -140,7 +143,9 @@ def check(args, tokenizer, rows):
     extra = rows[line - 1]
     context = f"{rows[0]['context']}\n\n{extra['context']}"
     joined = {"context": context, "input": extra["input"]}
-    result = generate(url, build_prompt(tokenizer, joined), SAMPLING_PARAMS)
+    # Same uuid as line 1, so the two prompts share line 1's prefix.
+    joined_prompt = f"{head}\n{build_prompt(tokenizer, joined)}"
+    result = generate(url, joined_prompt, SAMPLING_PARAMS)
     print_result(f"LINE 1 + LINE {line} CONTEXT", result, extra.get("answers"))
     device, remote = cache_tiers(result)
     if device < first["output"]["meta_info"]["cached_tokens"] // 2 or remote <= 0:
@@ -160,7 +165,8 @@ def make_prompt(tokenizer, rows, start, prompt_tokens):
         ids += tokenizer.encode(text, add_special_tokens=False)
         row += 1
     context = tokenizer.decode(ids[: max(1, prompt_tokens - 100)])
-    return build_prompt(tokenizer, {"context": context, "input": rows[start]["input"]})
+    data = {"context": context, "input": rows[start]["input"]}
+    return f"{uuid.uuid4().hex}\n{build_prompt(tokenizer, data)}"
 
 
 def print_row(*cells):
