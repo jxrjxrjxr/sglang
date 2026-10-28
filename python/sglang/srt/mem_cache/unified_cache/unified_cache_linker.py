@@ -20,6 +20,7 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -194,6 +195,7 @@ class UnifiedCacheLinkerWrapper:
 
     def prepare_layerwise_save(self, batch):
         """Plan full pages before forward; only OceanDisk opts into this hook."""
+        prepare_start = time.perf_counter()
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 
         allocator = self.cache.token_to_kv_pool_allocator
@@ -326,6 +328,7 @@ class UnifiedCacheLinkerWrapper:
                 self.pending_layerwise_saves.append(session)
 
             session.on_submitted = on_submitted
+            session.prepare_ms = (time.perf_counter() - prepare_start) * 1000
         return session
 
     def get_layerwise_page_hashes(self, req, key: RadixKey) -> list[str] | None:

@@ -529,6 +529,7 @@ class OceanDiskStorage(HiCacheStorage):
         import od_utils
 
         torch = self._torch
+        call_times = []
         with (
             self._lock,
             torch.cuda.device(self.device),
@@ -536,7 +537,7 @@ class OceanDiskStorage(HiCacheStorage):
         ):
             self._ensure_open()
             self._stream.wait_event(ready_event)
-            for batch_index, (cpu, gpu, lengths, indices) in enumerate(prepared):
+            for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
                 od_utils.batch_dispatch_put(
                     gpu,
@@ -553,14 +554,9 @@ class OceanDiskStorage(HiCacheStorage):
                     False,
                 )
                 call_ms = (time.perf_counter() - call_start) * 1000
-                logger.info(
-                    "[OceanDisk PUT call] layer=%d batch=%d/%d native_call_ms=%.3f",
-                    layer,
-                    batch_index + 1,
-                    len(prepared),
-                    call_ms,
-                )
+                call_times.append(call_ms)
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
+        return call_times
 
     def record_save_event(self):
         torch = self._torch

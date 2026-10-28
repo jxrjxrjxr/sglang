@@ -43,6 +43,8 @@ class LayerwiseSaveSession:
         self.aborted = False
         self.put_failed = False
         self.ready_events = []
+        self.prepare_ms = 0.0
+        self.native_call_times = []
         self.prepared = (
             linker.storage.prepare_layerwise_put(layers, max_ranges=linker.max_ranges)
             if linker.offload_owner
@@ -53,6 +55,7 @@ class LayerwiseSaveSession:
         linker._put_started(id(self), len(keys))
 
     def __enter__(self):
+        self.forward_start = time.perf_counter()
         self.linker._layerwise_pending_keys.update(self.keys)
         return self
 
@@ -64,6 +67,15 @@ class LayerwiseSaveSession:
         self.next_layer += 1
 
     def __exit__(self, exc_type, exc, tb):
+        if self.linker.offload_owner:
+            logger.info(
+                "[OceanDisk timing] phase=%s pages=%d prepare_cpu_ms=%.3f "
+                "forward_scope_cpu_ms=%.3f",
+                self.phase,
+                len(self.keys),
+                self.prepare_ms,
+                (time.perf_counter() - self.forward_start) * 1000,
+            )
         self.aborted = exc_type is not None or self.next_layer != self.linker.num_layers
         # The FIFO keeps the completion task after this session's layer tasks.
         # Even aborted forwards retain source pages until queued I/O is drained.
@@ -588,7 +600,22 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         try:
                             if self.offload_owner:
                                 task.finish_event = self.storage.record_save_event()
+                                wait_start = time.perf_counter()
                                 task.finish_event.synchronize()
+                                wait_ms = (time.perf_counter() - wait_start) * 1000
+                                calls = task.native_call_times
+                                logger.info(
+                                    "[OceanDisk PUT timing] phase=%s pages=%d calls=%d "
+                                    "native_total_ms=%.3f native_min_ms=%.3f "
+                                    "native_max_ms=%.3f final_event_wait_ms=%.3f",
+                                    task.phase,
+                                    len(task.keys),
+                                    len(calls),
+                                    sum(calls),
+                                    min(calls, default=0.0),
+                                    max(calls, default=0.0),
+                                    wait_ms,
+                                )
                             success = not task.aborted and not task.put_failed
                             if self.offload_owner and success:
                                 trace_event(
@@ -607,9 +634,10 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         session, layer, ready_event = task
                         if not session.put_failed:
                             try:
-                                self.storage.submit_put_layer(
+                                calls = self.storage.submit_put_layer(
                                     layer, session.prepared[layer], ready_event
                                 )
+                                session.native_call_times.extend(calls)
                             except BaseException:
                                 session.put_failed = True
                                 logger.exception("OceanDisk layer %d PUT failed", layer)
