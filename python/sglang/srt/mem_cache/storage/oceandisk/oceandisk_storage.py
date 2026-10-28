@@ -170,7 +170,7 @@ def pack_io(
 
 
 class OceanDiskStorage(HiCacheStorage):
-    """Serialize legacy direct-buffer I/O; aligned transfers can overlap pages."""
+    """Direct-buffer I/O with separate load/store streams; aligned ranges can overlap pages."""
 
     _registration_lock = threading.Lock()
     _initialized = False
@@ -260,7 +260,8 @@ class OceanDiskStorage(HiCacheStorage):
                 )
             torch.ops.load_library(library)
             self._ops = torch.ops.my_ops
-            self._stream = torch.cuda.Stream(device=self.device)
+            self._get_stream = torch.cuda.Stream(device=self.device)
+            self._put_stream = torch.cuda.Stream(device=self.device)
             self._output = torch.zeros(2, dtype=torch.int64, device=self.device)
             addresses, lengths = zip(*self.regions)
             # Match the old controller's MR extension for direct padded I/O.
@@ -269,11 +270,11 @@ class OceanDiskStorage(HiCacheStorage):
             tensor = torch.tensor(
                 [*addresses, *lengths], dtype=torch.int64, device=self.device
             )
-            self._stream.wait_stream(torch.cuda.current_stream(self.device))
+            self._get_stream.wait_stream(torch.cuda.current_stream(self.device))
             # Even failed init may have registered memory: retain it and prohibit retry.
             type(self)._initialized = True
             type(self)._registered_tensors = list(buffers)
-            with torch.cuda.stream(self._stream):
+            with torch.cuda.stream(self._get_stream):
                 try:
                     # Match od/nds_utils.py: stagger GIDS connection setup by GPU.
                     time.sleep(device_index * 2)
@@ -285,8 +286,9 @@ class OceanDiskStorage(HiCacheStorage):
                     )
                     status = self._ops.kvcache_init(tensor, self._output)
                 finally:
-                    self._stream.synchronize()
+                    self._get_stream.synchronize()
             self._check_status(status, "init")
+            self._put_stream.wait_stream(self._get_stream)
             trace_event(
                 "STORAGE_INIT",
                 source=__file__,
@@ -312,7 +314,7 @@ class OceanDiskStorage(HiCacheStorage):
         with (
             self._lock,
             torch.cuda.device(self.device),
-            torch.cuda.stream(self._stream),
+            torch.cuda.stream(self._get_stream),
         ):
             self._ensure_open()
             if not keys:
@@ -329,7 +331,7 @@ class OceanDiskStorage(HiCacheStorage):
             try:
                 prefix_hits = self._ops.kvcache_exist(metadata, self._output)
             finally:
-                self._stream.synchronize()
+                self._get_stream.synchronize()
             if not isinstance(prefix_hits, int) or not 0 <= prefix_hits <= len(keys):
                 raise RuntimeError(
                     f"OceanDisk batch exist returned invalid prefix length "
@@ -400,9 +402,8 @@ class OceanDiskStorage(HiCacheStorage):
 
         torch = self._torch
         with (
-            self._lock,
             torch.cuda.device(self.device),
-            torch.cuda.stream(self._stream),
+            torch.cuda.stream(self._get_stream),
         ):
             self._ensure_open()
             descriptors = self._pack_layer_batches(layers, max_ranges)
@@ -419,7 +420,7 @@ class OceanDiskStorage(HiCacheStorage):
                     gpu = cpu.to(self.device)
                     events = [torch.cuda.Event() for _ in layers]
                     for event in events:
-                        event.record(self._stream)
+                        event.record(self._get_stream)
                     submitted.append((cpu, gpu, events))
                     trace_batch(
                         "GET_METADATA_READY",
@@ -439,7 +440,7 @@ class OceanDiskStorage(HiCacheStorage):
                             cpu[layer : layer + 1],
                             self._output,
                             [events[layer].cuda_event],
-                            self._stream.stream_id,
+                            self._get_stream.stream_id,
                             self.device.index,
                             0,
                             1,
@@ -460,7 +461,7 @@ class OceanDiskStorage(HiCacheStorage):
                     meaning="layer_events_finished",
                 )
             except BaseException:
-                self._stream.synchronize()
+                self._get_stream.synchronize()
                 raise
 
     def put_layers(self, layers, *, max_ranges=256) -> None:
@@ -468,9 +469,8 @@ class OceanDiskStorage(HiCacheStorage):
 
         torch = self._torch
         with (
-            self._lock,
             torch.cuda.device(self.device),
-            torch.cuda.stream(self._stream),
+            torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
             descriptors = self._pack_layer_batches(layers, max_ranges)
@@ -505,7 +505,7 @@ class OceanDiskStorage(HiCacheStorage):
                         cpu,
                         self._output,
                         [],
-                        self._stream.stream_id,
+                        self._put_stream.stream_id,
                         self.device.index,
                         0,
                         len(layers),
@@ -519,7 +519,7 @@ class OceanDiskStorage(HiCacheStorage):
                         per_io_status_checked=False,
                     )
                 event = torch.cuda.Event()
-                event.record(self._stream)
+                event.record(self._put_stream)
                 event.synchronize()
                 trace_event(
                     "PUT_DONE",
@@ -528,7 +528,7 @@ class OceanDiskStorage(HiCacheStorage):
                     per_io_status_checked=False,
                 )
             except BaseException:
-                self._stream.synchronize()
+                self._put_stream.synchronize()
                 raise
 
     def prepare_layerwise_put(self, layers, *, max_ranges=256, timings=None):
@@ -575,12 +575,11 @@ class OceanDiskStorage(HiCacheStorage):
         torch = self._torch
         call_times = []
         with (
-            self._lock,
             torch.cuda.device(self.device),
-            torch.cuda.stream(self._stream),
+            torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            self._stream.wait_event(ready_event)
+            self._put_stream.wait_event(ready_event)
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
                 od_utils.batch_dispatch_put(
@@ -590,7 +589,7 @@ class OceanDiskStorage(HiCacheStorage):
                     cpu,
                     self._output,
                     [],
-                    self._stream.stream_id,
+                    self._put_stream.stream_id,
                     self.device.index,
                     0,
                     1,
@@ -605,12 +604,11 @@ class OceanDiskStorage(HiCacheStorage):
     def record_save_event(self):
         torch = self._torch
         with (
-            self._lock,
             torch.cuda.device(self.device),
-            torch.cuda.stream(self._stream),
+            torch.cuda.stream(self._put_stream),
         ):
             event = torch.cuda.Event()
-            event.record(self._stream)
+            event.record(self._put_stream)
             return event
 
     @staticmethod
@@ -660,7 +658,8 @@ class OceanDiskStorage(HiCacheStorage):
         with self._lock:
             if not self._closed:
                 with self._torch.cuda.device(self.device):
-                    self._stream.synchronize()
+                    self._get_stream.synchronize()
+                    self._put_stream.synchronize()
                 self._closed = True
         # No close/deregister operator is exposed. Keep allocations pinned by
         # Python references for the same lifetime as GIDS's process-global MRs.

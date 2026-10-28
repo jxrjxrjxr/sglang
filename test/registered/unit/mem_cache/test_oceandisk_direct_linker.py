@@ -71,7 +71,7 @@ class TestOceanDiskStorage(CustomTestCase):
         )
         storage._lock = threading.Lock()
         storage.device = "cuda:0"
-        storage._stream = Mock()
+        storage._get_stream = Mock()
         storage._ensure_open = Mock()
         storage._task_ids = itertools.count(10)
         storage.connection_indices = [2, 5]
@@ -81,7 +81,7 @@ class TestOceanDiskStorage(CustomTestCase):
         for prefix in (0, 2, 4):
             with self.subTest(prefix=prefix):
                 storage._ops.reset_mock()
-                storage._stream.reset_mock()
+                storage._get_stream.reset_mock()
                 storage._ops.kvcache_exist.return_value = prefix
                 self.assertEqual(
                     storage.exists_many(keys),
@@ -91,22 +91,22 @@ class TestOceanDiskStorage(CustomTestCase):
                 metadata, output = storage._ops.kvcache_exist.call_args.args
                 self.assertEqual(metadata[1:], [11, 12, 13, 14, 5, 2, 5, 2])
                 self.assertIs(output, storage._output)
-                storage._stream.synchronize.assert_called_once()
+                storage._get_stream.synchronize.assert_called_once()
 
         storage._ops.reset_mock()
-        storage._stream.reset_mock()
+        storage._get_stream.reset_mock()
         self.assertEqual(storage.exists_many([]), [])
         storage._ops.kvcache_exist.assert_not_called()
-        storage._stream.synchronize.assert_not_called()
+        storage._get_stream.synchronize.assert_not_called()
         for invalid in (-1, 5, None):
             storage._ops.kvcache_exist.return_value = invalid
             with self.assertRaisesRegex(RuntimeError, "invalid prefix length"):
                 storage.exists_many(keys)
         storage._ops.kvcache_exist.side_effect = RuntimeError("native failure")
-        storage._stream.reset_mock()
+        storage._get_stream.reset_mock()
         with self.assertRaisesRegex(RuntimeError, "native failure"):
             storage.exists_many(keys)
-        storage._stream.synchronize.assert_called_once()
+        storage._get_stream.synchronize.assert_called_once()
 
     def test_hicache_contract_is_reserved_without_changing_uc_range_io(self):
         self.assertTrue(issubclass(OceanDiskStorage, HiCacheStorage))
@@ -234,7 +234,8 @@ class TestOceanDiskStorage(CustomTestCase):
 
         fake_torch.cuda.Event.side_effect = new_event
         storage._torch = fake_torch
-        storage._stream = Mock(stream_id=123)
+        storage._get_stream = Mock(stream_id=123)
+        storage._put_stream = Mock(stream_id=456)
         storage._output = Mock()
         storage._ops = Mock()
         self.od_utils = SimpleNamespace(
@@ -354,7 +355,7 @@ class TestOceanDiskStorage(CustomTestCase):
             width = args[0].shape[1]
             self.assertEqual(args[1].values, [width, width])
             self.assertEqual(args[2].values, [0, 1])
-            self.assertEqual(args[5:], ([], 123, 0, 0, 2, False, False))
+            self.assertEqual(args[5:], ([], 456, 0, 0, 2, False, False))
             for row in args[0].values:
                 count = (len(row) - 1) // 6
                 keys = row[1 + count : 1 + count * 2]
@@ -371,7 +372,7 @@ class TestOceanDiskStorage(CustomTestCase):
         ]
         with self.assertRaisesRegex(RuntimeError, "put failed"):
             storage.put_layers([self.layer_ranges(3)], max_ranges=4)
-        storage._stream.synchronize.assert_called_once()
+        storage._put_stream.synchronize.assert_called_once()
 
     def test_put_submits_all_layers_in_one_call(self):
         storage, trace, _ = self.make_storage()
@@ -470,7 +471,7 @@ class TestOceanDiskStorage(CustomTestCase):
                 on_layer_ready=ready,
             )
         ready.assert_not_called()
-        storage._stream.synchronize.assert_called_once()
+        storage._get_stream.synchronize.assert_called_once()
 
     def test_get_later_layer_failure_keeps_only_prior_layer_ready(self):
         storage, _, _ = self.make_storage()
@@ -485,7 +486,7 @@ class TestOceanDiskStorage(CustomTestCase):
                 on_layer_ready=ready,
             )
         ready.assert_called_once_with(0)
-        storage._stream.synchronize.assert_called_once()
+        storage._get_stream.synchronize.assert_called_once()
 
     def test_layerwise_put_waits_on_gpu_and_retains_metadata_until_final_wait(self):
         storage, trace, events = self.make_storage()
@@ -500,12 +501,12 @@ class TestOceanDiskStorage(CustomTestCase):
         self.assertFalse(events)
         self.assertEqual(self.od_utils.batch_dispatch_put.call_count, 4)
         self.assertEqual(
-            storage._stream.wait_event.call_args_list,
+            storage._put_stream.wait_event.call_args_list,
             [unittest.mock.call(event) for event in ready],
         )
         for call in self.od_utils.batch_dispatch_put.call_args_list:
             self.assertEqual(call.args[0].shape, (1, 13))
-            self.assertEqual(call.args[5:], ([], 123, 0, 0, 1, False, False))
+            self.assertEqual(call.args[5:], ([], 456, 0, 0, 1, False, False))
         self.assertEqual([kind for kind, _ in trace], ["put"] * 4)
         for event in ready:
             event.synchronize.assert_not_called()
