@@ -536,7 +536,8 @@ class OceanDiskStorage(HiCacheStorage):
         ):
             self._ensure_open()
             self._stream.wait_event(ready_event)
-            for cpu, gpu, lengths, indices in prepared:
+            for batch_index, (cpu, gpu, lengths, indices) in enumerate(prepared):
+                call_start = time.perf_counter()
                 od_utils.batch_dispatch_put(
                     gpu,
                     lengths,
@@ -550,6 +551,14 @@ class OceanDiskStorage(HiCacheStorage):
                     1,
                     False,
                     False,
+                )
+                call_ms = (time.perf_counter() - call_start) * 1000
+                logger.info(
+                    "[OceanDisk PUT call] layer=%d batch=%d/%d native_call_ms=%.3f",
+                    layer,
+                    batch_index + 1,
+                    len(prepared),
+                    call_ms,
                 )
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
 
