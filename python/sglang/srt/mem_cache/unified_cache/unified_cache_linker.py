@@ -23,6 +23,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -176,6 +177,10 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self.bypass_storage_match = False
+        self.handoff_lookups: dict[str, list[PoolTransfer]] = {}
+        self.pending_handoff_loads: dict[str, int] = {}
+        self.completed_handoff_loads: dict[str, bool] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
@@ -376,6 +381,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        if self.bypass_storage_match:
+            self.hit_markers.pop(req.rid, None)
+            return result
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -470,6 +478,50 @@ class UnifiedCacheLinkerWrapper:
             last_hash,
             page_size=page,
         )
+
+    def build_handoff_lookup(self, req: Req, num_pages: int) -> list[PoolTransfer]:
+        """Build lookup transfers using prefill's page hash chain."""
+        if num_pages == 0:
+            return []
+        if req.rid in self.handoff_lookups:
+            return self.handoff_lookups[req.rid]
+        page = self.cache.page_size
+        key = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+        )[: num_pages * page]
+        hashes = get_storage_hash_str(key, prior_hash=None, page_size=page)
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                raise RuntimeError(f"Cannot build Linker lookup for rid={req.rid!r}.")
+            transfers.append(transfer)
+        self.handoff_lookups[req.rid] = transfers
+        return transfers
+
+    def queue_handoff_loads(self, loads) -> None:
+        """Queue (tag, start_page, end_page, device_indices), then start one batch."""
+        if not loads:
+            return
+        for tag, start, end, indices in loads:
+            rid = tag.rsplit("@", 1)[0]
+            # Component LOAD builders allocate new slots. Handoff already owns
+            # its slots; the same PoolTransfer carries them to the load backend.
+            transfers = [
+                replace(t, keys=t.keys[start:end], device_indices=indices)
+                for t in self.handoff_lookups[rid]
+            ]
+            if not self.cache_linker.load(tag, transfers):
+                raise RuntimeError(f"Failed to queue Linker handoff load {tag!r}.")
+        index = self.cache_linker.start_layer_wise_loading()
+        if index < 0:
+            raise RuntimeError("Linker handoff batch did not start.")
+        self.pending_handoff_loads.update((tag, index) for tag, *_ in loads)
 
     # ---- init_load_back: remote -> device, then insert ----
 
@@ -740,9 +792,21 @@ class UnifiedCacheLinkerWrapper:
 
     def drain_loads(self, finish_count: int) -> None:
         for _ in range(finish_count):
+            results = {}
             for rid in self.cache_linker.pop_completed_load():
-                node_id, lock_params = self.pending_loads.pop(rid)
-                self.cache.dec_lock_ref(node_id, lock_params)
+                if rid in self.pending_loads:
+                    node_id, lock_params = self.pending_loads.pop(rid)
+                    self.cache.dec_lock_ref(node_id, lock_params)
+                    continue
+                index = self.pending_handoff_loads.pop(rid)
+                if index not in results:
+                    # All tags in this batch share the same per-layer futures.
+                    futures = self.layer_done_counter.futures.pop(index)
+                    results[index] = all(
+                        future.done() and future.exception() is None
+                        for future in futures
+                    )
+                self.completed_handoff_loads[rid] = results[index]
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -771,6 +835,9 @@ class UnifiedCacheLinkerWrapper:
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
+        self.handoff_lookups.clear()
+        self.pending_handoff_loads.clear()
+        self.completed_handoff_loads.clear()
         for node_id, lock_params in self.pending_loads.values():
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
@@ -782,6 +849,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
+        self.handoff_lookups.pop(rid, None)
         self.hit_markers.pop(rid, None)
         # TODO: Roll back the published tree and component state atomically before
         # canceling; otherwise the tree may retain device slots that were never loaded.

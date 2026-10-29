@@ -11,6 +11,7 @@ To plug in a custom backend, register it under a string name via
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -224,11 +225,17 @@ def _create_unified_radix_cache(
         cache.init_cache_linker(
             linker_cls(server_args, params, components=set(cache.components))
         )
+        decode_linker_load = get_disagg().disaggregation_decode_linker_load
+        if decode_linker_load:
+            cache.write_through_threshold = sys.maxsize
+            cache.linker.bypass_storage_match = True
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
-        if getattr(cache.linker.cache_linker, "layerwise_save_enabled", False):
+        if not decode_linker_load and getattr(
+            cache.linker.cache_linker, "layerwise_save_enabled", False
+        ):
             # These decoder layers expose the paired KV/Indexer ready hook.
             model_bases = type(ctx.tp_worker.model_runner.model).__mro__
             if any(cls.__name__ == "DeepseekV2ForCausalLM" for cls in model_bases):
