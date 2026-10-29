@@ -45,6 +45,11 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_linker_mixin import (
+    DecodeLinkerTransferMixin,
+    LinkerLoadGatedKVReceiver,
+    _linker_handoff_prefix_len,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -321,6 +326,13 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+
+    # OceanDisk prefix loading into the preallocated request slots.
+    linker_prefix_len: int = 0
+    linker_loaded_len: int = 0
+    linker_inflight_end: int = 0
+    linker_next_probe_time: float = 0.0
+    linker_failed: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -1245,6 +1257,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
+                if get_disagg().disaggregation_decode_linker_load:
+                    decode_req.linker_prefix_len = _linker_handoff_prefix_len(
+                        decode_req.req,
+                        prefix_len,
+                        self.tree_cache.page_size,
+                        self.scheduler.chunked_prefill_size,
+                    )
+                    decode_req.linker_loaded_len = prefix_len
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
 
@@ -1390,6 +1410,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(preallocated_reqs) + 1,
                 )
             decode_req.req.kv.cache_protected_len = total_prefix_len
+            # Allocate and protect exactly as native Mooncake does. Only the
+            # RDMA destination/metadata skip the prefix loaded from OceanDisk.
+            if get_disagg().disaggregation_decode_linker_load:
+                total_prefix_len = decode_req.linker_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -2084,7 +2108,7 @@ def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
-class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+class DecodeTransferQueue(DecodeHiCacheTransferMixin, DecodeLinkerTransferMixin):
     """
     Store the requests that is polling kv
     """
@@ -2302,12 +2326,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if self.scheduler.enable_decode_hicache
             else [dr.kv_receiver for dr in self.queue]
         )
-        return poll_and_all_reduce(
+        if get_disagg().disaggregation_decode_linker_load:
+            pollers = [LinkerLoadGatedKVReceiver(dr) for dr in self.queue]
+        polls = poll_and_all_reduce(
             pollers,
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
         )
+        # Failure injection runs outside pollers. Defer even that failure until
+        # the TP-synchronized completion drain has released all DMA writers.
+        for dr, poll in zip(self.queue, polls):
+            if dr.linker_inflight_end and poll == KVPoll.Failed:
+                dr.linker_failed = True
+        return [
+            KVPoll.Transferring if dr.linker_inflight_end else poll
+            for dr, poll in zip(self.queue, polls)
+        ]
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
@@ -2332,6 +2367,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self.queue:
             return []
 
+        if get_disagg().disaggregation_decode_linker_load:
+            self._process_linker_loads(self.queue)
         if self.scheduler.enable_decode_hicache:
             self._process_hicache_local_restores(
                 [
@@ -2753,7 +2790,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
-        if self.enable_decode_hicache:
+        if self.enable_decode_hicache or get_disagg().disaggregation_decode_linker_load:
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
