@@ -60,18 +60,18 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestOceanDiskStorage(CustomTestCase):
     def test_exists_many_uses_one_batch_and_preserves_prefix_order(self):
+        query_stream = Mock()
         storage = OceanDiskStorage.__new__(OceanDiskStorage)
         storage._torch = SimpleNamespace(
             tensor=lambda values, **kwargs: values,
             int64="int64",
             cuda=SimpleNamespace(
                 device=lambda device: nullcontext(),
-                stream=lambda stream: nullcontext(),
+                current_stream=lambda device: query_stream,
             ),
         )
         storage._lock = threading.Lock()
         storage.device = "cuda:0"
-        storage._get_stream = Mock()
         storage._ensure_open = Mock()
         storage._task_ids = itertools.count(10)
         storage.connection_indices = [2, 5]
@@ -82,7 +82,7 @@ class TestOceanDiskStorage(CustomTestCase):
         for prefix in (0, 2, 4):
             with self.subTest(prefix=prefix):
                 storage._ops.reset_mock()
-                storage._get_stream.reset_mock()
+                query_stream.reset_mock()
                 storage._ops.kvcache_exist.return_value = prefix
                 self.assertEqual(
                     storage.exists_many(keys),
@@ -92,22 +92,22 @@ class TestOceanDiskStorage(CustomTestCase):
                 metadata, output = storage._ops.kvcache_exist.call_args.args
                 self.assertEqual(metadata[1:], [11, 12, 13, 14, 5, 2, 5, 2])
                 self.assertIs(output, storage._output)
-                storage._get_stream.synchronize.assert_called_once()
+                query_stream.synchronize.assert_called_once()
 
         storage._ops.reset_mock()
-        storage._get_stream.reset_mock()
+        query_stream.reset_mock()
         self.assertEqual(storage.exists_many([]), [])
         storage._ops.kvcache_exist.assert_not_called()
-        storage._get_stream.synchronize.assert_not_called()
+        query_stream.synchronize.assert_not_called()
         for invalid in (-1, 5, None):
             storage._ops.kvcache_exist.return_value = invalid
             with self.assertRaisesRegex(RuntimeError, "invalid prefix length"):
                 storage.exists_many(keys)
         storage._ops.kvcache_exist.side_effect = RuntimeError("native failure")
-        storage._get_stream.reset_mock()
+        query_stream.reset_mock()
         with self.assertRaisesRegex(RuntimeError, "native failure"):
             storage.exists_many(keys)
-        storage._get_stream.synchronize.assert_called_once()
+        query_stream.synchronize.assert_called_once()
 
     def test_hicache_contract_is_reserved_without_changing_uc_range_io(self):
         self.assertTrue(issubclass(OceanDiskStorage, HiCacheStorage))

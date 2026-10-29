@@ -343,14 +343,13 @@ class OceanDiskStorage(HiCacheStorage):
         individual key statuses. Entries after the first miss remain False.
         """
         torch = self._torch
-        with (
-            self._lock,
-            torch.cuda.device(self.device),
-            torch.cuda.stream(self._get_stream),
-        ):
+        # Match the legacy controller: create metadata and invoke the native
+        # existence operator on the caller's current stream.
+        with self._lock, torch.cuda.device(self.device):
             self._ensure_open()
             if not keys:
                 return []
+            query_stream = torch.cuda.current_stream(self.device)
             connections = [self.connection_router.select(key) for key in keys]
             if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
                 logger.info(
@@ -371,7 +370,7 @@ class OceanDiskStorage(HiCacheStorage):
             try:
                 prefix_hits = self._ops.kvcache_exist(metadata, self._output)
             finally:
-                self._get_stream.synchronize()
+                query_stream.synchronize()
             if not isinstance(prefix_hits, int) or not 0 <= prefix_hits <= len(keys):
                 raise RuntimeError(
                     f"OceanDisk batch exist returned invalid prefix length "
