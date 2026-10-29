@@ -11,6 +11,8 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import Future
+from queue import PriorityQueue
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -209,8 +211,11 @@ class OceanDiskStorage(HiCacheStorage):
             "extra_config" if "connection_indices" in config else "gids_config_all"
         )
         self._closed = False
-        # Serialize native GET/PUT/EXISTS through GPU completion.
-        self._lock = threading.Lock()
+        self._io_queue = PriorityQueue()
+        self._io_sequence = itertools.count()
+        self._io_thread = threading.Thread(
+            target=self._io_worker, daemon=True, name="oceandisk-native-io"
+        )
         self._task_ids = itertools.count(1)
 
         import torch
@@ -331,6 +336,34 @@ class OceanDiskStorage(HiCacheStorage):
                 connections=self.connection_indices,
                 registered_regions=len(self.regions),
             )
+        self._io_thread.start()
+
+    def _io_worker(self):
+        while True:
+            _, _, operation, stream, completion = self._io_queue.get()
+            if operation is None:
+                completion.set_result(None)
+                return
+            try:
+                with (
+                    self._torch.cuda.device(self.device),
+                    self._torch.cuda.stream(stream),
+                ):
+                    try:
+                        result = operation()
+                    finally:
+                        stream.synchronize()
+                completion.set_result(result)
+            except BaseException as error:
+                completion.set_exception(error)
+
+    def _run_io(self, operation, stream, priority):
+        self._ensure_open()
+        completion = Future()
+        self._io_queue.put(
+            (priority, next(self._io_sequence), operation, stream, completion)
+        )
+        return completion.result()
 
     @staticmethod
     def _check_status(status, operation: str) -> None:
@@ -338,6 +371,11 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int]) -> list[bool]:
+        with self._torch.cuda.device(self.device):
+            stream = self._torch.cuda.current_stream(self.device)
+        return self._run_io(lambda: self._exists_many(keys), stream, 0)
+
+    def _exists_many(self, keys: list[int]) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
         kvcache_exist returns the contiguous hit prefix in input order, not
@@ -346,7 +384,7 @@ class OceanDiskStorage(HiCacheStorage):
         torch = self._torch
         # Match the legacy controller: create metadata and invoke the native
         # existence operator on the caller's current stream.
-        with self._lock, torch.cuda.device(self.device):
+        with torch.cuda.device(self.device):
             self._ensure_open()
             if not keys:
                 return []
@@ -489,35 +527,35 @@ class OceanDiskStorage(HiCacheStorage):
                         od_utils,
                     )
                 for layer in range(len(layers)):
-                    with self._lock:
-                        try:
-                            for cpu, gpu, events in submitted:
-                                # Slice both metadata tensors and use local layer 0:
-                                # the native wrapper indexes GPU rows and CPU task IDs
-                                # differently when start_layer is nonzero.
-                                step = time.perf_counter()
-                                od_utils.batch_dispatch_get(
-                                    gpu[layer : layer + 1],
-                                    gpu.shape[1],
-                                    cpu[layer : layer + 1],
-                                    self._output,
-                                    [events[layer].cuda_event],
-                                    self._get_stream.stream_id,
-                                    self.device.index,
-                                    0,
-                                    1,
-                                    True,
-                                    False,
-                                )
-                                native_times.append((time.perf_counter() - step) * 1000)
-                            # A layer is usable only after every I/O batch containing
-                            # its paired KV/Indexer fragments has completed.
-                            step = time.perf_counter()
-                            for _, _, events in submitted:
-                                events[layer].synchronize()
-                            event_wait_ms += (time.perf_counter() - step) * 1000
-                        finally:
-                            self._get_stream.synchronize()
+                    for cpu, gpu, events in submitted:
+                        # Slice both metadata tensors and use local layer 0:
+                        # the native wrapper indexes GPU rows and CPU task IDs
+                        # differently when start_layer is nonzero.
+                        step = time.perf_counter()
+                        self._run_io(
+                            lambda: od_utils.batch_dispatch_get(
+                                gpu[layer : layer + 1],
+                                gpu.shape[1],
+                                cpu[layer : layer + 1],
+                                self._output,
+                                [events[layer].cuda_event],
+                                self._get_stream.stream_id,
+                                self.device.index,
+                                0,
+                                1,
+                                True,
+                                False,
+                            ),
+                            self._get_stream,
+                            1,
+                        )
+                        native_times.append((time.perf_counter() - step) * 1000)
+                    # A layer is usable only after every I/O batch containing
+                    # its paired KV/Indexer fragments has completed.
+                    step = time.perf_counter()
+                    for _, _, events in submitted:
+                        events[layer].synchronize()
+                    event_wait_ms += (time.perf_counter() - step) * 1000
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
                     if on_layer_ready is not None:
@@ -550,7 +588,6 @@ class OceanDiskStorage(HiCacheStorage):
 
         torch = self._torch
         with (
-            self._lock,
             torch.cuda.device(self.device),
             torch.cuda.stream(self._put_stream),
         ):
@@ -580,20 +617,25 @@ class OceanDiskStorage(HiCacheStorage):
                         len(descriptors),
                         od_utils,
                     )
-                    result = od_utils.batch_dispatch_put(
-                        gpu,
-                        lengths,
-                        indices,
-                        cpu,
-                        self._output,
-                        [],
-                        self._put_stream.stream_id,
-                        self.device.index,
-                        0,
-                        len(layers),
-                        False,
-                        False,
-                    )
+                    for layer in range(len(layers)):
+                        result = self._run_io(
+                            lambda: od_utils.batch_dispatch_put(
+                                gpu[layer : layer + 1],
+                                lengths[layer : layer + 1],
+                                indices[:1],
+                                cpu[layer : layer + 1],
+                                self._output,
+                                [],
+                                self._put_stream.stream_id,
+                                self.device.index,
+                                0,
+                                1,
+                                False,
+                                False,
+                            ),
+                            self._put_stream,
+                            2,
+                        )
                     trace_event(
                         "NATIVE_PUT_RETURN",
                         batch=batch_index + 1,
@@ -663,28 +705,28 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             # Wait before taking the I/O lock: computation may need a GET.
             ready_event.synchronize()
-            with self._lock:
-                try:
-                    for cpu, gpu, lengths, indices in prepared:
-                        call_start = time.perf_counter()
-                        od_utils.batch_dispatch_put(
-                            gpu,
-                            lengths,
-                            indices,
-                            cpu,
-                            self._output,
-                            [],
-                            self._put_stream.stream_id,
-                            self.device.index,
-                            0,
-                            1,
-                            False,
-                            False,
-                        )
-                        call_ms = (time.perf_counter() - call_start) * 1000
-                        call_times.append(call_ms)
-                finally:
-                    self._put_stream.synchronize()
+            for cpu, gpu, lengths, indices in prepared:
+                call_start = time.perf_counter()
+                self._run_io(
+                    lambda: od_utils.batch_dispatch_put(
+                        gpu,
+                        lengths,
+                        indices,
+                        cpu,
+                        self._output,
+                        [],
+                        self._put_stream.stream_id,
+                        self.device.index,
+                        0,
+                        1,
+                        False,
+                        False,
+                    ),
+                    self._put_stream,
+                    2,
+                )
+                call_ms = (time.perf_counter() - call_start) * 1000
+                call_times.append(call_ms)
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
         return call_times
 
@@ -742,11 +784,15 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError("OceanDisk storage is closed.")
 
     def close(self) -> None:
-        with self._lock:
-            if not self._closed:
-                with self._torch.cuda.device(self.device):
-                    self._get_stream.synchronize()
-                    self._put_stream.synchronize()
-                self._closed = True
-        # No close/deregister operator is exposed. Keep allocations pinned by
-        # Python references for the same lifetime as GIDS's process-global MRs.
+        if self._closed:
+            return
+        # Linker stops its producers before closing Storage. Drain queued work.
+        completion = Future()
+        self._io_queue.put((3, next(self._io_sequence), None, None, completion))
+        completion.result()
+        self._io_thread.join()
+        with self._torch.cuda.device(self.device):
+            self._get_stream.synchronize()
+            self._put_stream.synchronize()
+        self._closed = True
+        # GIDS exposes no deregistration operation; retain registered buffers.
