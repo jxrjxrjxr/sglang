@@ -26,8 +26,10 @@ SAMPLING_PARAMS = {
 }
 CONCURRENT_REQUESTS = 8
 LATENCY_PROMPT_TOKENS = [4096, 16384, 32768, 60000]
+LATENCY_OUTPUT_TOKENS = 128
 THROUGHPUT_PROMPT_TOKENS = 8192
 THROUGHPUT_CONCURRENCY = [1, 4, 8, 16]
+THROUGHPUT_OUTPUT_TOKENS = 256
 
 
 def generate(url, prompt, sampling_params):
@@ -189,7 +191,7 @@ def bench(args, tokenizer, rows):
     params = {"temperature": 0, "ignore_eos": True, "stream_interval": 1}
 
     # Clearing D before the reload leaves only the handoff: OceanDisk or RDMA.
-    params["max_new_tokens"] = 128
+    params["max_new_tokens"] = LATENCY_OUTPUT_TOKENS
     print("\n===== Single request (ms): cold, then again after clearing D =====")
     print_row("target tokens", "prompt tokens", "cold TTFT", "reload TTFT")
     for prompt_tokens in LATENCY_PROMPT_TOKENS:
@@ -202,7 +204,7 @@ def bench(args, tokenizer, rows):
         print_row(prompt_tokens, sent, *ttfts)
 
     # Max TBT shows decode stalls on D during concurrent request admission.
-    params["max_new_tokens"] = 256
+    params["max_new_tokens"] = THROUGHPUT_OUTPUT_TOKENS
     print(f"\n===== Concurrency (ms): {THROUGHPUT_PROMPT_TOKENS}-token prompts =====")
     print_row("concurrency", "TTFT p50", "TBT mean", "TBT max", "tokens/s")
     for concurrency in THROUGHPUT_CONCURRENCY:
