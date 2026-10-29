@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.storage.oceandisk.connection_router import ConnectionRouter
 
 if TYPE_CHECKING:
     import torch
@@ -141,6 +142,7 @@ def pack_io(
     connection_indices: tuple[int, ...],
     *,
     resolve=None,
+    select_connection=None,
 ) -> list[int]:
     """Column-major ABI used by od/cache_controller.py, with remote offsets."""
     half = len(ranges) // 2
@@ -158,6 +160,12 @@ def pack_io(
     ]
     if any(item.storage_offset < 0 for item in ranges):
         raise ValueError("OceanDisk storage offsets must be nonnegative.")
+    paired_connections = [
+        select_connection(item.key)
+        if select_connection is not None
+        else connection_indices[item.key % len(connection_indices)]
+        for item in ranges[:half]
+    ]
     return [
         task_id,
         *[mr for mr, _ in mr_offsets],
@@ -165,7 +173,8 @@ def pack_io(
         *[offset for _, offset in mr_offsets],
         *[item.storage_offset for item in ranges],
         *[item.size for item in ranges],
-        *[connection_indices[item.key % len(connection_indices)] for item in ranges],
+        *paired_connections,
+        *paired_connections,
     ]
 
 
@@ -257,6 +266,7 @@ class OceanDiskStorage(HiCacheStorage):
                 f"in {config_path}."
             )
 
+        self.connection_router = ConnectionRouter(config_path, self.connection_indices)
         with self._registration_lock, torch.cuda.device(self.device):
             if type(self)._initialized:
                 raise RuntimeError(
@@ -296,12 +306,14 @@ class OceanDiskStorage(HiCacheStorage):
             self._put_stream.wait_stream(self._get_stream)
             logger.info(
                 "[OceanDisk connections] device=%s config=%s configured_count=%d "
-                "selected=%s source=%s routing=key_modulo",
+                "selected=%s source=%s routing=dht groups=%s endpoints=%s",
                 self.device,
                 config_path,
                 connection_count,
                 self.connection_indices,
                 connection_source,
+                self.connection_router.groups,
+                self.connection_router.endpoints,
             )
             logger.info(
                 "[OceanDisk streams] device=%s get=%s put=%s",
@@ -339,10 +351,7 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             if not keys:
                 return []
-            connections = [
-                self.connection_indices[key % len(self.connection_indices)]
-                for key in keys
-            ]
+            connections = [self.connection_router.select(key) for key in keys]
             if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
                 logger.info(
                     "[OceanDisk connection usage] pid=%d device=%s keys=%d counts=%s",
@@ -396,6 +405,12 @@ class OceanDiskStorage(HiCacheStorage):
             return resolve_mr(self.regions, ptr, size)
 
         half = count // 2
+        # Fix one connection per page for the whole operation, including both
+        # KV/Indexer halves and every layer.
+        selected_connections = {
+            item.key: self.connection_router.select(item.key)
+            for item in layers[0][:half]
+        }
         batch_pages = max_ranges // 2
         batches = [
             [
@@ -406,6 +421,7 @@ class OceanDiskStorage(HiCacheStorage):
                     self.regions,
                     self.connection_indices,
                     resolve=resolve,
+                    select_connection=selected_connections.__getitem__,
                 )
                 for ranges in layers
             ]

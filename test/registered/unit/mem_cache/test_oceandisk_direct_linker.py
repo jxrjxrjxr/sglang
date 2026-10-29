@@ -75,6 +75,7 @@ class TestOceanDiskStorage(CustomTestCase):
         storage._ensure_open = Mock()
         storage._task_ids = itertools.count(10)
         storage.connection_indices = [2, 5]
+        storage.connection_router = SimpleNamespace(select=lambda key: [2, 5][key % 2])
         storage._output = object()
         storage._ops = Mock()
         keys = [11, 12, 13, 14]
@@ -194,6 +195,7 @@ class TestOceanDiskStorage(CustomTestCase):
         storage.device = SimpleNamespace(index=0)
         storage.regions = [(1000, 4096), (10000, 4096)]
         storage.connection_indices = (2, 5)
+        storage.connection_router = SimpleNamespace(select=lambda key: (2, 5)[key % 2])
         storage._task_ids = itertools.count(1)
         trace = []
 

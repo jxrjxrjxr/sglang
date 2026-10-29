@@ -390,7 +390,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
         if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
-            connections = self.storage.connection_indices
             cache_debug(
                 "LOOKUP",
                 rid=rid,
@@ -398,13 +397,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 local_prefix_pages=end,
                 first_hash=kv.keys[0] if keys else None,
                 first_key=keys[0] if keys else None,
-                first_connection=connections[keys[0] % len(connections)]
-                if keys
-                else None,
                 first_miss_key=keys[end] if end < len(keys) else None,
-                miss_connection=connections[keys[end] % len(connections)]
-                if end < len(keys)
-                else None,
             )
         trace_event(
             "LOOKUP",
