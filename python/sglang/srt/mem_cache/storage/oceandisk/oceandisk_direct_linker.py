@@ -355,6 +355,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self._put_activity["tasks"] += 1
             self._put_activity["pages"] += pages
 
+    def pending_offload_tasks(self):
+        """Queued or active PUT sessions not yet confirmed complete."""
+        with self._put_progress_lock:
+            return len(self._pending_puts)
+
     def _put_finished(self, task_id, success):
         if not self.offload_owner:
             return
@@ -387,14 +392,24 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
+        debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
+        pending_at_lookup = self.pending_offload_tasks()
         bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
-        if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
+        logger.info(
+            "[OceanDisk LOOKUP] rid=%s pages=%d hit_pages=%d pending_offload_at_lookup=%d",
+            rid,
+            len(keys),
+            end,
+            pending_at_lookup,
+        )
+        if debug_cache:
             cache_debug(
                 "LOOKUP",
                 rid=rid,
                 pages=len(keys),
                 local_prefix_pages=end,
+                pending_offload_at_lookup=pending_at_lookup,
                 first_hash=kv.keys[0] if keys else None,
                 first_key=keys[0] if keys else None,
                 first_miss_key=keys[end] if end < len(keys) else None,

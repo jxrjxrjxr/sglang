@@ -685,6 +685,12 @@ class SchedulerMetricsReporter:
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
+        wrapper = getattr(self.scheduler.tree_cache, "linker", None)
+        backend = getattr(wrapper, "cache_linker", None)
+        pending_offloads = getattr(backend, "pending_offload_tasks", None)
+        if pending_offloads is not None:
+            msg += f"#pending-offload: {pending_offloads()}, "
+
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (
