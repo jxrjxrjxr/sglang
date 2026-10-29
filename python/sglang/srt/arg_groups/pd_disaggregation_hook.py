@@ -43,6 +43,35 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    if cfg.disaggregation_decode_linker_load:
+        requirements = {
+            "--disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+            "--disaggregation-transfer-backend mooncake": (
+                cfg.disaggregation_transfer_backend == "mooncake"
+            ),
+            "--enable-unified-cache-external-linker": cfg.enable_unified_cache_external_linker,
+            # Completion is read from OceanDisk's per-layer counter futures.
+            "--unified-cache-external-linker-backend oceandisk": (
+                cfg.unified_cache_external_linker_backend == "oceandisk"
+            ),
+            "--disaggregation-decode-enable-radix-cache": cfg.disaggregation_decode_enable_radix_cache,
+            "pp-size=1": cfg.pp_size == 1,
+            "no DP attention": not resolved_view(server_args).enable_dp_attention,
+            "no hierarchical cache": not cfg.enable_hierarchical_cache,
+            "no host_pool retraction backup": cfg.disaggregation_decode_retraction_backup
+            != "host_pool",
+            "no staging": not envs.SGLANG_DISAGG_STAGING_BUFFER.get(),
+            "RDMA tail >= -1": envs.SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS.get()
+            >= -1,
+            "probe interval >= 0": envs.SGLANG_DISAGGREGATION_LINKER_PROBE_INTERVAL.get()
+            >= 0,
+        }
+        for requirement, satisfied in requirements.items():
+            if not satisfied:
+                raise ValueError(
+                    f"--disaggregation-decode-linker-load requires {requirement}."
+                )
+
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "

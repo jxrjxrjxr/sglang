@@ -691,6 +691,9 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_LINKER_PROBE_INTERVAL = EnvFloat(0.01)
+    # -1 uses decode's chunked_prefill_size; 0 leaves only the uncacheable tail.
+    SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS = EnvInt(-1)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
