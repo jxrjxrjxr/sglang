@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future
 from queue import PriorityQueue
 from dataclasses import dataclass
@@ -211,6 +212,7 @@ class OceanDiskStorage(HiCacheStorage):
             "extra_config" if "connection_indices" in config else "gids_config_all"
         )
         self._closed = False
+        self._debug_put_history = OrderedDict()
         self._io_queue = PriorityQueue()
         self._io_sequence = itertools.count()
         self._io_thread = threading.Thread(
@@ -415,7 +417,58 @@ class OceanDiskStorage(HiCacheStorage):
                     f"OceanDisk batch exist returned invalid prefix length "
                     f"{prefix_hits!r} for {len(keys)} keys."
                 )
+        if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1" and prefix_hits < len(
+            keys
+        ):
+            key = keys[prefix_hits]
+            conn = connections[prefix_hits]
+            put_record = self._debug_put_history.get(key)
+            try:
+                probe = torch.tensor(
+                    [next(self._task_ids), key, conn],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                single_hit = self._ops.kvcache_exist(probe, self._output)
+            except Exception as error:
+                single_hit = repr(error)
+            finally:
+                query_stream.synchronize()
+            logger.info(
+                "[OceanDisk miss probe] pid=%d device=%s key=%d page_index=%d "
+                "query_conn=%d query_endpoint=%s single_hit=%s "
+                "put_record=%s history_limit=100000 "
+                "put_record_fields=(state,conn,endpoint,task,layers)",
+                os.getpid(),
+                self.device,
+                key,
+                prefix_hits,
+                conn,
+                self.connection_router.endpoints[conn],
+                single_hit,
+                put_record,
+            )
         return [True] * prefix_hits + [False] * (len(keys) - prefix_hits)
+
+    def _debug_record_put(self, descriptors, state):
+        if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") != "1":
+            return
+        for batch in descriptors:
+            row = batch[0]
+            count = (len(row) - 1) // 6
+            for i in range(count // 2):
+                key = row[1 + count + i]
+                conn = row[1 + 5 * count + i]
+                self._debug_put_history[key] = (
+                    state,
+                    conn,
+                    self.connection_router.endpoints[conn],
+                    row[0],
+                    len(batch),
+                )
+                self._debug_put_history.move_to_end(key)
+                if len(self._debug_put_history) > 100000:
+                    self._debug_put_history.popitem(last=False)
 
     def _pack_layer_batches(self, layers, max_ranges):
         if type(max_ranges) is not int or not 2 <= max_ranges <= MAX_GIDS_RANGES:
@@ -593,6 +646,7 @@ class OceanDiskStorage(HiCacheStorage):
         ):
             self._ensure_open()
             descriptors = self._pack_layer_batches(layers, max_ranges)
+            self._debug_record_put(descriptors, "submitted")
             submitted = []
             trace_event(
                 "PUT_BEGIN",
@@ -645,6 +699,7 @@ class OceanDiskStorage(HiCacheStorage):
                 event = torch.cuda.Event()
                 event.record(self._put_stream)
                 event.synchronize()
+                self._debug_record_put(descriptors, "completed")
                 trace_event(
                     "PUT_DONE",
                     layers=len(layers),
@@ -652,6 +707,7 @@ class OceanDiskStorage(HiCacheStorage):
                     per_io_status_checked=False,
                 )
             except BaseException:
+                self._debug_record_put(descriptors, "failed")
                 self._put_stream.synchronize()
                 raise
 
