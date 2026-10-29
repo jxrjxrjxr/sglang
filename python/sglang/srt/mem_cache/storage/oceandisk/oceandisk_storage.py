@@ -209,6 +209,7 @@ class OceanDiskStorage(HiCacheStorage):
             "extra_config" if "connection_indices" in config else "gids_config_all"
         )
         self._closed = False
+        # Serialize native GET/PUT/EXISTS through GPU completion.
         self._lock = threading.Lock()
         self._task_ids = itertools.count(1)
 
@@ -488,31 +489,35 @@ class OceanDiskStorage(HiCacheStorage):
                         od_utils,
                     )
                 for layer in range(len(layers)):
-                    for cpu, gpu, events in submitted:
-                        # Slice both metadata tensors and use local layer 0:
-                        # the native wrapper indexes GPU rows and CPU task IDs
-                        # differently when start_layer is nonzero.
-                        step = time.perf_counter()
-                        od_utils.batch_dispatch_get(
-                            gpu[layer : layer + 1],
-                            gpu.shape[1],
-                            cpu[layer : layer + 1],
-                            self._output,
-                            [events[layer].cuda_event],
-                            self._get_stream.stream_id,
-                            self.device.index,
-                            0,
-                            1,
-                            True,
-                            False,
-                        )
-                        native_times.append((time.perf_counter() - step) * 1000)
-                    # A layer is usable only after every I/O batch containing
-                    # its paired KV/Indexer fragments has completed.
-                    step = time.perf_counter()
-                    for _, _, events in submitted:
-                        events[layer].synchronize()
-                    event_wait_ms += (time.perf_counter() - step) * 1000
+                    with self._lock:
+                        try:
+                            for cpu, gpu, events in submitted:
+                                # Slice both metadata tensors and use local layer 0:
+                                # the native wrapper indexes GPU rows and CPU task IDs
+                                # differently when start_layer is nonzero.
+                                step = time.perf_counter()
+                                od_utils.batch_dispatch_get(
+                                    gpu[layer : layer + 1],
+                                    gpu.shape[1],
+                                    cpu[layer : layer + 1],
+                                    self._output,
+                                    [events[layer].cuda_event],
+                                    self._get_stream.stream_id,
+                                    self.device.index,
+                                    0,
+                                    1,
+                                    True,
+                                    False,
+                                )
+                                native_times.append((time.perf_counter() - step) * 1000)
+                            # A layer is usable only after every I/O batch containing
+                            # its paired KV/Indexer fragments has completed.
+                            step = time.perf_counter()
+                            for _, _, events in submitted:
+                                events[layer].synchronize()
+                            event_wait_ms += (time.perf_counter() - step) * 1000
+                        finally:
+                            self._get_stream.synchronize()
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
                     if on_layer_ready is not None:
@@ -545,6 +550,7 @@ class OceanDiskStorage(HiCacheStorage):
 
         torch = self._torch
         with (
+            self._lock,
             torch.cuda.device(self.device),
             torch.cuda.stream(self._put_stream),
         ):
@@ -655,25 +661,30 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            self._put_stream.wait_event(ready_event)
-            for cpu, gpu, lengths, indices in prepared:
-                call_start = time.perf_counter()
-                od_utils.batch_dispatch_put(
-                    gpu,
-                    lengths,
-                    indices,
-                    cpu,
-                    self._output,
-                    [],
-                    self._put_stream.stream_id,
-                    self.device.index,
-                    0,
-                    1,
-                    False,
-                    False,
-                )
-                call_ms = (time.perf_counter() - call_start) * 1000
-                call_times.append(call_ms)
+            # Wait before taking the I/O lock: computation may need a GET.
+            ready_event.synchronize()
+            with self._lock:
+                try:
+                    for cpu, gpu, lengths, indices in prepared:
+                        call_start = time.perf_counter()
+                        od_utils.batch_dispatch_put(
+                            gpu,
+                            lengths,
+                            indices,
+                            cpu,
+                            self._output,
+                            [],
+                            self._put_stream.stream_id,
+                            self.device.index,
+                            0,
+                            1,
+                            False,
+                            False,
+                        )
+                        call_ms = (time.perf_counter() - call_start) * 1000
+                        call_times.append(call_ms)
+                finally:
+                    self._put_stream.synchronize()
             trace_event("PUT_LAYER_SUBMITTED", layer=layer, batches=len(prepared))
         return call_times
 
