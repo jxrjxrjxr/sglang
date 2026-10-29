@@ -1018,7 +1018,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker.layer_done_counter.set_consumer(index)
         linker._run_transfers = Mock(side_effect=RuntimeError("injected get failure"))
         event = Mock()
-        linker.load_queue.put((index, {"req": []}, event))
+        linker.load_queue.put((index, {"req": []}, event, 0.0))
         linker.load_queue.put(None)
         with patch("torch.cuda.device", return_value=nullcontext()):
             linker._load_worker()
@@ -1057,7 +1057,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         linker.offload_results = Queue()
         linker.device = "cuda:0"
         linker.storage.prepare_layerwise_put.return_value = [["layer0"], ["layer1"]]
-        session = LayerwiseSaveSession(linker, [[], []], [7, 8])
+        session = LayerwiseSaveSession(linker, lambda timings: [[], []], [7, 8])
         linker.get_layerwise_receipts.return_value = [session.completion]
         return linker, session
 
@@ -1073,24 +1073,20 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
             linker.storage.record_save_event.assert_not_called()
             on_submitted.assert_not_called()
             self.assertFalse(session.completion.done())
-        self.assertEqual(
-            [call[0] for call in linker.storage.method_calls],
-            [
-                "prepare_layerwise_put",
-            ],
-        )
+        linker.storage.prepare_layerwise_put.assert_not_called()
         self.assertFalse(
             any(r.done() and r.result() for r in linker._layerwise_receipts.values())
         )
         self.assertEqual(linker._layerwise_pending_keys, {7, 8})
         on_submitted.assert_called_once()
-        self.assertIsNotNone(session.prepared)
+        self.assertIsNone(session.prepared)
         session.release_source.assert_not_called()
         self.assertIsNone(session.finish_event)
         self.run_worker(linker)
         self.assertEqual(linker.storage.submit_put_layer.call_count, 2)
         session.finish_event.synchronize.assert_called_once()
         self.assertTrue(session.completion.result())
+
         self.assertEqual(set(linker._layerwise_receipts), {7, 8})
         self.assertEqual(linker._layerwise_pending_keys, {7, 8})
         release = session.release_source
@@ -1098,6 +1094,21 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         release.assert_called_once()
         self.assertFalse(linker._layerwise_pending_keys)
         self.assertIsNone(session.prepared)
+
+    def test_background_preparation_failure_skips_put_and_reports_failure(self):
+        linker, session = self.make_session()
+        session.prepare_layers = Mock(side_effect=RuntimeError("prepare failed"))
+        session.release_source = Mock()
+        with session:
+            session.save_layer(0)
+            session.save_layer(1)
+        session.prepare_layers.assert_not_called()
+        self.run_worker(linker)
+        linker.storage.submit_put_layer.assert_not_called()
+        self.assertFalse(session.completion.result())
+        session.release_source.assert_not_called()
+        session.finish(False)
+        self.assertFalse(linker._layerwise_pending_keys)
 
     @staticmethod
     def run_worker(linker):
@@ -1199,7 +1210,8 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
                         [session.completion],
                     )
                 if owner:
-                    layers = linker.storage.prepare_layerwise_put.call_args.args[0]
+                    linker.storage.prepare_layerwise_put.assert_not_called()
+                    layers = session.prepare_layers({})
                     for layer_index, ranges in enumerate(layers):
                         expected = []
                         for pool in (PoolName.KV, PoolName.INDEXER):
@@ -1242,7 +1254,8 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertEqual(session.keys, [new_key])
         self.assertIs(linker._layerwise_receipts[pending_key], old_receipt)
         self.assertIs(linker._layerwise_receipts[new_key], session.completion)
-        for ranges in linker.storage.prepare_layerwise_put.call_args.args[0]:
+        linker.storage.prepare_layerwise_put.assert_not_called()
+        for ranges in session.prepare_layers({}):
             self.assertEqual([r.key for r in ranges], [new_key, new_key])
 
     def test_non_owner_skips_all_pool_address_and_io_preparation(self):
