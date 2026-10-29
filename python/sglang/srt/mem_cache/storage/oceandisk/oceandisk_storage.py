@@ -182,8 +182,8 @@ class OceanDiskStorage(HiCacheStorage):
         device: torch.device,
         buffers: list[torch.Tensor],
     ):
-        connections = config.get("connection_indices", [0])
-        if (
+        connections = config.get("connection_indices", [])
+        if "connection_indices" in config and (
             not isinstance(connections, list)
             or not connections
             or any(
@@ -196,6 +196,9 @@ class OceanDiskStorage(HiCacheStorage):
                 "OceanDisk connection_indices must be distinct integers in [0, 7]."
             )
         self.connection_indices = tuple(connections)
+        connection_source = (
+            "extra_config" if "connection_indices" in config else "gids_config_all"
+        )
         self._closed = False
         self._lock = threading.Lock()
         self._task_ids = itertools.count(1)
@@ -246,6 +249,8 @@ class OceanDiskStorage(HiCacheStorage):
             os.environ["GIDS_DIR"], device_index, os.environ.get("USE_SINGLE_PORT")
         )
         connection_count = read_connection_count(config_path)
+        if "connection_indices" not in config:
+            self.connection_indices = tuple(range(connection_count))
         if any(index >= connection_count for index in self.connection_indices):
             raise ValueError(
                 f"OceanDisk connection_indices refer outside {connection_count} connections "
@@ -290,6 +295,15 @@ class OceanDiskStorage(HiCacheStorage):
             self._check_status(status, "init")
             self._put_stream.wait_stream(self._get_stream)
             logger.info(
+                "[OceanDisk connections] device=%s config=%s configured_count=%d "
+                "selected=%s source=%s routing=key_modulo",
+                self.device,
+                config_path,
+                connection_count,
+                self.connection_indices,
+                connection_source,
+            )
+            logger.info(
                 "[OceanDisk streams] device=%s get=%s put=%s",
                 self.device,
                 self._get_stream.stream_id,
@@ -329,6 +343,17 @@ class OceanDiskStorage(HiCacheStorage):
                 self.connection_indices[key % len(self.connection_indices)]
                 for key in keys
             ]
+            if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
+                logger.info(
+                    "[OceanDisk connection usage] pid=%d device=%s keys=%d counts=%s",
+                    os.getpid(),
+                    self.device,
+                    len(keys),
+                    {
+                        index: connections.count(index)
+                        for index in self.connection_indices
+                    },
+                )
             metadata = torch.tensor(
                 [next(self._task_ids), *keys, *connections],
                 dtype=torch.int64,

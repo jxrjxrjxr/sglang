@@ -80,7 +80,10 @@ class LayerwiseSaveSession:
         self.next_layer += 1
 
     def __exit__(self, exc_type, exc, tb):
-        if self.linker.offload_owner:
+        if (
+            self.linker.offload_owner
+            and os.environ.get("SGLANG_OCEANDISK_TRACE") == "1"
+        ):
             logger.info(
                 "[OceanDisk timing] phase=%s pages=%d prepare_cpu_ms=%.3f "
                 "forward_scope_cpu_ms=%.3f hook_cpu_ms=%.3f prepare_parts_ms=%s",
@@ -677,18 +680,19 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                 task.finish_event.synchronize()
                                 wait_ms = (time.perf_counter() - wait_start) * 1000
                                 calls = task.native_call_times
-                                logger.info(
-                                    "[OceanDisk PUT timing] phase=%s pages=%d calls=%d "
-                                    "native_total_ms=%.3f native_min_ms=%.3f "
-                                    "native_max_ms=%.3f final_event_wait_ms=%.3f",
-                                    task.phase,
-                                    len(task.keys),
-                                    len(calls),
-                                    sum(calls),
-                                    min(calls, default=0.0),
-                                    max(calls, default=0.0),
-                                    wait_ms,
-                                )
+                                if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
+                                    logger.info(
+                                        "[OceanDisk PUT timing] phase=%s pages=%d calls=%d "
+                                        "native_total_ms=%.3f native_min_ms=%.3f "
+                                        "native_max_ms=%.3f final_event_wait_ms=%.3f",
+                                        task.phase,
+                                        len(task.keys),
+                                        len(calls),
+                                        sum(calls),
+                                        min(calls, default=0.0),
+                                        max(calls, default=0.0),
+                                        wait_ms,
+                                    )
                             success = not task.aborted and not task.put_failed
                             if self.offload_owner and success:
                                 trace_event(
