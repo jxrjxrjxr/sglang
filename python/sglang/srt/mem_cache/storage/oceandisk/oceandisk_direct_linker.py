@@ -151,11 +151,20 @@ class LayerWiseLoadCounter:
         futures = self.futures.get(index)
         if futures is None:
             return
+        perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+        wait_start = time.perf_counter() if perf_trace else 0.0
         try:
             futures[threshold].result()
         except BaseException as error:
             raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
         finally:
+            if perf_trace:
+                logger.info(
+                    "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
+                    index,
+                    threshold,
+                    (time.perf_counter() - wait_start) * 1000,
+                )
             if threshold == self.num_layers - 1:
                 self.futures.pop(index, None)
 
@@ -253,13 +262,17 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self._layerwise_pending_keys = set()
         self._init_put_progress()
         self.layerwise_save_enabled = config.get("layerwise_save", True)
+        # DSA interleave gathers both caches before the per-layer save hook.
+        # Reuse the shared namespace and CP0 writer selected above; planning
+        # uses the full ScheduleBatch token history and request-to-slot map.
         if self.layerwise_save_enabled and (
             params.pp_size != 1
-            or params.attn_cp_size != 1
+            or (params.attn_cp_size != 1 and not shared_cp_cache)
             or getattr(server_args, "speculative_algorithm", None)
         ):
             raise ValueError(
-                "OceanDisk layerwise_save requires PP=1, CP=1 and no speculative decoding."
+                "OceanDisk layerwise_save requires PP=1, no speculative decoding, "
+                "and CP=1 or DSA interleave CP with rank-replicated caches."
             )
         self._load_thread = threading.Thread(
             target=self._load_worker, daemon=True, name=f"oceandisk-load-tp{tp_rank}"
