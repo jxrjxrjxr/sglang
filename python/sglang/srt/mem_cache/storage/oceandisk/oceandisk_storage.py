@@ -350,10 +350,9 @@ class OceanDiskStorage(HiCacheStorage):
                     self._torch.cuda.device(self.device),
                     self._torch.cuda.stream(stream),
                 ):
-                    try:
-                        result = operation()
-                    finally:
-                        stream.synchronize()
+                    # Native calls synchronize internally; GET/PUT callers
+                    # retain their completion events, as in the controller.
+                    result = operation()
                 completion.set_result(result)
             except BaseException as error:
                 completion.set_exception(error)
