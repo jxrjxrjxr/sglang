@@ -13,7 +13,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import Future
-from queue import PriorityQueue
+from queue import Queue
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -213,8 +213,7 @@ class OceanDiskStorage(HiCacheStorage):
         )
         self._closed = False
         self._debug_put_history = OrderedDict()
-        self._io_queue = PriorityQueue()
-        self._io_sequence = itertools.count()
+        self._io_queue = Queue()
         self._io_thread = threading.Thread(
             target=self._io_worker, daemon=True, name="oceandisk-native-io"
         )
@@ -342,7 +341,7 @@ class OceanDiskStorage(HiCacheStorage):
 
     def _io_worker(self):
         while True:
-            _, _, operation, stream, completion = self._io_queue.get()
+            operation, stream, completion = self._io_queue.get()
             if operation is None:
                 completion.set_result(None)
                 return
@@ -359,12 +358,10 @@ class OceanDiskStorage(HiCacheStorage):
             except BaseException as error:
                 completion.set_exception(error)
 
-    def _run_io(self, operation, stream, priority):
+    def _run_io(self, operation, stream):
         self._ensure_open()
         completion = Future()
-        self._io_queue.put(
-            (priority, next(self._io_sequence), operation, stream, completion)
-        )
+        self._io_queue.put((operation, stream, completion))
         return completion.result()
 
     @staticmethod
@@ -375,7 +372,7 @@ class OceanDiskStorage(HiCacheStorage):
     def exists_many(self, keys: list[int]) -> list[bool]:
         with self._torch.cuda.device(self.device):
             stream = self._torch.cuda.current_stream(self.device)
-        return self._run_io(lambda: self._exists_many(keys), stream, 0)
+        return self._run_io(lambda: self._exists_many(keys), stream)
 
     def _exists_many(self, keys: list[int]) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
@@ -600,7 +597,6 @@ class OceanDiskStorage(HiCacheStorage):
                                 False,
                             ),
                             self._get_stream,
-                            1,
                         )
                         native_times.append((time.perf_counter() - step) * 1000)
                     # A layer is usable only after every I/O batch containing
@@ -663,7 +659,12 @@ class OceanDiskStorage(HiCacheStorage):
                     indices = torch.tensor(
                         list(range(len(batch))), dtype=torch.int64, device="cpu"
                     )
-                    submitted.append((cpu, gpu, lengths, indices))
+                    # Materialize CUDA handles; the native wrapper records
+                    # each event again after the corresponding layer PUT.
+                    events = [torch.cuda.Event() for _ in layers]
+                    for event in events:
+                        event.record(self._put_stream)
+                    submitted.append((cpu, gpu, lengths, indices, events))
                     trace_batch(
                         "NATIVE_PUT_CALL",
                         batch,
@@ -671,34 +672,32 @@ class OceanDiskStorage(HiCacheStorage):
                         len(descriptors),
                         od_utils,
                     )
-                    for layer in range(len(layers)):
-                        result = self._run_io(
-                            lambda: od_utils.batch_dispatch_put(
-                                gpu[layer : layer + 1],
-                                lengths[layer : layer + 1],
-                                indices[:1],
-                                cpu[layer : layer + 1],
-                                self._output,
-                                [],
-                                self._put_stream.stream_id,
-                                self.device.index,
-                                0,
-                                1,
-                                False,
-                                False,
-                            ),
-                            self._put_stream,
-                            2,
-                        )
+                    result = self._run_io(
+                        lambda: od_utils.batch_dispatch_put(
+                            gpu,
+                            lengths,
+                            indices,
+                            cpu,
+                            self._output,
+                            [event.cuda_event for event in events],
+                            self._put_stream.stream_id,
+                            self.device.index,
+                            0,
+                            len(layers),
+                            True,
+                            False,
+                        ),
+                        self._put_stream,
+                    )
                     trace_event(
                         "NATIVE_PUT_RETURN",
                         batch=batch_index + 1,
                         result=result,
                         per_io_status_checked=False,
                     )
-                event = torch.cuda.Event()
-                event.record(self._put_stream)
-                event.synchronize()
+                for _, _, _, _, events in submitted:
+                    if events:
+                        events[-1].synchronize()
                 self._debug_record_put(descriptors, "completed")
                 trace_event(
                     "PUT_DONE",
@@ -779,7 +778,6 @@ class OceanDiskStorage(HiCacheStorage):
                         False,
                     ),
                     self._put_stream,
-                    2,
                 )
                 call_ms = (time.perf_counter() - call_start) * 1000
                 call_times.append(call_ms)
@@ -844,7 +842,7 @@ class OceanDiskStorage(HiCacheStorage):
             return
         # Linker stops its producers before closing Storage. Drain queued work.
         completion = Future()
-        self._io_queue.put((3, next(self._io_sequence), None, None, completion))
+        self._io_queue.put((None, None, completion))
         completion.result()
         self._io_thread.join()
         with self._torch.cuda.device(self.device):
