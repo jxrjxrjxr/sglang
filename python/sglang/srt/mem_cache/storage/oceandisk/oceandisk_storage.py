@@ -370,11 +370,6 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int]) -> list[bool]:
-        with self._torch.cuda.device(self.device):
-            stream = self._torch.cuda.current_stream(self.device)
-        return self._run_io(lambda: self._exists_many(keys), stream)
-
-    def _exists_many(self, keys: list[int]) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
         kvcache_exist returns the contiguous hit prefix in input order, not

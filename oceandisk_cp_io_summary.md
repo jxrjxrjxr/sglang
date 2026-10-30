@@ -52,20 +52,20 @@ flowchart LR
 
 ## 3. I/O 队列：集中调用，按顺序执行
 
-每个 Storage 实例新增一个 `oceandisk-native-io` 后台线程和FIFO 队列，统一执行原生调用。
+每个 Storage 实例新增一个 `oceandisk-native-io` 后台线程和FIFO 队列，顺序执行原生 GET／PUT；EXISTS 在调用线程直接同步执行。
 
 | 操作 | 调度单位 |
 | --- | --- |
-| EXISTS | 一次查询，包括 DEBUG 单 key 复查 |
+| EXISTS | 不进入队列，在调用线程直接同步查询，包括 DEBUG 单 key 复查 |
 | GET | 一层中的一个 metadata 批次 |
 | 普通 PUT | 一个 metadata 批次的全部层 |
 
-三种操作统一按入队顺序执行，没有操作优先级。普通 PUT 每个 metadata 批次一次提交全部层。
+GET／PUT 按入队顺序执行，没有操作优先级。EXISTS 不参与队列排序。普通 PUT 每个 metadata 批次一次提交全部层。
 
 ```mermaid
 flowchart TD
-    S[调度线程：EXISTS] --> Q[Storage FIFO 队列]
-    L[Linker 加载线程：GET] --> Q
+    S[调度线程：EXISTS] --> X[直接调用原生 EXISTS]
+    L[Linker 加载线程：GET] --> Q[Storage FIFO 队列]
     W[Linker 卸载线程：PUT] --> Q
     Q --> I[唯一原生 I/O worker]
     I --> N[执行一个原生调用]
@@ -85,7 +85,7 @@ UC 触发普通 offload
 → 向 UC 返回本批卸载结果
 ```
 
-GET 每层的所有批次完成后才通知该层可用，计算可以继续等待自己的层通知。EXISTS 调用方仍需等待查询结果；正在执行的原生调用无法被优先任务打断，排队的操作按 FIFO 等待。
+GET 每层的所有批次完成后才通知该层可用，计算可以继续等待自己的层通知。EXISTS 调用方直接执行并等待查询结果；正在执行的原生调用无法被优先任务打断，排队的操作按 FIFO 等待。
 
 ## 4. 线程、stream 与完成结果
 
@@ -93,9 +93,9 @@ GET 每层的所有批次完成后才通知该层可用，计算可以继续等�
 
 - GPU 计算使用计算 stream。
 - GET、PUT 保留各自的 stream；原生 EXISTS 内部另有自己的 stream。
-- 本 Storage 的原生调用由一个 worker 顺序执行，避免进程内交叠。
+- 本 Storage 的原生 GET／PUT 由一个 worker 顺序执行；直接执行的 EXISTS 可与它们交叠。
 - 不同 GPU 进程仍能并发调用 GIDS；这是依赖各进程独立连接资源的正常工作方式。
-- 队列取代了覆盖整批 PUT 的共享锁，但原生 I/O 仍顺序执行。
+- 队列取代了覆盖整批 PUT 的共享锁，GET／PUT 顺序执行，查询独立执行。
 
 非 owner 可以先返回本地跳过结果；UC 原有逻辑跨 attention TP／CP 组汇总完成数量与成功状态，随后更新树节点、解除保护，不需要新增跨 rank 的后台线程 collective。
 
@@ -105,7 +105,7 @@ GET 每层的所有批次完成后才通知该层可用，计算可以继续等�
 | --- | --- | --- |
 | MLA 保存 | 全 TP rank0 实际保存 | DSA interleave 共享 CP 模式选 CP0／attention TP0 |
 | CP 副本 | 直接使用 page hash 的共享存储思路 | 各 CP 使用相同的编码 key |
-| 原生提交 | 公共队列中的 GET／PUT 由一个 worker 处理 | EXISTS／GET／PUT 都进入统一 worker |
+| 原生提交 | 公共队列中的 GET／PUT 由一个 worker 处理 | GET／PUT 进入统一 worker，EXISTS 直接同步调用 |
 | 调度顺序 | 公共队列按入队顺序 | 按入队顺序 |
 | 普通 PUT | 可以一次原生调用提交多层 | 每批一次提交全部层，批次间允许其他操作进入 |
 
@@ -113,7 +113,7 @@ GET 每层的所有批次完成后才通知该层可用，计算可以继续等�
 
 ## 6. 仍需验证的边界
 
-1. 普通 PUT 已恢复每批一次提交全部层，同进程查询不会插入该批层间。完成 event 传入原生包装，由包装逐层记录；后台等待每批最后一层 event，再报告整批结果。不同进程仍可并发查询，当前未提供跨进程的整页发布屏障。
+1. 普通 PUT 已恢复每批一次提交全部层，GET／PUT worker 内不会插入其他读写调用，但同进程 EXISTS 可独立并发执行。完成 event 传入原生包装，由包装逐层记录；后台等待每批最后一层 event，再报告整批结果。不同进程仍可并发查询，当前未提供跨进程的整页发布屏障。
 2. CUDA event／stream 完成不等于物理落盘。原生 PUT／GET 会等待远端应答，但持久化语义取决于 GIDS 协议；上层 `completed` 也不能替代完整的原生错误检查。
 3. 用户最新 LLMTest 复测反馈：启用 CP0 单份保存、各 CP 共享 key 后，未再出现此前部分用户命中不足或不命中的现象。本次实测支持该改造有效；具体失败根因及更多负载下的稳定性仍未完全确认。
 4. 新共享模式测试建议使用新 namespace，避免混用之前按 CP 分别保存的测试数据。
