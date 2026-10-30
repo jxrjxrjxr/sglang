@@ -351,15 +351,23 @@ class OceanDiskStorage(HiCacheStorage):
         if status != 0:
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
-    def exists_many(self, keys: list[int]) -> list[bool]:
+    def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
         # Exclude new PUT submissions until the synchronous query returns.
-        with (
-            self._put_io_lock,
-            self._torch.cuda.device(self.device),
-        ):
-            self._ensure_open()
-            self._put_stream.synchronize()
-            return self._exists_many(keys)
+        with self._torch.cuda.device(self.device):
+            started = time.perf_counter() if timings is not None else 0.0
+            with self._put_io_lock:
+                if timings is not None:
+                    timings["put_lock_ms"] = (time.perf_counter() - started) * 1000
+                self._ensure_open()
+                started = time.perf_counter() if timings is not None else 0.0
+                self._put_stream.synchronize()
+                if timings is not None:
+                    timings["put_sync_ms"] = (time.perf_counter() - started) * 1000
+                started = time.perf_counter() if timings is not None else 0.0
+                result = self._exists_many(keys)
+                if timings is not None:
+                    timings["exists_ms"] = (time.perf_counter() - started) * 1000
+                return result
 
     def _exists_many(self, keys: list[int]) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
