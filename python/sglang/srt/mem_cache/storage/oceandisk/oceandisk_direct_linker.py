@@ -410,22 +410,18 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         keys = [self._object_key(key) for key in kv.keys]
         debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
         perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
-        wait_started = time.perf_counter() if perf_trace else 0.0
-        # Drain queued and active offloads before querying. Do not hold the
-        # Storage PUT lock here: the offload thread needs it to finish.
-        self.offload_queue.join()
-        queue_wait_ms = (time.perf_counter() - wait_started) * 1000 if perf_trace else 0.0
+        # Query without draining queued offloads. Storage excludes PUT only
+        # while synchronizing already-submitted work and executing EXISTS.
         pending_at_lookup = self.pending_offload_tasks()
         if perf_trace:
             timings = {}
             bitmap = self.storage.exists_many(keys, timings=timings)
             logger.info(
                 "[OceanDisk PERF LOOKUP] rid=%s pages=%d "
-                "offload_wait_ms=%.3f put_lock_ms=%.3f "
+                "put_lock_ms=%.3f "
                 "put_sync_ms=%.3f exists_ms=%.3f",
                 rid,
                 len(keys),
-                queue_wait_ms,
                 timings["put_lock_ms"],
                 timings["put_sync_ms"],
                 timings["exists_ms"],
