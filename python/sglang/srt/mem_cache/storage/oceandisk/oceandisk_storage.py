@@ -370,14 +370,20 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int]) -> list[bool]:
+        # Serialize native EXISTS with GET/PUT, retaining the caller's stream
+        # for metadata preparation and the native existence operator.
+        with self._torch.cuda.device(self.device):
+            query_stream = self._torch.cuda.current_stream(self.device)
+        return self._run_io(lambda: self._exists_many(keys), query_stream)
+
+    def _exists_many(self, keys: list[int]) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
         kvcache_exist returns the contiguous hit prefix in input order, not
         individual key statuses. Entries after the first miss remain False.
         """
         torch = self._torch
-        # Match the legacy controller: create metadata and invoke the native
-        # existence operator on the caller's current stream.
+        # The worker selects the stream captured by exists_many().
         with torch.cuda.device(self.device):
             self._ensure_open()
             if not keys:
