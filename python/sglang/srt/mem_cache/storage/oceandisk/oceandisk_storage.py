@@ -344,10 +344,7 @@ class OceanDiskStorage(HiCacheStorage):
             self._torch.cuda.stream(stream),
         ):
             self._ensure_open()
-            try:
-                return operation()
-            finally:
-                stream.synchronize()
+            return operation()
 
     @staticmethod
     def _check_status(status, operation: str) -> None:
