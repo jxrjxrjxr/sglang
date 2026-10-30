@@ -340,6 +340,7 @@ class OceanDiskStorage(HiCacheStorage):
         self._io_thread.start()
 
     def _io_worker(self):
+        finish_event = None
         while True:
             operation, stream, completion = self._io_queue.get()
             if operation is None:
@@ -350,9 +351,15 @@ class OceanDiskStorage(HiCacheStorage):
                     self._torch.cuda.device(self.device),
                     self._torch.cuda.stream(stream),
                 ):
-                    # Native calls synchronize internally; GET/PUT callers
-                    # retain their completion events, as in the controller.
-                    result = operation()
+                    if finish_event is None:
+                        finish_event = self._torch.cuda.Event()
+                    try:
+                        result = operation()
+                    finally:
+                        # Confirm this operation's stream work before the next
+                        # native call. Reuse only after the event completes.
+                        finish_event.record(stream)
+                        finish_event.synchronize()
                 completion.set_result(result)
             except BaseException as error:
                 completion.set_exception(error)
@@ -369,20 +376,13 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int]) -> list[bool]:
-        # Serialize native EXISTS with GET/PUT, retaining the caller's stream
-        # for metadata preparation and the native existence operator.
-        with self._torch.cuda.device(self.device):
-            query_stream = self._torch.cuda.current_stream(self.device)
-        return self._run_io(lambda: self._exists_many(keys), query_stream)
-
-    def _exists_many(self, keys: list[int]) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
         kvcache_exist returns the contiguous hit prefix in input order, not
         individual key statuses. Entries after the first miss remain False.
         """
         torch = self._torch
-        # The worker selects the stream captured by exists_many().
+        # Match the controller's synchronous query on the caller's stream.
         with torch.cuda.device(self.device):
             self._ensure_open()
             if not keys:
