@@ -195,7 +195,18 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         replicated = self.pool_group.rank_replicated
-        self.offload_owner = not replicated or tp_rank == 0
+        # Interleave CP materializes full MLA KV and Indexer caches on each
+        # rank. Match the legacy controller: retain one shared remote copy.
+        shared_cp_cache = (
+            replicated
+            and params.attn_cp_size > 1
+            and getattr(server_args, "cp_strategy", None) == "interleave"
+            and getattr(server_args, "attention_backend", None) == "dsa"
+        )
+        storage_cp_rank = 0 if shared_cp_cache else params.attn_cp_rank
+        self.offload_owner = (not replicated or tp_rank == 0) and (
+            not shared_cp_cache or params.attn_cp_rank == 0
+        )
         config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
@@ -217,7 +228,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             tp_size,
             None if replicated else tp_rank,
             params.attn_cp_size,
-            params.attn_cp_rank,
+            storage_cp_rank,
             params.pp_size,
             params.pp_rank,
         )
@@ -261,11 +272,16 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self._load_thread.start()
         self._offload_thread.start()
         logger.info(
-            "OceanDisk direct linker: tp=%d/%d replicated=%s owner=%s pools=%s",
+            "OceanDisk direct linker: tp=%d/%d replicated=%s owner=%s "
+            "cp=%d/%d shared_cp_cache=%s storage_cp_rank=%d pools=%s",
             tp_rank,
             tp_size,
             replicated,
             self.offload_owner,
+            params.attn_cp_rank,
+            params.attn_cp_size,
+            shared_cp_cache,
+            storage_cp_rank,
             list(self.pools),
         )
         trace_event(
