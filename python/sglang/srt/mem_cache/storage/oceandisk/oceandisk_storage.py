@@ -12,8 +12,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import Future
-from queue import Queue
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -213,10 +212,7 @@ class OceanDiskStorage(HiCacheStorage):
         )
         self._closed = False
         self._debug_put_history = OrderedDict()
-        self._io_queue = Queue()
-        self._io_thread = threading.Thread(
-            target=self._io_worker, daemon=True, name="oceandisk-native-io"
-        )
+        self._put_io_lock = threading.Lock()
         self._task_ids = itertools.count(1)
 
         import torch
@@ -337,38 +333,21 @@ class OceanDiskStorage(HiCacheStorage):
                 connections=self.connection_indices,
                 registered_regions=len(self.regions),
             )
-        self._io_thread.start()
-
-    def _io_worker(self):
-        finish_event = None
-        while True:
-            operation, stream, completion = self._io_queue.get()
-            if operation is None:
-                completion.set_result(None)
-                return
-            try:
-                with (
-                    self._torch.cuda.device(self.device),
-                    self._torch.cuda.stream(stream),
-                ):
-                    if finish_event is None:
-                        finish_event = self._torch.cuda.Event()
-                    try:
-                        result = operation()
-                    finally:
-                        # Confirm this operation's stream work before the next
-                        # native call. Reuse only after the event completes.
-                        finish_event.record(stream)
-                        finish_event.synchronize()
-                completion.set_result(result)
-            except BaseException as error:
-                completion.set_exception(error)
 
     def _run_io(self, operation, stream):
-        self._ensure_open()
-        completion = Future()
-        self._io_queue.put((operation, stream, completion))
-        return completion.result()
+        # Scheduler layer waits finish GET before the next lookup. Only
+        # background PUT needs exclusion against synchronous EXISTS.
+        io_lock = self._put_io_lock if stream is self._put_stream else nullcontext()
+        with (
+            io_lock,
+            self._torch.cuda.device(self.device),
+            self._torch.cuda.stream(stream),
+        ):
+            self._ensure_open()
+            try:
+                return operation()
+            finally:
+                stream.synchronize()
 
     @staticmethod
     def _check_status(status, operation: str) -> None:
@@ -376,18 +355,27 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int]) -> list[bool]:
+        # Exclude new PUT submissions until the synchronous query returns.
+        with (
+            self._put_io_lock,
+            self._torch.cuda.device(self.device),
+        ):
+            self._ensure_open()
+            self._put_stream.synchronize()
+            return self._exists_many(keys)
+
+    def _exists_many(self, keys: list[int]) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
         kvcache_exist returns the contiguous hit prefix in input order, not
         individual key statuses. Entries after the first miss remain False.
         """
         torch = self._torch
-        # Match the controller's synchronous query on the caller's stream.
+        # Metadata uses the querying thread's current stream.
         with torch.cuda.device(self.device):
             self._ensure_open()
             if not keys:
                 return []
-            query_stream = torch.cuda.current_stream(self.device)
             connections = [self.connection_router.select(key) for key in keys]
             if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
                 logger.info(
@@ -405,10 +393,7 @@ class OceanDiskStorage(HiCacheStorage):
                 dtype=torch.int64,
                 device=self.device,
             )
-            try:
-                prefix_hits = self._ops.kvcache_exist(metadata, self._output)
-            finally:
-                query_stream.synchronize()
+            prefix_hits = self._ops.kvcache_exist(metadata, self._output)
             if not isinstance(prefix_hits, int) or not 0 <= prefix_hits <= len(keys):
                 raise RuntimeError(
                     f"OceanDisk batch exist returned invalid prefix length "
@@ -429,8 +414,6 @@ class OceanDiskStorage(HiCacheStorage):
                 single_hit = self._ops.kvcache_exist(probe, self._output)
             except Exception as error:
                 single_hit = repr(error)
-            finally:
-                query_stream.synchronize()
             logger.info(
                 "[OceanDisk miss probe] pid=%d device=%s key=%d page_index=%d "
                 "query_conn=%d query_endpoint=%s single_hit=%s "
@@ -758,7 +741,7 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            # Wait before taking the I/O lock: computation may need a GET.
+            # Wait before taking the PUT lock; do not hold up EXISTS for compute.
             ready_event.synchronize()
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
@@ -840,13 +823,12 @@ class OceanDiskStorage(HiCacheStorage):
     def close(self) -> None:
         if self._closed:
             return
-        # Linker stops its producers before closing Storage. Drain queued work.
-        completion = Future()
-        self._io_queue.put((None, None, completion))
-        completion.result()
-        self._io_thread.join()
-        with self._torch.cuda.device(self.device):
+        # Linker stops and joins its producers before closing Storage.
+        with (
+            self._put_io_lock,
+            self._torch.cuda.device(self.device),
+        ):
             self._get_stream.synchronize()
             self._put_stream.synchronize()
-        self._closed = True
+            self._closed = True
         # GIDS exposes no deregistration operation; retain registered buffers.

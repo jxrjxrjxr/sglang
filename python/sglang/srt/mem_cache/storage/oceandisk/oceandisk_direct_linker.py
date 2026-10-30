@@ -409,6 +409,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
         debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
+        # Wait for both queued and active offloads before querying storage.
+        # Do this before Storage's submission lock so workers can finish.
+        self.offload_queue.join()
         pending_at_lookup = self.pending_offload_tasks()
         bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
