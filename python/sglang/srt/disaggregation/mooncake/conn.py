@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mooncake.transfer_monitor import TransferMonitor
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -224,7 +225,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
         self.enable_trace = get_observability().enable_trace
+        self.transfer_monitor = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            trace = envs.SGLANG_MOONCAKE_TRANSFER_TRACE.get()
+            warn_after = envs.SGLANG_MOONCAKE_TRANSFER_WARN_SECONDS.get()
+            timeout = envs.SGLANG_MOONCAKE_TRANSFER_TIMEOUT_SECONDS.get()
+            fail_fast = envs.SGLANG_MOONCAKE_TRANSFER_FAIL_FAST.get()
+            if trace or warn_after > 0 or timeout > 0 or fail_fast:
+                self.transfer_monitor = TransferMonitor(
+                    self.kv_args.engine_rank, trace, warn_after, timeout, fail_fast
+                )
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
@@ -1395,7 +1405,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        kv_chunk: Optional[TransferKVChunk] = None,
     ):
+        monitor = (
+            getattr(self, "transfer_monitor", None) if kv_chunk is not None else None
+        )
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
@@ -1404,6 +1418,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             if indices is None:
                 continue
+            if monitor is not None:
+                monitor.start(
+                    kv_chunk, f"STATE/{st.value}", req.mooncake_session_id, len(indices)
+                )
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
             src_dim_per_tensor = (
@@ -1572,6 +1590,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         ),
                         local_tp_rank_in_group=local_tp_rank_in_group,
                     ):
+                        if monitor is not None:
+                            monitor.end(kv_chunk, "skipped")
                         continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
@@ -1580,6 +1600,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and len(src_indices) == 0
                     and len(dst_indices_local) == 0
                 ):
+                    if monitor is not None:
+                        monitor.end(kv_chunk, "skipped")
                     continue
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
@@ -1658,6 +1680,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     or rc
                 )
+            if monitor is not None:
+                monitor.end(kv_chunk, rc)
         return rc
 
     def _send_slot_state(
@@ -1843,6 +1867,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
+        monitor = getattr(self, "transfer_monitor", None)
+        kv_chunk = None
         if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
@@ -1853,6 +1879,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if monitor is not None:
+                    monitor.start(kv_chunk, "DEQUEUE")
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1882,6 +1910,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if monitor is not None:
+                        monitor.end(kv_chunk, "skipped")
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -1964,6 +1994,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     ]
                                 )
 
+                        if monitor is not None:
+                            monitor.start(kv_chunk, "KV", req.mooncake_session_id)
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
@@ -2051,6 +2083,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 executor,
                                 target_rank_registration_info.dst_kv_layer_ids,
                             )
+                        if monitor is not None:
+                            monitor.end(kv_chunk, ret)
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -2076,6 +2110,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    kv_chunk=kv_chunk,
                                 )
                                 if state_rc != 0:
                                     with self.session_lock:
@@ -2096,17 +2131,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data
+                            if monitor is not None:
+                                monitor.start(
+                                    kv_chunk, "AUX", req.mooncake_session_id, 0
+                                )
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if monitor is not None:
+                                monitor.end(kv_chunk, ret)
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                if monitor is not None:
+                                    monitor.start(
+                                        kv_chunk, "CONCLUDE", req.mooncake_session_id, 0
+                                    )
                                 self.conclude_transfer(
                                     bootstrap_room=req.room,
                                     status=status,
@@ -2140,6 +2185,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
+                if monitor is not None:
+                    monitor.end(kv_chunk)
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
@@ -2171,6 +2218,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
+                if monitor is not None:
+                    monitor.failed(kv_chunk, e)
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -2412,18 +2461,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
         )
+        monitor = getattr(self, "transfer_monitor", None)
+        if monitor is not None:
+            monitor.start(chunk, "QUEUED")
+        self.transfer_queues[shard_idx].put(chunk)
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -2527,6 +2578,16 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
         if should_skip:
             return
+        monitor = getattr(self.kv_mgr, "transfer_monitor", None)
+        if monitor is not None and monitor.trace:
+            logger.info(
+                "[PDXFER] room=%s event=SEND pages=%s cumulative_pages=%s expected_pages=%s last=%s",
+                self.bootstrap_room,
+                len(kv_indices),
+                self.curr_idx,
+                self.num_kv_indices,
+                int(is_last_chunk),
+            )
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
@@ -2551,6 +2612,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
+        monitor = getattr(self.kv_mgr, "transfer_monitor", None)
+        if monitor is not None:
+            monitor.check()
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             # Hold Success until all staging chunks transferred: a deferred

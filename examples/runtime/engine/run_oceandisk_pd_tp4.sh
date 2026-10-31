@@ -15,6 +15,12 @@ set -eu
 # GIDS_DIR 内放 gids_config_0..7.txt（D 用 --base-gpu-id 4，读 4..7）：
 # OPEXTENSION=/path/to/libop_extension.so GIDS_DIR=/path/to/config sh ... check
 
+# Optional P-side diagnostics (all disabled by default):
+# SGLANG_MOONCAKE_TRANSFER_TRACE=1
+# SGLANG_MOONCAKE_TRANSFER_WARN_SECONDS=30
+# SGLANG_MOONCAKE_TRANSFER_TIMEOUT_SECONDS=120
+# SGLANG_MOONCAKE_TRANSFER_FAIL_FAST=1  # stop P on deadline/worker exception
+
 # Edit these paths for your machine.
 MODEL_PATH="${MODEL_PATH:-/home/models/GLM-5.2-W4AFP8/}"
 DATASET_PATH="${DATASET_PATH:-/home/z00591349/dataset/multifieldqa_zh.jsonl}"
@@ -118,13 +124,44 @@ set -- \
 mkdir -p "$LOG_DIR"
 LOG_DIR="$(cd -- "$LOG_DIR" && pwd)"
 printf 'mode=%s backend=%s logs=%s\n' "$mode" "$TRANSFER_BACKEND" "$LOG_DIR"
+# Separate process groups let cleanup also stop scheduler/client children.
+command -v setsid >/dev/null 2>&1 || { echo 'setsid is required' >&2; exit 1; }
 pids=
-trap 'kill $pids 2>/dev/null || true' EXIT
-trap 'exit 130' INT TERM
+client_pid=
+cleanup() {
+    trap '' INT TERM
+    for pid in $pids $client_pid; do kill -TERM "-$pid" 2>/dev/null || true; done
+    alive=
+    for attempt in 1 2 3 4 5; do
+        alive=
+        for pid in $pids $client_pid; do
+            if kill -0 "-$pid" 2>/dev/null; then alive="$alive $pid"; fi
+        done
+        [ -n "$alive" ] || break
+        sleep 1
+    done
+    for pid in $alive; do kill -KILL "-$pid" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+wait_for_client() {
+    while kill -0 "$client_pid" 2>/dev/null; do
+        for pid in $pids; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "Backend pid=$pid exited; stopping experiment (logs: $LOG_DIR)" >&2
+                return 1
+            fi
+        done
+        sleep 1
+    done
+    wait "$client_pid"
+}
 
 # P、D、router 依次启动，前一个就绪后再起后一个，避免 P、D 同时建链互相影响；
 # 等待中任一服务退出时 kill -0 失败，脚本退出并停掉其余服务。
-python3 -m sglang.launch_server "$@" --base-gpu-id 0 --port 31002 \
+setsid python3 -m sglang.launch_server "$@" --base-gpu-id 0 --port 31002 \
     --dist-init-addr 127.0.0.1:31500 --disaggregation-mode prefill \
     --disaggregation-bootstrap-port 31145 > "$LOG_DIR/prefill.log" 2>&1 &
 pids="$pids $!"
@@ -132,7 +169,7 @@ until curl -sf http://127.0.0.1:31002/health >/dev/null; do
     kill -0 $pids
     sleep 10
 done
-python3 -m sglang.launch_server "$@" --base-gpu-id 4 --port 31001 \
+setsid python3 -m sglang.launch_server "$@" --base-gpu-id 4 --port 31001 \
     --dist-init-addr 127.0.0.1:31501 --disaggregation-mode decode \
     --disaggregation-decode-enable-radix-cache $decode_args > "$LOG_DIR/decode.log" 2>&1 &
 pids="$pids $!"
@@ -140,7 +177,7 @@ until curl -sf http://127.0.0.1:31001/health >/dev/null; do
     kill -0 $pids
     sleep 10
 done
-python3 -m sglang_router.launch_router --pd-disaggregation \
+setsid python3 -m sglang_router.launch_router --pd-disaggregation \
     --prefill http://127.0.0.1:31002 31145 --decode http://127.0.0.1:31001 \
     --host 127.0.0.1 --port 31345 > "$LOG_DIR/router.log" 2>&1 &
 pids="$pids $!"
@@ -157,13 +194,17 @@ if [ "$mode" = rounds ]; then
     status=0
     # ROUNDS_ARGS 是以空格分隔的参数列表，不作为 shell 代码执行。
     set -f
-    "${PYTHON_BIN:-python3}" -u run_rounds.py $ROUNDS_ARGS \
+    setsid "${PYTHON_BIN:-python3}" -u run_rounds.py $ROUNDS_ARGS \
         --model "$MODEL_PATH" --base-url http://127.0.0.1:31345 \
         --conversation-dir "$LOG_DIR/conversations" \
-        --output-json "$LOG_DIR/rounds.json" > "$LOG_DIR/rounds.log" 2>&1 || status=$?
+        --output-json "$LOG_DIR/rounds.json" > "$LOG_DIR/rounds.log" 2>&1 &
+    client_pid=$!
+    wait_for_client || status=$?
     cat "$LOG_DIR/rounds.log"
     exit "$status"
 fi
-"${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_pd_tp4.py" "$mode" \
+setsid "${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_pd_tp4.py" "$mode" \
     --model-path "${MODEL_PATH}" \
-    --dataset-path "${DATASET_PATH}" --decode-log "$LOG_DIR/decode.log"
+    --dataset-path "${DATASET_PATH}" --decode-log "$LOG_DIR/decode.log" &
+client_pid=$!
+wait_for_client

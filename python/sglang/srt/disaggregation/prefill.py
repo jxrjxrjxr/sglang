@@ -1295,6 +1295,17 @@ class SchedulerDisaggregationPrefillMixin:
                 base = req.disagg_decode_prefix_len
                 end_idx = base + ((end_idx - base) // grid_tokens) * grid_tokens
 
+        if last_chunk and envs.SGLANG_MOONCAKE_TRANSFER_TRACE.get():
+            logger.info(
+                "[PDXFER] rid=%s room=%s event=FINAL_CHUNK input_tokens=%s prefix_tokens=%s start=%s end=%s skipped=%s",
+                req.rid,
+                req.bootstrap_room,
+                transfer_input_len,
+                req.disagg_decode_prefix_len,
+                start_idx,
+                end_idx,
+                end_idx < start_idx,
+            )
         if end_idx < start_idx:
             logger.debug(
                 "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",

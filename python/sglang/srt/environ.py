@@ -787,6 +787,12 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # Phase logs and deadlines are independent, opt-in diagnostics. Zero disables
+    # a deadline; fail-fast stops the instance, never releases an in-flight room.
+    SGLANG_MOONCAKE_TRANSFER_TRACE = EnvBool(False)
+    SGLANG_MOONCAKE_TRANSFER_WARN_SECONDS = EnvFloat(0.0)
+    SGLANG_MOONCAKE_TRANSFER_TIMEOUT_SECONDS = EnvFloat(0.0)
+    SGLANG_MOONCAKE_TRANSFER_FAIL_FAST = EnvBool(False)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
