@@ -20,6 +20,7 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -387,6 +388,12 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             return result
 
+        perf_match = (
+            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+            and type(self.cache_linker).__module__.endswith("oceandisk_direct_linker")
+            and get_tensor_model_parallel_rank() == 0
+        )
+        lookup_start = time.perf_counter() if perf_match else 0.0
         lookup_transfers = []
         for component in self._components:
             transfer = component.build_external_linker_transfer(
@@ -398,11 +405,25 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        lookup_end = time.perf_counter() if perf_match else 0.0
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
+        if perf_match:
+            logger.info(
+                "[OceanDisk PERF MATCH] rid=%s input_tokens=%d hbm_tokens=%d "
+                "query_pages=%d od_tokens=%d lookup_ms=%.3f rank_sync_ms=%.3f",
+                req.rid,
+                len(key),
+                device_hit_len,
+                len(tail_hashes),
+                hit_pages * page,
+                (lookup_end - lookup_start) * 1000,
+                (time.perf_counter() - lookup_end) * 1000,
+            )
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page

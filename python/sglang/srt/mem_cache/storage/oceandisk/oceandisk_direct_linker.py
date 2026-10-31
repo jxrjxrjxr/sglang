@@ -160,11 +160,12 @@ class LayerWiseLoadCounter:
             raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
         finally:
             if perf_trace:
+                wait_ms = (time.perf_counter() - wait_start) * 1000
                 logger.info(
                     "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
                     index,
                     threshold,
-                    (time.perf_counter() - wait_start) * 1000,
+                    wait_ms,
                 )
             if threshold == self.num_layers - 1:
                 self.futures.pop(index, None)
@@ -417,7 +418,10 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
         debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
-        perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+        perf_trace = (
+            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+            and get_tensor_model_parallel_rank() == 0
+        )
         # Query without draining queued offloads. Storage excludes PUT only
         # while synchronizing already-submitted work and executing EXISTS.
         pending_at_lookup = self.pending_offload_tasks()
@@ -427,23 +431,20 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             logger.info(
                 "[OceanDisk PERF LOOKUP] rid=%s pages=%d "
                 "put_lock_ms=%.3f "
-                "put_sync_ms=%.3f exists_ms=%.3f",
+                "put_sync_ms=%.3f exists_ms=%.3f exists_prepare_ms=%.3f "
+                "exists_native_ms=%.3f probe_ms=%.3f",
                 rid,
                 len(keys),
                 timings["put_lock_ms"],
                 timings["put_sync_ms"],
                 timings["exists_ms"],
+                timings["exists_prepare_ms"],
+                timings["exists_native_ms"],
+                timings["probe_ms"],
             )
         else:
             bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
-        logger.info(
-            "[OceanDisk LOOKUP] rid=%s pages=%d hit_pages=%d pending_offload_at_lookup=%d",
-            rid,
-            len(keys),
-            end,
-            pending_at_lookup,
-        )
         if debug_cache:
             cache_debug(
                 "LOOKUP",

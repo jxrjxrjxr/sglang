@@ -364,12 +364,16 @@ class OceanDiskStorage(HiCacheStorage):
                 if timings is not None:
                     timings["put_sync_ms"] = (time.perf_counter() - started) * 1000
                 started = time.perf_counter() if timings is not None else 0.0
-                result = self._exists_many(keys)
+                result = (
+                    self._exists_many(keys, timings=timings)
+                    if timings is not None
+                    else self._exists_many(keys)
+                )
                 if timings is not None:
                     timings["exists_ms"] = (time.perf_counter() - started) * 1000
                 return result
 
-    def _exists_many(self, keys: list[int]) -> list[bool]:
+    def _exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
         kvcache_exist returns the contiguous hit prefix in input order, not
@@ -379,6 +383,11 @@ class OceanDiskStorage(HiCacheStorage):
         # Metadata uses the querying thread's current stream.
         with torch.cuda.device(self.device):
             self._ensure_open()
+            if timings is not None:
+                timings.update(
+                    exists_prepare_ms=0.0, exists_native_ms=0.0, probe_ms=0.0
+                )
+                prepare_start = time.perf_counter()
             if not keys:
                 return []
             connections = [self.connection_router.select(key) for key in keys]
@@ -398,7 +407,16 @@ class OceanDiskStorage(HiCacheStorage):
                 dtype=torch.int64,
                 device=self.device,
             )
+            if timings is not None:
+                timings["exists_prepare_ms"] = (
+                    time.perf_counter() - prepare_start
+                ) * 1000
+                native_start = time.perf_counter()
             prefix_hits = self._ops.kvcache_exist(metadata, self._output)
+            if timings is not None:
+                timings["exists_native_ms"] = (
+                    time.perf_counter() - native_start
+                ) * 1000
             if not isinstance(prefix_hits, int) or not 0 <= prefix_hits <= len(keys):
                 raise RuntimeError(
                     f"OceanDisk batch exist returned invalid prefix length "
@@ -407,6 +425,7 @@ class OceanDiskStorage(HiCacheStorage):
         if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1" and prefix_hits < len(
             keys
         ):
+            probe_start = time.perf_counter() if timings is not None else 0.0
             key = keys[prefix_hits]
             conn = connections[prefix_hits]
             put_record = self._debug_put_history.get(key)
@@ -433,6 +452,8 @@ class OceanDiskStorage(HiCacheStorage):
                 single_hit,
                 put_record,
             )
+            if timings is not None:
+                timings["probe_ms"] = (time.perf_counter() - probe_start) * 1000
         return [True] * prefix_hits + [False] * (len(keys) - prefix_hits)
 
     def _debug_record_put(self, descriptors, state):
