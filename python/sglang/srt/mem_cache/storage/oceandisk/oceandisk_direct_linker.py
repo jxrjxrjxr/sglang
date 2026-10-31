@@ -12,12 +12,12 @@ from queue import Empty, Queue
 from weakref import WeakValueDictionary
 
 import torch
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
-    MAX_GIDS_RANGES,
     OceanDiskRange,
     OceanDiskStorage,
     encode_key,
@@ -55,9 +55,7 @@ class LayerwiseSaveSession:
         self.prepare_details = {}
         self.hook_cpu_ms = 0.0
         self.prepared = (
-            linker.storage.prepare_layerwise_put(
-                layers, max_ranges=linker.max_ranges, timings=self.prepare_details
-            )
+            linker.storage.prepare_layerwise_put(layers, timings=self.prepare_details)
             if linker.offload_owner
             else None
         )
@@ -80,7 +78,10 @@ class LayerwiseSaveSession:
         self.next_layer += 1
 
     def __exit__(self, exc_type, exc, tb):
-        if self.linker.offload_owner:
+        if (
+            self.linker.offload_owner
+            and os.environ.get("SGLANG_OCEANDISK_TRACE") == "1"
+        ):
             logger.info(
                 "[OceanDisk timing] phase=%s pages=%d prepare_cpu_ms=%.3f "
                 "forward_scope_cpu_ms=%.3f hook_cpu_ms=%.3f prepare_parts_ms=%s",
@@ -148,11 +149,24 @@ class LayerWiseLoadCounter:
         futures = self.futures.get(index)
         if futures is None:
             return
+        perf_trace = (
+            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+            and get_tensor_model_parallel_rank() == 0
+        )
+        wait_start = time.perf_counter() if perf_trace else 0.0
         try:
             futures[threshold].result()
         except BaseException as error:
             raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
         finally:
+            if perf_trace:
+                wait_ms = (time.perf_counter() - wait_start) * 1000
+                logger.info(
+                    "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
+                    index,
+                    threshold,
+                    wait_ms,
+                )
             if threshold == self.num_layers - 1:
                 self.futures.pop(index, None)
 
@@ -192,16 +206,21 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         replicated = self.pool_group.rank_replicated
-        self.offload_owner = not replicated or tp_rank == 0
+        # Interleave CP materializes full MLA KV and Indexer caches on each
+        # rank. Match the legacy controller: retain one shared remote copy.
+        shared_cp_cache = (
+            replicated
+            and params.attn_cp_size > 1
+            and getattr(server_args, "cp_strategy", None) == "interleave"
+            and getattr(server_args, "attention_backend", None) == "dsa"
+        )
+        storage_cp_rank = 0 if shared_cp_cache else params.attn_cp_rank
+        self.offload_owner = (not replicated or tp_rank == 0) and (
+            not shared_cp_cache or params.attn_cp_rank == 0
+        )
         config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
-        self.max_ranges = config.get("max_ranges_per_call", 256)
-        if (
-            type(self.max_ranges) is not int
-            or not 2 <= self.max_ranges <= MAX_GIDS_RANGES
-        ):
-            raise ValueError(f"OceanDisk max_ranges must be in [2, {MAX_GIDS_RANGES}].")
         namespace = config.get("namespace", get_model().model_path)
         if not isinstance(namespace, str) or not namespace:
             raise ValueError(
@@ -214,7 +233,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             tp_size,
             None if replicated else tp_rank,
             params.attn_cp_size,
-            params.attn_cp_rank,
+            storage_cp_rank,
             params.pp_size,
             params.pp_rank,
         )
@@ -239,13 +258,17 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self._layerwise_pending_keys = set()
         self._init_put_progress()
         self.layerwise_save_enabled = config.get("layerwise_save", True)
+        # DSA interleave gathers both caches before the per-layer save hook.
+        # Reuse the shared namespace and CP0 writer selected above; planning
+        # uses the full ScheduleBatch token history and request-to-slot map.
         if self.layerwise_save_enabled and (
             params.pp_size != 1
-            or params.attn_cp_size != 1
+            or (params.attn_cp_size != 1 and not shared_cp_cache)
             or getattr(server_args, "speculative_algorithm", None)
         ):
             raise ValueError(
-                "OceanDisk layerwise_save requires PP=1, CP=1 and no speculative decoding."
+                "OceanDisk layerwise_save requires PP=1, no speculative decoding, "
+                "and CP=1 or DSA interleave CP with rank-replicated caches."
             )
         self._load_thread = threading.Thread(
             target=self._load_worker, daemon=True, name=f"oceandisk-load-tp{tp_rank}"
@@ -258,11 +281,16 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self._load_thread.start()
         self._offload_thread.start()
         logger.info(
-            "OceanDisk direct linker: tp=%d/%d replicated=%s owner=%s pools=%s",
+            "OceanDisk direct linker: tp=%d/%d replicated=%s owner=%s "
+            "cp=%d/%d shared_cp_cache=%s storage_cp_rank=%d pools=%s",
             tp_rank,
             tp_size,
             replicated,
             self.offload_owner,
+            params.attn_cp_rank,
+            params.attn_cp_size,
+            shared_cp_cache,
+            storage_cp_rank,
             list(self.pools),
         )
         trace_event(
@@ -352,6 +380,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self._put_activity["tasks"] += 1
             self._put_activity["pages"] += pages
 
+    def pending_offload_tasks(self):
+        """Queued or active PUT sessions not yet confirmed complete."""
+        with self._put_progress_lock:
+            return len(self._pending_puts)
+
     def _put_finished(self, task_id, success):
         if not self.offload_owner:
             return
@@ -384,24 +417,44 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
         keys = [self._object_key(key) for key in kv.keys]
-        bitmap = self.storage.exists_many(keys)
+        debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
+        perf_trace = (
+            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+            and get_tensor_model_parallel_rank() == 0
+        )
+        # Query without draining queued offloads. Storage excludes PUT only
+        # while synchronizing already-submitted work and executing EXISTS.
+        pending_at_lookup = self.pending_offload_tasks()
+        if perf_trace:
+            timings = {}
+            bitmap = self.storage.exists_many(keys, timings=timings)
+            logger.info(
+                "[OceanDisk PERF LOOKUP] rid=%s pages=%d "
+                "put_lock_ms=%.3f "
+                "put_sync_ms=%.3f exists_ms=%.3f exists_prepare_ms=%.3f "
+                "exists_native_ms=%.3f probe_ms=%.3f",
+                rid,
+                len(keys),
+                timings["put_lock_ms"],
+                timings["put_sync_ms"],
+                timings["exists_ms"],
+                timings["exists_prepare_ms"],
+                timings["exists_native_ms"],
+                timings["probe_ms"],
+            )
+        else:
+            bitmap = self.storage.exists_many(keys)
         end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
-        if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
-            connections = self.storage.connection_indices
+        if debug_cache:
             cache_debug(
                 "LOOKUP",
                 rid=rid,
                 pages=len(keys),
                 local_prefix_pages=end,
+                pending_offload_at_lookup=pending_at_lookup,
                 first_hash=kv.keys[0] if keys else None,
                 first_key=keys[0] if keys else None,
-                first_connection=connections[keys[0] % len(connections)]
-                if keys
-                else None,
                 first_miss_key=keys[end] if end < len(keys) else None,
-                miss_connection=connections[keys[end] % len(connections)]
-                if end < len(keys)
-                else None,
             )
         trace_event(
             "LOOKUP",
@@ -584,11 +637,19 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         layers = self._transfer_layers(transfers)
         if write:
             if layers and layers[0]:
-                self.storage.put_layers(layers, max_ranges=self.max_ranges)
+                self.storage.put_layers(layers)
         else:
+            perf_kwargs = {}
+            if (
+                os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+                and get_tensor_model_parallel_rank() == 0
+            ):
+                perf_kwargs["perf_context"] = (
+                    counter_index,
+                    self.pending_offload_tasks,
+                )
             self.storage.get_layers(
                 layers,
-                max_ranges=self.max_ranges,
                 on_layer_ready=(
                     None
                     if counter_index is None
@@ -596,6 +657,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         counter_index, layer
                     )
                 ),
+                **perf_kwargs,
             )
 
     def _load_worker(self) -> None:
@@ -677,18 +739,19 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                 task.finish_event.synchronize()
                                 wait_ms = (time.perf_counter() - wait_start) * 1000
                                 calls = task.native_call_times
-                                logger.info(
-                                    "[OceanDisk PUT timing] phase=%s pages=%d calls=%d "
-                                    "native_total_ms=%.3f native_min_ms=%.3f "
-                                    "native_max_ms=%.3f final_event_wait_ms=%.3f",
-                                    task.phase,
-                                    len(task.keys),
-                                    len(calls),
-                                    sum(calls),
-                                    min(calls, default=0.0),
-                                    max(calls, default=0.0),
-                                    wait_ms,
-                                )
+                                if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
+                                    logger.info(
+                                        "[OceanDisk PUT timing] phase=%s pages=%d calls=%d "
+                                        "native_total_ms=%.3f native_min_ms=%.3f "
+                                        "native_max_ms=%.3f final_event_wait_ms=%.3f",
+                                        task.phase,
+                                        len(task.keys),
+                                        len(calls),
+                                        sum(calls),
+                                        min(calls, default=0.0),
+                                        max(calls, default=0.0),
+                                        wait_ms,
+                                    )
                             success = not task.aborted and not task.put_failed
                             if self.offload_owner and success:
                                 trace_event(

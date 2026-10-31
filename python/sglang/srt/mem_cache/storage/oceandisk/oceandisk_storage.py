@@ -11,11 +11,14 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.storage.oceandisk.connection_router import ConnectionRouter
 
 if TYPE_CHECKING:
     import torch
@@ -141,6 +144,7 @@ def pack_io(
     connection_indices: tuple[int, ...],
     *,
     resolve=None,
+    select_connection=None,
 ) -> list[int]:
     """Column-major ABI used by od/cache_controller.py, with remote offsets."""
     half = len(ranges) // 2
@@ -158,6 +162,12 @@ def pack_io(
     ]
     if any(item.storage_offset < 0 for item in ranges):
         raise ValueError("OceanDisk storage offsets must be nonnegative.")
+    paired_connections = [
+        select_connection(item.key)
+        if select_connection is not None
+        else connection_indices[item.key % len(connection_indices)]
+        for item in ranges[:half]
+    ]
     return [
         task_id,
         *[mr for mr, _ in mr_offsets],
@@ -165,7 +175,8 @@ def pack_io(
         *[offset for _, offset in mr_offsets],
         *[item.storage_offset for item in ranges],
         *[item.size for item in ranges],
-        *[connection_indices[item.key % len(connection_indices)] for item in ranges],
+        *paired_connections,
+        *paired_connections,
     ]
 
 
@@ -182,8 +193,8 @@ class OceanDiskStorage(HiCacheStorage):
         device: torch.device,
         buffers: list[torch.Tensor],
     ):
-        connections = config.get("connection_indices", [0])
-        if (
+        connections = config.get("connection_indices", [])
+        if "connection_indices" in config and (
             not isinstance(connections, list)
             or not connections
             or any(
@@ -196,8 +207,12 @@ class OceanDiskStorage(HiCacheStorage):
                 "OceanDisk connection_indices must be distinct integers in [0, 7]."
             )
         self.connection_indices = tuple(connections)
+        connection_source = (
+            "extra_config" if "connection_indices" in config else "gids_config_all"
+        )
         self._closed = False
-        self._lock = threading.Lock()
+        self._debug_put_history = OrderedDict()
+        self._put_io_lock = threading.Lock()
         self._task_ids = itertools.count(1)
 
         import torch
@@ -246,12 +261,15 @@ class OceanDiskStorage(HiCacheStorage):
             os.environ["GIDS_DIR"], device_index, os.environ.get("USE_SINGLE_PORT")
         )
         connection_count = read_connection_count(config_path)
+        if "connection_indices" not in config:
+            self.connection_indices = tuple(range(connection_count))
         if any(index >= connection_count for index in self.connection_indices):
             raise ValueError(
                 f"OceanDisk connection_indices refer outside {connection_count} connections "
                 f"in {config_path}."
             )
 
+        self.connection_router = ConnectionRouter(config_path, self.connection_indices)
         with self._registration_lock, torch.cuda.device(self.device):
             if type(self)._initialized:
                 raise RuntimeError(
@@ -290,6 +308,17 @@ class OceanDiskStorage(HiCacheStorage):
             self._check_status(status, "init")
             self._put_stream.wait_stream(self._get_stream)
             logger.info(
+                "[OceanDisk connections] device=%s config=%s configured_count=%d "
+                "selected=%s source=%s routing=dht groups=%s endpoints=%s",
+                self.device,
+                config_path,
+                connection_count,
+                self.connection_indices,
+                connection_source,
+                self.connection_router.groups,
+                self.connection_router.endpoints,
+            )
+            logger.info(
                 "[OceanDisk streams] device=%s get=%s put=%s",
                 self.device,
                 self._get_stream.stream_id,
@@ -305,52 +334,158 @@ class OceanDiskStorage(HiCacheStorage):
                 registered_regions=len(self.regions),
             )
 
+    def _run_io(self, operation, stream):
+        # Scheduler layer waits finish GET before the next lookup. Only
+        # background PUT needs exclusion against synchronous EXISTS.
+        io_lock = self._put_io_lock if stream is self._put_stream else nullcontext()
+        with (
+            io_lock,
+            self._torch.cuda.device(self.device),
+            self._torch.cuda.stream(stream),
+        ):
+            self._ensure_open()
+            return operation()
+
     @staticmethod
     def _check_status(status, operation: str) -> None:
         if status != 0:
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
-    def exists_many(self, keys: list[int]) -> list[bool]:
+    def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
+        # Exclude new PUT submissions until the synchronous query returns.
+        with self._torch.cuda.device(self.device):
+            started = time.perf_counter() if timings is not None else 0.0
+            with self._put_io_lock:
+                if timings is not None:
+                    timings["put_lock_ms"] = (time.perf_counter() - started) * 1000
+                self._ensure_open()
+                started = time.perf_counter() if timings is not None else 0.0
+                self._put_stream.synchronize()
+                if timings is not None:
+                    timings["put_sync_ms"] = (time.perf_counter() - started) * 1000
+                started = time.perf_counter() if timings is not None else 0.0
+                result = (
+                    self._exists_many(keys, timings=timings)
+                    if timings is not None
+                    else self._exists_many(keys)
+                )
+                if timings is not None:
+                    timings["exists_ms"] = (time.perf_counter() - started) * 1000
+                return result
+
+    def _exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
         kvcache_exist returns the contiguous hit prefix in input order, not
         individual key statuses. Entries after the first miss remain False.
         """
         torch = self._torch
-        with (
-            self._lock,
-            torch.cuda.device(self.device),
-            torch.cuda.stream(self._get_stream),
-        ):
+        # Metadata uses the querying thread's current stream.
+        with torch.cuda.device(self.device):
             self._ensure_open()
+            if timings is not None:
+                timings.update(
+                    exists_prepare_ms=0.0, exists_native_ms=0.0, probe_ms=0.0
+                )
+                prepare_start = time.perf_counter()
             if not keys:
                 return []
-            connections = [
-                self.connection_indices[key % len(self.connection_indices)]
-                for key in keys
-            ]
+            connections = [self.connection_router.select(key) for key in keys]
+            if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
+                logger.info(
+                    "[OceanDisk connection usage] pid=%d device=%s keys=%d counts=%s",
+                    os.getpid(),
+                    self.device,
+                    len(keys),
+                    {
+                        index: connections.count(index)
+                        for index in self.connection_indices
+                    },
+                )
             metadata = torch.tensor(
                 [next(self._task_ids), *keys, *connections],
                 dtype=torch.int64,
                 device=self.device,
             )
-            try:
-                prefix_hits = self._ops.kvcache_exist(metadata, self._output)
-            finally:
-                self._get_stream.synchronize()
+            if timings is not None:
+                timings["exists_prepare_ms"] = (
+                    time.perf_counter() - prepare_start
+                ) * 1000
+                native_start = time.perf_counter()
+            prefix_hits = self._ops.kvcache_exist(metadata, self._output)
+            if timings is not None:
+                timings["exists_native_ms"] = (
+                    time.perf_counter() - native_start
+                ) * 1000
             if not isinstance(prefix_hits, int) or not 0 <= prefix_hits <= len(keys):
                 raise RuntimeError(
                     f"OceanDisk batch exist returned invalid prefix length "
                     f"{prefix_hits!r} for {len(keys)} keys."
                 )
+        if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1" and prefix_hits < len(
+            keys
+        ):
+            probe_start = time.perf_counter() if timings is not None else 0.0
+            key = keys[prefix_hits]
+            conn = connections[prefix_hits]
+            put_record = self._debug_put_history.get(key)
+            try:
+                probe = torch.tensor(
+                    [next(self._task_ids), key, conn],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                single_hit = self._ops.kvcache_exist(probe, self._output)
+            except Exception as error:
+                single_hit = repr(error)
+            logger.info(
+                "[OceanDisk miss probe] pid=%d device=%s key=%d page_index=%d "
+                "query_conn=%d query_endpoint=%s single_hit=%s "
+                "put_record=%s history_limit=100000 "
+                "put_record_fields=(state,conn,endpoint,task,layers)",
+                os.getpid(),
+                self.device,
+                key,
+                prefix_hits,
+                conn,
+                self.connection_router.endpoints[conn],
+                single_hit,
+                put_record,
+            )
+            if timings is not None:
+                timings["probe_ms"] = (time.perf_counter() - probe_start) * 1000
         return [True] * prefix_hits + [False] * (len(keys) - prefix_hits)
 
-    def _pack_layer_batches(self, layers, max_ranges):
-        if type(max_ranges) is not int or not 2 <= max_ranges <= MAX_GIDS_RANGES:
-            raise ValueError(f"OceanDisk max_ranges must be in [2, {MAX_GIDS_RANGES}].")
+    def _debug_record_put(self, descriptors, state):
+        if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") != "1":
+            return
+        for batch in descriptors:
+            row = batch[0]
+            count = (len(row) - 1) // 6
+            for i in range(count // 2):
+                key = row[1 + count + i]
+                conn = row[1 + 5 * count + i]
+                self._debug_put_history[key] = (
+                    state,
+                    conn,
+                    self.connection_router.endpoints[conn],
+                    row[0],
+                    len(batch),
+                )
+                self._debug_put_history.move_to_end(key)
+                if len(self._debug_put_history) > 100000:
+                    self._debug_put_history.popitem(last=False)
+
+    def _pack_layer_batches(self, layers):
         if not layers:
             return []
         count = len(layers[0])
+        if count == 0:
+            return []
+        if count > MAX_GIDS_RANGES:
+            raise ValueError(
+                f"OceanDisk IO count {count} exceeds native capacity {MAX_GIDS_RANGES}."
+            )
         if count % 2 or any(len(layer) != count for layer in layers):
             raise ValueError("OceanDisk layers require equal, even IO counts.")
         # Index registrations once per batch instead of scanning all layer MRs
@@ -371,20 +506,24 @@ class OceanDiskStorage(HiCacheStorage):
             return resolve_mr(self.regions, ptr, size)
 
         half = count // 2
-        batch_pages = max_ranges // 2
+        # Fix one connection per page for the whole operation, including both
+        # KV/Indexer halves and every layer.
+        selected_connections = {
+            item.key: self.connection_router.select(item.key)
+            for item in layers[0][:half]
+        }
         batches = [
             [
                 pack_io(
                     next(self._task_ids),
-                    ranges[start : min(start + batch_pages, half)]
-                    + ranges[half + start : half + min(start + batch_pages, half)],
+                    ranges,
                     self.regions,
                     self.connection_indices,
                     resolve=resolve,
+                    select_connection=selected_connections.__getitem__,
                 )
                 for ranges in layers
             ]
-            for start in range(0, half, batch_pages)
         ]
         # Resolve original ranges against actual allocations before rounding lengths.
         # Legacy behavior deliberately includes bytes beyond each logical page.
@@ -397,15 +536,14 @@ class OceanDiskStorage(HiCacheStorage):
         return batches
 
     def get_layers(
-        self, layers, *, max_ranges=256, on_layer_ready=None, timings=None
+        self,
+        layers,
+        *,
+        on_layer_ready=None,
+        timings=None,
+        perf_context=None,
     ) -> None:
-        """Publish each layer before calling the next layer's native GET.
-
-        Native GIDS builds may block inside GET. Passing all layers to one
-        dispatch would then delay every readiness notification until the last
-        layer finishes. Prepare metadata first, but dispatch one layer at a
-        time so model compute can start while subsequent layers are loaded.
-        """
+        """Submit all layers together, then publish completion layer by layer."""
         import od_utils
 
         started = time.perf_counter()
@@ -418,7 +556,7 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._get_stream),
         ):
             self._ensure_open()
-            descriptors = self._pack_layer_batches(layers, max_ranges)
+            descriptors = self._pack_layer_batches(layers)
             packed = time.perf_counter()
             cpu_tensor_ms = upload_ms = 0.0
             submitted = []
@@ -426,7 +564,7 @@ class OceanDiskStorage(HiCacheStorage):
                 "GET_BEGIN",
                 layers=len(layers),
                 batches=len(descriptors),
-                mode="layerwise_dispatch",
+                mode="all_layers_dispatch",
             )
             try:
                 for batch_index, batch in enumerate(descriptors):
@@ -447,36 +585,73 @@ class OceanDiskStorage(HiCacheStorage):
                         len(descriptors),
                         od_utils,
                     )
-                for layer in range(len(layers)):
-                    for cpu, gpu, events in submitted:
-                        # Slice both metadata tensors and use local layer 0:
-                        # the native wrapper indexes GPU rows and CPU task IDs
-                        # differently when start_layer is nonzero.
-                        step = time.perf_counter()
-                        od_utils.batch_dispatch_get(
-                            gpu[layer : layer + 1],
+                if perf_context is not None:
+                    task, pending_puts = perf_context
+                    submit_pending_start = pending_puts()
+                dispatch_started = time.perf_counter()
+                for cpu, gpu, events in submitted:
+                    step = time.perf_counter()
+                    self._run_io(
+                        lambda: od_utils.batch_dispatch_get(
+                            gpu,
                             gpu.shape[1],
-                            cpu[layer : layer + 1],
+                            cpu,
                             self._output,
-                            [events[layer].cuda_event],
+                            [event.cuda_event for event in events],
                             self._get_stream.stream_id,
                             self.device.index,
                             0,
-                            1,
+                            len(layers),
                             True,
                             False,
-                        )
-                        native_times.append((time.perf_counter() - step) * 1000)
+                        ),
+                        self._get_stream,
+                    )
+                    native_times.append((time.perf_counter() - step) * 1000)
+                if perf_context is not None:
+                    logger.info(
+                        "[OceanDisk PERF GET SUBMIT] task=%s layers=%d calls=%d "
+                        "native_call_ms=%.3f prepare_ms=%.3f "
+                        "pending_put_start=%d pending_put_end=%d",
+                        task,
+                        len(layers),
+                        len(native_times),
+                        sum(native_times),
+                        (dispatch_started - started) * 1000,
+                        submit_pending_start,
+                        pending_puts(),
+                    )
+                for layer in range(len(layers)):
+                    if perf_context is not None:
+                        pending_start = pending_puts()
                     # A layer is usable only after every I/O batch containing
                     # its paired KV/Indexer fragments has completed.
                     step = time.perf_counter()
                     for _, _, events in submitted:
                         events[layer].synchronize()
-                    event_wait_ms += (time.perf_counter() - step) * 1000
+                    layer_wait_ms = (time.perf_counter() - step) * 1000
+                    event_wait_ms += layer_wait_ms
+                    if perf_context is not None:
+                        ready_after_submit_ms = (
+                            time.perf_counter() - dispatch_started
+                        ) * 1000
+                        pending_end = pending_puts()
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
                     if on_layer_ready is not None:
                         on_layer_ready(layer)
+                    if perf_context is not None:
+                        logger.info(
+                            "[OceanDisk PERF GET LAYER] task=%s layer=%d "
+                            "event_wait_ms=%.3f ready_after_submit_ms=%.3f "
+                            "pending_put_start=%d pending_put_end=%d",
+                            task,
+                            layer,
+                            layer_wait_ms,
+                            ready_after_submit_ms,
+                            pending_start,
+                            pending_end,
+                        )
                     if layer == 0:
                         first_layer_ms = (time.perf_counter() - started) * 1000
                 if timings is not None:
@@ -500,7 +675,7 @@ class OceanDiskStorage(HiCacheStorage):
                 self._get_stream.synchronize()
                 raise
 
-    def put_layers(self, layers, *, max_ranges=256) -> None:
+    def put_layers(self, layers) -> None:
         import od_utils
 
         torch = self._torch
@@ -509,7 +684,8 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            descriptors = self._pack_layer_batches(layers, max_ranges)
+            descriptors = self._pack_layer_batches(layers)
+            self._debug_record_put(descriptors, "submitted")
             submitted = []
             trace_event(
                 "PUT_BEGIN",
@@ -526,7 +702,12 @@ class OceanDiskStorage(HiCacheStorage):
                     indices = torch.tensor(
                         list(range(len(batch))), dtype=torch.int64, device="cpu"
                     )
-                    submitted.append((cpu, gpu, lengths, indices))
+                    # Materialize CUDA handles; the native wrapper records
+                    # each event again after the corresponding layer PUT.
+                    events = [torch.cuda.Event() for _ in layers]
+                    for event in events:
+                        event.record(self._put_stream)
+                    submitted.append((cpu, gpu, lengths, indices, events))
                     trace_batch(
                         "NATIVE_PUT_CALL",
                         batch,
@@ -534,19 +715,22 @@ class OceanDiskStorage(HiCacheStorage):
                         len(descriptors),
                         od_utils,
                     )
-                    result = od_utils.batch_dispatch_put(
-                        gpu,
-                        lengths,
-                        indices,
-                        cpu,
-                        self._output,
-                        [],
-                        self._put_stream.stream_id,
-                        self.device.index,
-                        0,
-                        len(layers),
-                        False,
-                        False,
+                    result = self._run_io(
+                        lambda: od_utils.batch_dispatch_put(
+                            gpu,
+                            lengths,
+                            indices,
+                            cpu,
+                            self._output,
+                            [event.cuda_event for event in events],
+                            self._put_stream.stream_id,
+                            self.device.index,
+                            0,
+                            len(layers),
+                            True,
+                            False,
+                        ),
+                        self._put_stream,
                     )
                     trace_event(
                         "NATIVE_PUT_RETURN",
@@ -554,9 +738,10 @@ class OceanDiskStorage(HiCacheStorage):
                         result=result,
                         per_io_status_checked=False,
                     )
-                event = torch.cuda.Event()
-                event.record(self._put_stream)
-                event.synchronize()
+                for _, _, _, _, events in submitted:
+                    if events:
+                        events[-1].synchronize()
+                self._debug_record_put(descriptors, "completed")
                 trace_event(
                     "PUT_DONE",
                     layers=len(layers),
@@ -564,16 +749,17 @@ class OceanDiskStorage(HiCacheStorage):
                     per_io_status_checked=False,
                 )
             except BaseException:
+                self._debug_record_put(descriptors, "failed")
                 self._put_stream.synchronize()
                 raise
 
-    def prepare_layerwise_put(self, layers, *, max_ranges=256, timings=None):
+    def prepare_layerwise_put(self, layers, *, timings=None):
         """Prepare descriptors on the PUT stream and retain through completion."""
         torch = self._torch
         with torch.cuda.device(self.device), torch.cuda.stream(self._put_stream):
             self._ensure_open()
             pack_start = time.perf_counter()
-            batches = self._pack_layer_batches(layers, max_ranges)
+            batches = self._pack_layer_batches(layers)
             pack_ms = (time.perf_counter() - pack_start) * 1000
             cpu_ms = upload_ms = views_ms = 0.0
             prepared = [[] for _ in layers]
@@ -615,22 +801,26 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            self._put_stream.wait_event(ready_event)
+            # Wait before taking the PUT lock; do not hold up EXISTS for compute.
+            ready_event.synchronize()
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
-                od_utils.batch_dispatch_put(
-                    gpu,
-                    lengths,
-                    indices,
-                    cpu,
-                    self._output,
-                    [],
-                    self._put_stream.stream_id,
-                    self.device.index,
-                    0,
-                    1,
-                    False,
-                    False,
+                self._run_io(
+                    lambda: od_utils.batch_dispatch_put(
+                        gpu,
+                        lengths,
+                        indices,
+                        cpu,
+                        self._output,
+                        [],
+                        self._put_stream.stream_id,
+                        self.device.index,
+                        0,
+                        1,
+                        False,
+                        False,
+                    ),
+                    self._put_stream,
                 )
                 call_ms = (time.perf_counter() - call_start) * 1000
                 call_times.append(call_ms)
@@ -691,11 +881,14 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError("OceanDisk storage is closed.")
 
     def close(self) -> None:
-        with self._lock:
-            if not self._closed:
-                with self._torch.cuda.device(self.device):
-                    self._get_stream.synchronize()
-                    self._put_stream.synchronize()
-                self._closed = True
-        # No close/deregister operator is exposed. Keep allocations pinned by
-        # Python references for the same lifetime as GIDS's process-global MRs.
+        if self._closed:
+            return
+        # Linker stops and joins its producers before closing Storage.
+        with (
+            self._put_io_lock,
+            self._torch.cuda.device(self.device),
+        ):
+            self._get_stream.synchronize()
+            self._put_stream.synchronize()
+            self._closed = True
+        # GIDS exposes no deregistration operation; retain registered buffers.
