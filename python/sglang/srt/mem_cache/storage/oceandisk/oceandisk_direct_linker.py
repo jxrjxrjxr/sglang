@@ -12,12 +12,12 @@ from queue import Empty, Queue
 from weakref import WeakValueDictionary
 
 import torch
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
-    MAX_GIDS_RANGES,
     OceanDiskRange,
     OceanDiskStorage,
     encode_key,
@@ -55,9 +55,7 @@ class LayerwiseSaveSession:
         self.prepare_details = {}
         self.hook_cpu_ms = 0.0
         self.prepared = (
-            linker.storage.prepare_layerwise_put(
-                layers, max_ranges=linker.max_ranges, timings=self.prepare_details
-            )
+            linker.storage.prepare_layerwise_put(layers, timings=self.prepare_details)
             if linker.offload_owner
             else None
         )
@@ -151,7 +149,10 @@ class LayerWiseLoadCounter:
         futures = self.futures.get(index)
         if futures is None:
             return
-        perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+        perf_trace = (
+            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+            and get_tensor_model_parallel_rank() == 0
+        )
         wait_start = time.perf_counter() if perf_trace else 0.0
         try:
             futures[threshold].result()
@@ -219,12 +220,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
-        self.max_ranges = config.get("max_ranges_per_call", 256)
-        if (
-            type(self.max_ranges) is not int
-            or not 2 <= self.max_ranges <= MAX_GIDS_RANGES
-        ):
-            raise ValueError(f"OceanDisk max_ranges must be in [2, {MAX_GIDS_RANGES}].")
         namespace = config.get("namespace", get_model().model_path)
         if not isinstance(namespace, str) or not namespace:
             raise ValueError(
@@ -641,11 +636,19 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         layers = self._transfer_layers(transfers)
         if write:
             if layers and layers[0]:
-                self.storage.put_layers(layers, max_ranges=self.max_ranges)
+                self.storage.put_layers(layers)
         else:
+            perf_kwargs = {}
+            if (
+                os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+                and get_tensor_model_parallel_rank() == 0
+            ):
+                perf_kwargs["perf_context"] = (
+                    counter_index,
+                    self.pending_offload_tasks,
+                )
             self.storage.get_layers(
                 layers,
-                max_ranges=self.max_ranges,
                 on_layer_ready=(
                     None
                     if counter_index is None
@@ -653,6 +656,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         counter_index, layer
                     )
                 ),
+                **perf_kwargs,
             )
 
     def _load_worker(self) -> None:

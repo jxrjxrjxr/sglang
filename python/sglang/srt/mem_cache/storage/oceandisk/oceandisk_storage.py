@@ -455,12 +455,16 @@ class OceanDiskStorage(HiCacheStorage):
                 if len(self._debug_put_history) > 100000:
                     self._debug_put_history.popitem(last=False)
 
-    def _pack_layer_batches(self, layers, max_ranges):
-        if type(max_ranges) is not int or not 2 <= max_ranges <= MAX_GIDS_RANGES:
-            raise ValueError(f"OceanDisk max_ranges must be in [2, {MAX_GIDS_RANGES}].")
+    def _pack_layer_batches(self, layers):
         if not layers:
             return []
         count = len(layers[0])
+        if count == 0:
+            return []
+        if count > MAX_GIDS_RANGES:
+            raise ValueError(
+                f"OceanDisk IO count {count} exceeds native capacity {MAX_GIDS_RANGES}."
+            )
         if count % 2 or any(len(layer) != count for layer in layers):
             raise ValueError("OceanDisk layers require equal, even IO counts.")
         # Index registrations once per batch instead of scanning all layer MRs
@@ -487,13 +491,11 @@ class OceanDiskStorage(HiCacheStorage):
             item.key: self.connection_router.select(item.key)
             for item in layers[0][:half]
         }
-        batch_pages = max_ranges // 2
         batches = [
             [
                 pack_io(
                     next(self._task_ids),
-                    ranges[start : min(start + batch_pages, half)]
-                    + ranges[half + start : half + min(start + batch_pages, half)],
+                    ranges,
                     self.regions,
                     self.connection_indices,
                     resolve=resolve,
@@ -501,7 +503,6 @@ class OceanDiskStorage(HiCacheStorage):
                 )
                 for ranges in layers
             ]
-            for start in range(0, half, batch_pages)
         ]
         # Resolve original ranges against actual allocations before rounding lengths.
         # Legacy behavior deliberately includes bytes beyond each logical page.
@@ -514,7 +515,12 @@ class OceanDiskStorage(HiCacheStorage):
         return batches
 
     def get_layers(
-        self, layers, *, max_ranges=256, on_layer_ready=None, timings=None
+        self,
+        layers,
+        *,
+        on_layer_ready=None,
+        timings=None,
+        perf_context=None,
     ) -> None:
         """Publish each layer before calling the next layer's native GET.
 
@@ -535,7 +541,7 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._get_stream),
         ):
             self._ensure_open()
-            descriptors = self._pack_layer_batches(layers, max_ranges)
+            descriptors = self._pack_layer_batches(layers)
             packed = time.perf_counter()
             cpu_tensor_ms = upload_ms = 0.0
             submitted = []
@@ -565,6 +571,11 @@ class OceanDiskStorage(HiCacheStorage):
                         od_utils,
                     )
                 for layer in range(len(layers)):
+                    if perf_context is not None:
+                        task, pending_puts = perf_context
+                        pending_start = pending_puts()
+                        layer_started = time.perf_counter()
+                        call_start_index = len(native_times)
                     for cpu, gpu, events in submitted:
                         # Slice both metadata tensors and use local layer 0:
                         # the native wrapper indexes GPU rows and CPU task IDs
@@ -592,11 +603,29 @@ class OceanDiskStorage(HiCacheStorage):
                     step = time.perf_counter()
                     for _, _, events in submitted:
                         events[layer].synchronize()
-                    event_wait_ms += (time.perf_counter() - step) * 1000
+                    layer_wait_ms = (time.perf_counter() - step) * 1000
+                    event_wait_ms += layer_wait_ms
+                    if perf_context is not None:
+                        layer_ms = (time.perf_counter() - layer_started) * 1000
+                        pending_end = pending_puts()
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
                     if on_layer_ready is not None:
                         on_layer_ready(layer)
+                    if perf_context is not None:
+                        logger.info(
+                            "[OceanDisk PERF GET LAYER] task=%s layer=%d "
+                            "batches=%d native_call_ms=%.3f event_wait_ms=%.3f "
+                            "layer_ms=%.3f pending_put_start=%d pending_put_end=%d",
+                            task,
+                            layer,
+                            len(submitted),
+                            sum(native_times[call_start_index:]),
+                            layer_wait_ms,
+                            layer_ms,
+                            pending_start,
+                            pending_end,
+                        )
                     if layer == 0:
                         first_layer_ms = (time.perf_counter() - started) * 1000
                 if timings is not None:
@@ -620,7 +649,7 @@ class OceanDiskStorage(HiCacheStorage):
                 self._get_stream.synchronize()
                 raise
 
-    def put_layers(self, layers, *, max_ranges=256) -> None:
+    def put_layers(self, layers) -> None:
         import od_utils
 
         torch = self._torch
@@ -629,7 +658,7 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            descriptors = self._pack_layer_batches(layers, max_ranges)
+            descriptors = self._pack_layer_batches(layers)
             self._debug_record_put(descriptors, "submitted")
             submitted = []
             trace_event(
@@ -698,13 +727,13 @@ class OceanDiskStorage(HiCacheStorage):
                 self._put_stream.synchronize()
                 raise
 
-    def prepare_layerwise_put(self, layers, *, max_ranges=256, timings=None):
+    def prepare_layerwise_put(self, layers, *, timings=None):
         """Prepare descriptors on the PUT stream and retain through completion."""
         torch = self._torch
         with torch.cuda.device(self.device), torch.cuda.stream(self._put_stream):
             self._ensure_open()
             pack_start = time.perf_counter()
-            batches = self._pack_layer_batches(layers, max_ranges)
+            batches = self._pack_layer_batches(layers)
             pack_ms = (time.perf_counter() - pack_start) * 1000
             cpu_ms = upload_ms = views_ms = 0.0
             prepared = [[] for _ in layers]
