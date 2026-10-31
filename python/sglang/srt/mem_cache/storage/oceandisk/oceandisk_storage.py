@@ -522,13 +522,7 @@ class OceanDiskStorage(HiCacheStorage):
         timings=None,
         perf_context=None,
     ) -> None:
-        """Publish each layer before calling the next layer's native GET.
-
-        Native GIDS builds may block inside GET. Passing all layers to one
-        dispatch would then delay every readiness notification until the last
-        layer finishes. Prepare metadata first, but dispatch one layer at a
-        time so model compute can start while subsequent layers are loaded.
-        """
+        """Submit all layers together, then publish completion layer by layer."""
         import od_utils
 
         started = time.perf_counter()
@@ -549,7 +543,7 @@ class OceanDiskStorage(HiCacheStorage):
                 "GET_BEGIN",
                 layers=len(layers),
                 batches=len(descriptors),
-                mode="layerwise_dispatch",
+                mode="all_layers_dispatch",
             )
             try:
                 for batch_index, batch in enumerate(descriptors):
@@ -570,34 +564,45 @@ class OceanDiskStorage(HiCacheStorage):
                         len(descriptors),
                         od_utils,
                     )
+                if perf_context is not None:
+                    task, pending_puts = perf_context
+                    submit_pending_start = pending_puts()
+                dispatch_started = time.perf_counter()
+                for cpu, gpu, events in submitted:
+                    step = time.perf_counter()
+                    self._run_io(
+                        lambda: od_utils.batch_dispatch_get(
+                            gpu,
+                            gpu.shape[1],
+                            cpu,
+                            self._output,
+                            [event.cuda_event for event in events],
+                            self._get_stream.stream_id,
+                            self.device.index,
+                            0,
+                            len(layers),
+                            True,
+                            False,
+                        ),
+                        self._get_stream,
+                    )
+                    native_times.append((time.perf_counter() - step) * 1000)
+                if perf_context is not None:
+                    logger.info(
+                        "[OceanDisk PERF GET SUBMIT] task=%s layers=%d calls=%d "
+                        "native_call_ms=%.3f prepare_ms=%.3f "
+                        "pending_put_start=%d pending_put_end=%d",
+                        task,
+                        len(layers),
+                        len(native_times),
+                        sum(native_times),
+                        (dispatch_started - started) * 1000,
+                        submit_pending_start,
+                        pending_puts(),
+                    )
                 for layer in range(len(layers)):
                     if perf_context is not None:
-                        task, pending_puts = perf_context
                         pending_start = pending_puts()
-                        layer_started = time.perf_counter()
-                        call_start_index = len(native_times)
-                    for cpu, gpu, events in submitted:
-                        # Slice both metadata tensors and use local layer 0:
-                        # the native wrapper indexes GPU rows and CPU task IDs
-                        # differently when start_layer is nonzero.
-                        step = time.perf_counter()
-                        self._run_io(
-                            lambda: od_utils.batch_dispatch_get(
-                                gpu[layer : layer + 1],
-                                gpu.shape[1],
-                                cpu[layer : layer + 1],
-                                self._output,
-                                [events[layer].cuda_event],
-                                self._get_stream.stream_id,
-                                self.device.index,
-                                0,
-                                1,
-                                True,
-                                False,
-                            ),
-                            self._get_stream,
-                        )
-                        native_times.append((time.perf_counter() - step) * 1000)
                     # A layer is usable only after every I/O batch containing
                     # its paired KV/Indexer fragments has completed.
                     step = time.perf_counter()
@@ -606,7 +611,9 @@ class OceanDiskStorage(HiCacheStorage):
                     layer_wait_ms = (time.perf_counter() - step) * 1000
                     event_wait_ms += layer_wait_ms
                     if perf_context is not None:
-                        layer_ms = (time.perf_counter() - layer_started) * 1000
+                        ready_after_submit_ms = (
+                            time.perf_counter() - dispatch_started
+                        ) * 1000
                         pending_end = pending_puts()
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
@@ -615,14 +622,12 @@ class OceanDiskStorage(HiCacheStorage):
                     if perf_context is not None:
                         logger.info(
                             "[OceanDisk PERF GET LAYER] task=%s layer=%d "
-                            "batches=%d native_call_ms=%.3f event_wait_ms=%.3f "
-                            "layer_ms=%.3f pending_put_start=%d pending_put_end=%d",
+                            "event_wait_ms=%.3f ready_after_submit_ms=%.3f "
+                            "pending_put_start=%d pending_put_end=%d",
                             task,
                             layer,
-                            len(submitted),
-                            sum(native_times[call_start_index:]),
                             layer_wait_ms,
-                            layer_ms,
+                            ready_after_submit_ms,
                             pending_start,
                             pending_end,
                         )
