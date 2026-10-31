@@ -109,8 +109,6 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 set -- \
     --model-path "${MODEL_PATH}" \
     --tp-size 4 \
-    --enable-prefill-cp \
-    --cp-strategy interleave \
     --attention-backend dsa \
     --host 127.0.0.1 \
     --trust-remote-code \
@@ -166,6 +164,7 @@ wait_for_client() {
 # 等待中任一服务退出时 kill -0 失败，脚本退出并停掉其余服务。
 setsid python3 -m sglang.launch_server "$@" --base-gpu-id 0 --port 31002 \
     --dist-init-addr 127.0.0.1:31500 --disaggregation-mode prefill \
+    --enable-prefill-cp --cp-strategy interleave \
     --disaggregation-bootstrap-port 31145 > "$LOG_DIR/prefill.log" 2>&1 &
 pids="$pids $!"
 until curl -sf http://127.0.0.1:31002/health >/dev/null; do

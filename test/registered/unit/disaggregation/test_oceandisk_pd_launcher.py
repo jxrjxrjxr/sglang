@@ -146,6 +146,12 @@ wait
     def finish(self, process):
         stdout, stderr = process.communicate(timeout=15)
         self.assert_groups_stopped()
+        prefill = (self.base / "calls/prefill.args").read_text().splitlines()
+        decode = (self.base / "calls/decode.args").read_text().splitlines()
+        self.assertIn("--enable-prefill-cp", prefill)
+        self.assertEqual(prefill[prefill.index("--cp-strategy") + 1], "interleave")
+        self.assertNotIn("--enable-prefill-cp", decode)
+        self.assertNotIn("--cp-strategy", decode)
         return process.returncode, stdout, stderr
 
     def test_normal_exit_and_client_error_preserve_status_and_output(self):

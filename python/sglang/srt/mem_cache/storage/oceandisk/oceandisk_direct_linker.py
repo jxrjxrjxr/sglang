@@ -214,6 +214,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             and getattr(server_args, "cp_strategy", None) == "interleave"
             and getattr(server_args, "attention_backend", None) == "dsa"
         )
+        # PD decode uses TP without CP. Replicated prefill CP pages use the
+        # same namespace as that full-width TP layout.
+        pd_shared_cp_cache = (
+            shared_cp_cache and server_args.disaggregation_mode == "prefill"
+        )
         storage_cp_rank = 0 if shared_cp_cache else params.attn_cp_rank
         self.offload_owner = (not replicated or tp_rank == 0) and (
             not shared_cp_cache or params.attn_cp_rank == 0
@@ -230,9 +235,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             "sglang-oceandisk-pool-pages",
             namespace,
             params.page_size,
-            tp_size,
+            tp_size * params.attn_cp_size if pd_shared_cp_cache else tp_size,
             None if replicated else tp_rank,
-            params.attn_cp_size,
+            1 if pd_shared_cp_cache else params.attn_cp_size,
             storage_cp_rank,
             params.pp_size,
             params.pp_rank,
