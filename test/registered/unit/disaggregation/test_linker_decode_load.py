@@ -533,6 +533,7 @@ class TestLinkerDecodeLoad(unittest.TestCase):
             unified_cache_external_linker_backend="oceandisk",
             disaggregation_decode_enable_radix_cache=True,
             pp_size=1,
+            dp_size=1,
             enable_dp_attention=False,
             enable_hierarchical_cache=False,
             disaggregation_decode_retraction_backup=None,
@@ -548,7 +549,7 @@ class TestLinkerDecodeLoad(unittest.TestCase):
             unified_cache_external_linker_backend="mooncake",
             disaggregation_decode_enable_radix_cache=False,
             pp_size=2,
-            enable_dp_attention=True,
+            dp_size=2,
             enable_hierarchical_cache=True,
             disaggregation_decode_retraction_backup="host_pool",
         )
@@ -566,6 +567,8 @@ class TestLinkerDecodeLoad(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         pd_disaggregation_hook.handle_pd_disaggregation(cfg)
                 else:
+                    pd_disaggregation_hook.handle_pd_disaggregation(cfg)
+                    cfg.enable_dp_attention = True
                     pd_disaggregation_hook.handle_pd_disaggregation(cfg)
                     for env, value in [
                         (envs.SGLANG_DISAGG_STAGING_BUFFER, True),

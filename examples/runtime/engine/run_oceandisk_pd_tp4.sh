@@ -109,6 +109,9 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 set -- \
     --model-path "${MODEL_PATH}" \
     --tp-size 4 \
+    --enable-prefill-cp \
+    --cp-strategy interleave \
+    --attention-backend dsa \
     --host 127.0.0.1 \
     --trust-remote-code \
     --page-size 64 \

@@ -56,7 +56,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             ),
             "--disaggregation-decode-enable-radix-cache": cfg.disaggregation_decode_enable_radix_cache,
             "pp-size=1": cfg.pp_size == 1,
-            "no DP attention": not resolved_view(server_args).enable_dp_attention,
+            "dp-size=1": cfg.dp_size == 1,
             "no hierarchical cache": not cfg.enable_hierarchical_cache,
             "no host_pool retraction backup": cfg.disaggregation_decode_retraction_backup
             != "host_pool",
