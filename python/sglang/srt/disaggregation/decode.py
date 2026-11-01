@@ -1242,6 +1242,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            # Fake warmup completes locally without READY notifications or GET.
+            use_linker_notify = (
+                get_disagg().disaggregation_linker_notify
+                and not _is_fake_transfer(decode_req.req)
+            )
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
@@ -1258,7 +1263,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
-                if get_disagg().disaggregation_linker_notify:
+                if use_linker_notify:
                     decode_req.linker_prefix_len = _linker_handoff_prefix_len(
                         decode_req.req,
                         prefix_len,
@@ -1413,7 +1418,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.req.kv.cache_protected_len = total_prefix_len
             # Allocate and protect exactly as native Mooncake does. Only the
             # RDMA destination/metadata skip the prefix loaded from OceanDisk.
-            if get_disagg().disaggregation_linker_notify:
+            if use_linker_notify:
                 total_prefix_len = decode_req.linker_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
@@ -1588,7 +1593,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            if get_disagg().disaggregation_linker_notify:
+            if use_linker_notify:
                 metadata_kwargs["linker_start_page"] = (
                     len(decode_req.req.prefix_indices) // self.tree_cache.page_size
                 )

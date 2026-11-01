@@ -24,6 +24,8 @@ from sglang.srt.disaggregation.decode_linker_mixin import (
     LinkerLoadGatedKVReceiver,
     _linker_handoff_prefix_len,
 )
+from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -441,9 +443,11 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertFalse(self.linker.hit_markers)
         self.backend.lookup.assert_not_called()
 
-    def test_prealloc_allocates_from_l1_but_rdma_starts_at_s(self):
-        dr = self.request(prefix=0)
+    def _preallocate_request(self, *, fake=False, l1=4):
+        dr = self.request(prefix=0, l1=l1)
+        dr.linker_loaded_len = 0
         req = dr.req
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST if fake else "127.0.0.1"
         req.finished_reason, req.output_ids = None, []
         req.sampling_params = SimpleNamespace(max_new_tokens=16)
         req.set_extend_range = Mock()
@@ -458,9 +462,9 @@ class TestLinkerDecodeLoad(unittest.TestCase):
             location, indices
         )
         pm = SimpleNamespace(
-            prefix_indices=torch.arange(100, 104),
-            l1_prefix_len=4,
-            decode_prefix_len=4,
+            prefix_indices=torch.arange(100, 100 + l1),
+            l1_prefix_len=l1,
+            decode_prefix_len=l1,
             restore_token_count=0,
         )
         allocator = SimpleNamespace(
@@ -506,7 +510,12 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         harness._pre_alloc = lambda *args: decode.DecodePreallocQueue._pre_alloc(
             harness, *args
         )
-        dr.kv_receiver.send_metadata = Mock()
+        if fake:
+            dr.kv_receiver = FakeKVReceiver(None, FAKE_BOOTSTRAP_HOST)
+            dr.kv_receiver.init(0)
+            dr.kv_receiver.send_metadata = Mock(wraps=dr.kv_receiver.send_metadata)
+        else:
+            dr.kv_receiver.send_metadata = Mock()
         cfg = SimpleNamespace(
             disaggregation_decode_enable_radix_cache=True,
             disaggregation_linker_notify=True,
@@ -514,11 +523,18 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         with (
             patch.object(decode, "get_disagg", return_value=cfg),
             patch.object(
-                decode, "alloc_for_decode_prealloc", return_value=torch.arange(104, 129)
+                decode,
+                "alloc_for_decode_prealloc",
+                return_value=torch.arange(100 + l1, 129),
             ) as allocate,
         ):
             ready, failed = decode.DecodePreallocQueue.pop_preallocated(harness)
         self.assertEqual((len(ready), len(failed)), (1, 0))
+        return dr, allocate
+
+    def test_prealloc_allocates_from_l1_but_rdma_starts_at_s(self):
+        dr, allocate = self._preallocate_request()
+        req = dr.req
         self.assertEqual(allocate.call_args.kwargs["total_prefix_len"], 4)
         self.assertEqual(allocate.call_args.kwargs["delta_len"], 25)
         self.assertEqual(req.kv.cache_protected_len, 4)
@@ -529,6 +545,25 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertEqual(kwargs["linker_start_page"], 1)
         self.assertEqual(args[0].tolist(), [30, 31, 32])
         self.assertEqual(args[2][0].tolist(), list(range(25, 33)))
+
+    def test_fake_warmup_skips_notify_metadata_and_loads(self):
+        with envs.SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS.override(0):
+            for l1 in (0, 4):
+                with self.subTest(l1=l1):
+                    dr, allocate = self._preallocate_request(fake=True, l1=l1)
+                    self.assertEqual(allocate.call_args.kwargs["total_prefix_len"], l1)
+                    self.assertEqual(dr.req.kv.cache_protected_len, l1)
+                    self.assertEqual(dr.linker_prefix_len, 0)
+                    self.assertEqual(dr.linker_loaded_len, 0)
+                    args, kwargs = dr.kv_receiver.send_metadata.call_args
+                    self.assertEqual(kwargs, {"decode_prefix_len": l1})
+                    self.assertEqual(args[0].tolist(), list(range(25 + l1 // 4, 33)))
+                    self.process(dr)
+                    self.backend.load.assert_not_called()
+                    self.cache._all_reduce_attn_groups.assert_not_called()
+                    self.assertEqual(
+                        LinkerLoadGatedKVReceiver(dr).poll(), KVPoll.Success
+                    )
 
     def test_configuration_rejects_out_of_scope_combinations(self):
         defaults = dict(
