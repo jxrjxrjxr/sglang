@@ -1,7 +1,7 @@
 python3 run_rounds.py \
   --base-url http://127.0.0.1:31345 \
   --model /home/models/GLM-5.2-W4AFP8/ \
-  --rounds 3 \
+  --rounds 10 \
   --batch-size 10 \
   --initial-tokens 128000 \
   --increment-tokens 256 \

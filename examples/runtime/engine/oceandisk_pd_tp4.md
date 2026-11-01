@@ -78,7 +78,7 @@ git -C "$REPO" log --oneline -1
 
 ## 3. 准备多轮脚本与语料
 
-仓库内 `examples/runtime/engine/Round/run_rounds.py` 原样复用 `D:\CodeSpace\LLMTest\Round` 的版本，保留轮间 `input("等待清洗hbm")`。同目录的 `run_rounds.sh` 只有一条 Python 命令，参数默认 10 条 128K、3 轮、每轮增量 256、输出 16 token，地址改为 router 的 `31345` 端口。
+仓库内 `examples/runtime/engine/Round/run_rounds.py` 原样复用 `D:\CodeSpace\LLMTest\Round` 的版本，保留轮间 `input("等待清洗hbm")`。同目录的 `run_rounds.sh` 只有一条 Python 命令，参数默认 10 条 128K、10 轮、每轮增量 256、输出 16 token，地址改为 router 的 `31345` 端口。
 
 语料继续使用机器上已有的 `/home/j00977581/Round/doupocangqiong.txt`。首次使用仓库内 Round 目录时创建链接；已有该文件或链接时跳过：
 
