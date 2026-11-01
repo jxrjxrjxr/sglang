@@ -245,8 +245,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.linker_notify = getattr(server_args, "disaggregation_linker_notify", False)
         self.linker_group_size = envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get()
+        # DSA uses one positional KV buffer per layer and no explicit layer IDs.
         self.linker_num_layers = (
-            len(set(args.kv_layer_ids)) if self.linker_notify else 0
+            (len(set(args.kv_layer_ids)) or len(args.kv_data_ptrs))
+            if self.linker_notify
+            else 0
         )
         # Values are the existing sender/receiver objects, scoped to active rooms.
         self.linker_senders = {}

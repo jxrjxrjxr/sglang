@@ -30,13 +30,29 @@ def _linker_handoff_prefix_len(req: Req, l1: int, page: int, chunk: int) -> int:
     return max(l1, (cacheable - tail) // page * page)
 
 
-def _linker_load_timed_out(dr: DecodeRequest, now: float) -> bool:
-    return (
+def _record_linker_failure(dr: DecodeRequest, reason: str) -> None:
+    receiver = dr.kv_receiver
+    with receiver.kv_mgr.failure_lock:
+        receiver.kv_mgr.failure_records.setdefault(receiver.bootstrap_room, reason)
+    dr.linker_failed = True
+
+
+def _check_linker_load_timeout(dr: DecodeRequest, now: float) -> bool:
+    if (
         not dr.linker_inflight_end
         and dr.linker_loaded_len < dr.linker_prefix_len
         and now - dr.req.time_stats.decode_transfer_queue_entry_time
         >= envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
-    )
+    ):
+        elapsed = now - dr.req.time_stats.decode_transfer_queue_entry_time
+        _record_linker_failure(
+            dr,
+            f"OceanDisk prefix load timed out after {elapsed:.1f}s: "
+            f"loaded_tokens={dr.linker_loaded_len}/{dr.linker_prefix_len}, "
+            f"loaded_layers={dr.linker_loaded_layers}",
+        )
+        return True
+    return False
 
 
 class LinkerLoadGatedKVReceiver:
@@ -54,9 +70,16 @@ class LinkerLoadGatedKVReceiver:
             dr.linker_failed = True
         if dr.linker_inflight_end:
             return KVPoll.Transferring
-        if _linker_load_timed_out(dr, time.perf_counter()):
-            dr.linker_failed = True
+        _check_linker_load_timeout(dr, time.perf_counter())
         if dr.linker_failed:
+            # Peers may only observe the failed rank-consensus bit. Preserve any
+            # local GET/timeout/transport reason before reporting their progress.
+            _record_linker_failure(
+                dr,
+                "OceanDisk prefix transfer failed: "
+                f"loaded_tokens={dr.linker_loaded_len}/{dr.linker_prefix_len}, "
+                f"loaded_layers={dr.linker_loaded_layers}",
+            )
             return KVPoll.Failed
         if poll == KVPoll.Success and dr.linker_loaded_len < dr.linker_prefix_len:
             return KVPoll.Transferring
@@ -95,7 +118,12 @@ class DecodeLinkerTransferMixin:
                     dr.linker_loaded_len = dr.linker_inflight_end
                     dr.linker_loaded_layers = 0
             else:
-                dr.linker_failed = True
+                _record_linker_failure(
+                    dr,
+                    "OceanDisk GET failed: "
+                    f"tokens={dr.linker_loaded_len}:{dr.linker_inflight_end}, "
+                    f"layers={dr.linker_loaded_layers}:{dr.linker_inflight_layers}",
+                )
             dr.linker_inflight_end = dr.linker_inflight_layers = 0
 
         # Only CPU bookkeeping and rank consensus run here; EXISTS is never
@@ -106,7 +134,7 @@ class DecodeLinkerTransferMixin:
                 dr.linker_failed
                 or dr.kv_receiver.poll() == KVPoll.Failed
                 or dr.kv_receiver.abort_notified
-                or _linker_load_timed_out(dr, now)
+                or _check_linker_load_timeout(dr, now)
             )
             due = False
             if not failed and not dr.linker_inflight_end:

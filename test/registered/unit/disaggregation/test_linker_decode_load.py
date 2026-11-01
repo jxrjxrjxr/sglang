@@ -5,6 +5,7 @@ import inspect
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections import deque
@@ -18,6 +19,7 @@ from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.disaggregation import decode
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import DecodeRequest
 from sglang.srt.disaggregation.decode_linker_mixin import (
     DecodeLinkerTransferMixin,
@@ -25,6 +27,7 @@ from sglang.srt.disaggregation.decode_linker_mixin import (
     _linker_handoff_prefix_len,
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
+from sglang.srt.disaggregation.mooncake.conn import MooncakeFailureExceptionMixin
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -131,6 +134,10 @@ class TestLinkerDecodeLoad(unittest.TestCase):
             kv_receiver=SimpleNamespace(
                 poll=Mock(return_value=KVPoll.Success), abort_notified=False,
                 linker_ready_until=Mock(return_value=100),
+                bootstrap_room=7,
+                kv_mgr=SimpleNamespace(failure_records={}, failure_lock=threading.Lock()),
+                conclude_state=None,
+                clear=Mock(),
             ),
             linker_prefix_len=prefix,
             linker_loaded_len=l1,
@@ -241,6 +248,27 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertEqual(gate.poll(), KVPoll.Failed)
         self.process(dr)
         self.backend.lookup.assert_not_called()
+        with self.assertRaisesRegex(KVTransferError, "timed out") as caught:
+            MooncakeFailureExceptionMixin.failure_exception(dr.kv_receiver)
+        self.assertFalse(caught.exception.is_from_another_rank)
+
+    def test_timeout_in_scheduler_records_progress(self):
+        dr = self.request()
+        dr.req.time_stats.decode_transfer_queue_entry_time -= 301
+        self.process(dr)
+        reason = dr.kv_receiver.kv_mgr.failure_records[7]
+        self.assertIn("timed out", reason)
+        self.assertIn("loaded_tokens=4/24", reason)
+        self.assertIn("loaded_layers=0", reason)
+        self.assertEqual(LinkerLoadGatedKVReceiver(dr).poll(), KVPoll.Failed)
+        self.assertEqual(dr.kv_receiver.kv_mgr.failure_records[7], reason)
+
+    def test_native_failure_reason_is_preserved(self):
+        dr = self.request()
+        dr.kv_receiver.kv_mgr.failure_records[7] = "RDMA tail failed"
+        dr.kv_receiver.poll.return_value = KVPoll.Failed
+        self.assertEqual(LinkerLoadGatedKVReceiver(dr).poll(), KVPoll.Failed)
+        self.assertEqual(dr.kv_receiver.kv_mgr.failure_records[7], "RDMA tail failed")
 
     def test_completed_prefix_leaves_tail_timeout_to_mooncake(self):
         dr = self.request()
@@ -418,6 +446,7 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertTrue(dr.linker_failed)
         self.backend.lookup.assert_not_called()
         self.assertEqual(LinkerLoadGatedKVReceiver(dr).poll(), KVPoll.Failed)
+        self.assertIn("prefix transfer failed", dr.kv_receiver.kv_mgr.failure_records[7])
 
     def test_shared_counter_failure_and_normal_load_unlock(self):
         a, b = self.request(), self.request("b", slot=1)
@@ -432,6 +461,8 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertFalse(self.counter.futures)
         self.process(a, b)
         self.assertTrue(a.linker_failed and b.linker_failed)
+        for dr in (a, b):
+            self.assertIn("OceanDisk GET failed", dr.kv_receiver.kv_mgr.failure_records[7])
         self.assertEqual(a.linker_loaded_len, 4)
         self.assertEqual(len(self.batches), 1)
 

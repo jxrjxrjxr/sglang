@@ -12,6 +12,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.mooncake import conn as mooncake
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -20,6 +22,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     _linker_ready_end,
     _merge_linker_ranges,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
@@ -77,6 +81,52 @@ class TestLinkerNotifyTransport(unittest.TestCase):
                 receiver.receive_linker_ready(parts)
 
         mgr._send_multipart_locked = Mock(side_effect=deliver)
+
+    def _initialize_notify_manager(self, layer_ids, buffers, *, notify=True):
+        self.mgr.disaggregation_mode = DisaggregationMode.DECODE
+        args = SimpleNamespace(kv_layer_ids=layer_ids, kv_data_ptrs=buffers)
+        with (
+            patch.object(CommonKVManager, "__init__", return_value=None),
+            patch.object(MooncakeKVManager, "init_engine"),
+            patch.object(MooncakeKVManager, "register_buffer_to_engine"),
+            patch.object(MooncakeKVManager, "start_decode_thread"),
+            patch.object(
+                mooncake,
+                "get_observability",
+                return_value=SimpleNamespace(enable_trace=False),
+            ),
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+            envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.override(50),
+        ):
+            self.mgr.__init__(
+                args,
+                DisaggregationMode.DECODE,
+                SimpleNamespace(disaggregation_linker_notify=notify),
+                is_mla_backend=True,
+            )
+        self.mgr.linker_senders[7] = self.sender
+        self.mgr.linker_receivers[7] = self.receiver
+
+    def test_dsa_positional_layers_publish_both_groups(self):
+        # DSA reports positional KV buffers and no explicit kv_layer_ids.
+        self._initialize_notify_manager([], list(range(78)))
+        self.assertEqual(self.mgr.linker_num_layers, 78)
+        self.mgr.conclude_transfer(bootstrap_room=7, status=KVPoll.Success)
+        self.assertEqual(self.mgr.request_status[7], KVPoll.Transferring)
+        self.sender.notify_linker_ready(0, 8, 0, 50)
+        self.assertEqual(self.receiver.linker_ready_until(0, 50, 0), 8)
+        self.assertEqual(self.mgr.request_status[7], KVPoll.Transferring)
+        self.sender.notify_linker_ready(0, 8, 50, 78)
+        self.assertEqual(self.receiver.linker_ready_until(50, 78, 0), 8)
+        self.assertEqual(self.mgr.request_status[7], KVPoll.Success)
+
+    def test_explicit_layer_ids_and_native_mode(self):
+        for notify, expected in ((True, 3), (False, 0)):
+            with self.subTest(notify=notify):
+                self._initialize_notify_manager(
+                    [0, 0, 1, 1, 2, 2], list(range(6)), notify=notify
+                )
+                self.assertEqual(self.mgr.linker_num_layers, expected)
 
     def test_native_transfer_without_notify_completes_immediately(self):
         self.mgr.linker_notify = False
