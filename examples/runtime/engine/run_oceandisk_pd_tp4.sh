@@ -6,11 +6,10 @@ set -eu
 # sh examples/runtime/engine/run_oceandisk_pd_tp4.sh check 2>&1 | tee pd_check.log
 # sh examples/runtime/engine/run_oceandisk_pd_tp4.sh bench 2>&1 | tee pd_bench_notify.log
 # 默认 notify：P 分组 PUT 完成后发 ZMQ，D 分窗口／层组 GET；尾部走 Mooncake RDMA。
-# rounds：把整个 Round 目录（含 doupocangqiong.txt）拷到测试机器，再指定路径：
-# ROUNDS_DIR=/path/to/Round sh ... rounds
-# ROUNDS_ARGS 覆盖整组多轮参数；router 不支持 request-usage 时，从覆盖值中去掉它。
+# start：nohup 启动 P、D、router，就绪后打印端口并退出；Round/run_rounds.sh 单独前台运行。
+# LOG_DIR=/path/to/logs sh examples/runtime/engine/run_oceandisk_pd_tp4.sh start
 # 10 x 128K 约需 1.3M token 的 D 容量，不足时排队；保留日志里的容量与排队数据。
-# notify、mooncake 各跑一次，日志、对话和 JSON 留在各自 LOG_DIR。
+# notify、mooncake 各跑一次；服务日志在 LOG_DIR，多轮对话和 JSON 由 Round 参数指定。
 # 原生 PD 对照（mooncake，不经过 OceanDisk）：TRANSFER_BACKEND=mooncake sh ... bench
 # GIDS_DIR 内放 gids_config_0..7.txt（D 用 --base-gpu-id 4，读 4..7）：
 # OPEXTENSION=/path/to/libop_extension.so GIDS_DIR=/path/to/config sh ... check
@@ -29,7 +28,7 @@ LOG_DIR="${LOG_DIR:-/tmp/oceandisk_pd/${run_id}}"
 
 mode=check
 case "${1:-}" in
-    check|bench|rounds)
+    start|check|bench)
         mode="$1"
         shift
         ;;
@@ -37,15 +36,11 @@ esac
 if [ "$mode" = check ]; then
     export SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS="${SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS:-0}"
 fi
-if [ "$mode" = rounds ]; then
+if [ "$mode" = start ]; then
     CONTEXT_LENGTH="${CONTEXT_LENGTH:-163840}"
     export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-1800}"
     # P 等待 D 握手的超时，D 容量不足时也可能长时间排队。
     export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-1800}"
-    ROUNDS_DIR="$(cd -- "${ROUNDS_DIR:?Set ROUNDS_DIR to the external Round directory}" && pwd)"
-    test -f "$ROUNDS_DIR/run_rounds.py"
-    test -f "$ROUNDS_DIR/doupocangqiong.txt"
-    ROUNDS_ARGS="${ROUNDS_ARGS:---rounds 3 --batch-size 10 --initial-tokens 128000 --increment-tokens 256 --output-len 16 --record-response --request-usage}"
     # 检查本地模型配置，不自动放宽模型的位置长度限制。
     "${PYTHON_BIN:-python3}" - "$MODEL_PATH/config.json" "$CONTEXT_LENGTH" <<'PY'
 import json
@@ -158,26 +153,26 @@ wait_for_client() {
 
 # P、D、router 依次启动，前一个就绪后再起后一个，避免 P、D 同时建链互相影响；
 # 等待中任一服务退出时 kill -0 失败，脚本退出并停掉其余服务。
-setsid python3 -m sglang.launch_server "$@" --base-gpu-id 0 --port 31002 \
+nohup setsid python3 -m sglang.launch_server "$@" --base-gpu-id 0 --port 31002 \
     --dist-init-addr 127.0.0.1:31500 --disaggregation-mode prefill \
     --enable-prefill-cp --cp-strategy interleave \
-    --disaggregation-bootstrap-port 31145 > "$LOG_DIR/prefill.log" 2>&1 &
+    --disaggregation-bootstrap-port 31145 </dev/null > "$LOG_DIR/prefill.log" 2>&1 &
 pids="$pids $!"
 until curl -sf http://127.0.0.1:31002/health >/dev/null; do
     kill -0 $pids
     sleep 10
 done
-setsid python3 -m sglang.launch_server "$@" --base-gpu-id 4 --port 31001 \
+nohup setsid python3 -m sglang.launch_server "$@" --base-gpu-id 4 --port 31001 \
     --dist-init-addr 127.0.0.1:31501 --disaggregation-mode decode \
-    --disaggregation-decode-enable-radix-cache > "$LOG_DIR/decode.log" 2>&1 &
+    --disaggregation-decode-enable-radix-cache </dev/null > "$LOG_DIR/decode.log" 2>&1 &
 pids="$pids $!"
 until curl -sf http://127.0.0.1:31001/health >/dev/null; do
     kill -0 $pids
     sleep 10
 done
-setsid python3 -m sglang_router.launch_router --pd-disaggregation \
+nohup setsid python3 -m sglang_router.launch_router --pd-disaggregation \
     --prefill http://127.0.0.1:31002 31145 --decode http://127.0.0.1:31001 \
-    --host 127.0.0.1 --port 31345 > "$LOG_DIR/router.log" 2>&1 &
+    --host 127.0.0.1 --port 31345 </dev/null > "$LOG_DIR/router.log" 2>&1 &
 pids="$pids $!"
 # router 的 /health 只表示进程存活，/readiness 要等 P、D 都被判为健康。
 until curl -sf http://127.0.0.1:31345/readiness >/dev/null; do
@@ -185,21 +180,13 @@ until curl -sf http://127.0.0.1:31345/readiness >/dev/null; do
     sleep 5
 done
 
-if [ "$mode" = rounds ]; then
-    cd -- "$ROUNDS_DIR"
-    printf 'backend=%s context_length=%s rounds_args=%s\n' \
-        "$TRANSFER_BACKEND" "$CONTEXT_LENGTH" "$ROUNDS_ARGS" > "$LOG_DIR/rounds-config.txt"
-    status=0
-    # ROUNDS_ARGS 是以空格分隔的参数列表，不作为 shell 代码执行。
-    set -f
-    setsid "${PYTHON_BIN:-python3}" -u run_rounds.py $ROUNDS_ARGS \
-        --model "$MODEL_PATH" --base-url http://127.0.0.1:31345 \
-        --conversation-dir "$LOG_DIR/conversations" \
-        --output-json "$LOG_DIR/rounds.json" > "$LOG_DIR/rounds.log" 2>&1 &
-    client_pid=$!
-    wait_for_client || status=$?
-    cat "$LOG_DIR/rounds.log"
-    exit "$status"
+if [ "$mode" = start ]; then
+    kill -0 $pids
+    printf '%s\n' $pids > "$LOG_DIR/server.pids"
+    trap - EXIT INT TERM
+    printf 'Ready: router=http://127.0.0.1:31345 prefill=http://127.0.0.1:31002 decode=http://127.0.0.1:31001\n'
+    printf 'logs=%s pids=%s/server.pids\n' "$LOG_DIR" "$LOG_DIR"
+    exit 0
 fi
 setsid "${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_pd_tp4.py" "$mode" \
     --model-path "${MODEL_PATH}" \

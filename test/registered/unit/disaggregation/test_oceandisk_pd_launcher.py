@@ -26,19 +26,16 @@ class TestOceanDiskPDLauncher(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="pd-launcher-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
-        for name in ("bin", "model", "gids", "rounds", "calls"):
+        for name in ("bin", "model", "gids", "calls"):
             (self.base / name).mkdir()
         (self.base / "model/config.json").write_text(
             json.dumps({"max_position_embeddings": 200000})
         )
-        (self.base / "rounds/run_rounds.py").touch()
-        (self.base / "rounds/doupocangqiong.txt").touch()
         self.env = dict(
             os.environ,
             PATH=str(self.base / "bin") + os.pathsep + os.environ["PATH"],
             MODEL_PATH=str(self.base / "model"),
             GIDS_DIR=str(self.base / "gids"),
-            ROUNDS_DIR=str(self.base / "rounds"),
             CALLS=str(self.base / "calls"),
             LOG_DIR=str(self.base / "logs"),
             TRANSFER_BACKEND="notify",
@@ -73,6 +70,7 @@ if [ "$1" = -m ]; then
 fi
 printf '%s\n' "$$" > "$CALLS/$role.pid"
 printf '%s\n' "$@" > "$CALLS/$role.args"
+if [ "${FAIL_START_ROLE:-}" = "$role" ]; then exit 7; fi
 if [ "$role" = client ]; then
     echo client-output
     touch "$CALLS/client.started"
@@ -95,7 +93,7 @@ wait
         path.write_text(text)
         path.chmod(0o755)
 
-    def start(self, mode="rounds", **env):
+    def start(self, mode="check", **env):
         for path in (self.base / "calls").iterdir():
             path.unlink()
         process = subprocess.Popen(
@@ -162,9 +160,35 @@ wait
                 code, stdout, stderr = self.finish(self.start(CLIENT_EXIT=str(status)))
                 self.assertEqual(code, status, stderr)
                 self.assertIn("client-output", stdout)
-                self.assertIn(
-                    "client-output", (self.base / "logs/rounds.log").read_text()
-                )
+
+    def test_start_returns_with_services_running_and_no_client(self):
+        process = self.start("start")
+        stdout, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, stderr)
+        for port in (31345, 31002, 31001):
+            self.assertIn(f"http://127.0.0.1:{port}", stdout)
+        self.assertFalse((self.base / "calls/client.started").exists())
+        pids = (self.base / "logs/server.pids").read_text().splitlines()
+        self.assertEqual(len(pids), 3)
+        for role, pid in zip(("prefill", "decode", "router"), pids):
+            self.assertEqual(pid, (self.base / f"calls/{role}.pid").read_text().strip())
+            os.killpg(int(pid), signal.SIGHUP)
+        time.sleep(0.1)
+        for pid in pids:
+            state = subprocess.check_output(
+                ["ps", "-o", "stat=", "-p", pid], text=True
+            )
+            self.assertFalse(state.strip().startswith("Z"), state)
+
+    def test_start_failure_stops_started_services(self):
+        for role in ("prefill", "decode", "router"):
+            with self.subTest(role=role):
+                process = self.start("start", FAIL_START_ROLE=role)
+                stdout, _ = process.communicate(timeout=15)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertNotIn("Ready:", stdout)
+                self.assertFalse((self.base / "logs/server.pids").exists())
+                self.assert_groups_stopped()
 
     def test_each_backend_exit_stops_blocked_client_and_other_groups(self):
         for role in ("prefill", "decode", "router"):
