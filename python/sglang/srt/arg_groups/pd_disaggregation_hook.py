@@ -43,6 +43,55 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    if cfg.disaggregation_linker_notify:
+        requirements = {
+            "prefill or decode mode": cfg.disaggregation_mode in ("prefill", "decode"),
+            "--disaggregation-transfer-backend mooncake": (
+                cfg.disaggregation_transfer_backend == "mooncake"
+            ),
+            "--enable-unified-cache-external-linker": (
+                cfg.enable_unified_cache_external_linker
+            ),
+            # Completion is read from OceanDisk's per-layer counter futures.
+            "--unified-cache-external-linker-backend oceandisk": (
+                cfg.unified_cache_external_linker_backend == "oceandisk"
+            ),
+            "decode radix cache": (
+                cfg.disaggregation_mode != "decode"
+                or cfg.disaggregation_decode_enable_radix_cache
+            ),
+            "DSA attention": cfg.attention_backend == "dsa",
+            "prefill interleave CP": (
+                cfg.disaggregation_mode != "prefill"
+                or (cfg.enable_prefill_cp and cfg.cp_strategy == "interleave")
+            ),
+            "replicated DSA layers": not cfg.enable_dsa_cache_layer_split,
+            "CP0 transfer owner": (
+                not envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            ),
+            "no decode offload": not cfg.disaggregation_decode_enable_offload_kvcache,
+            "no speculative decoding": cfg.speculative_algorithm is None,
+            "dcp-size=1": cfg.dcp_size == 1,
+            "pp-size=1": cfg.pp_size == 1,
+            "dp-size=1": cfg.dp_size == 1,
+            "no hierarchical cache": not cfg.enable_hierarchical_cache,
+            "no host_pool retraction backup": (
+                cfg.disaggregation_decode_retraction_backup != "host_pool"
+            ),
+            "no staging": not envs.SGLANG_DISAGG_STAGING_BUFFER.get(),
+            "RDMA tail >= -1": (
+                envs.SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS.get() >= -1
+            ),
+            "notify layers > 0": (
+                envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get() > 0
+            ),
+        }
+        for requirement, satisfied in requirements.items():
+            if not satisfied:
+                raise ValueError(
+                    f"--disaggregation-linker-notify requires {requirement}."
+                )
+
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "

@@ -665,6 +665,101 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         linker.offload_results = Queue()
         return linker
 
+    def make_initialized_linker(
+        self, mode, tp_size, *, cp_size=1, cp_rank=0, tp_rank=0, replicated=True
+    ):
+        group = self.make_linker().pool_group
+        group.rank_replicated = replicated
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=Mock(),
+            page_size=2,
+            attn_tp_cache_group=object(),
+            tp_cache_group=object(),
+            attn_cp_size=cp_size,
+            attn_cp_rank=cp_rank,
+            pp_size=1,
+            pp_rank=0,
+        )
+        args = SimpleNamespace(
+            disaggregation_mode=mode,
+            attention_backend="dsa",
+            cp_strategy="interleave" if cp_size > 1 else None,
+            speculative_algorithm=None,
+        )
+        module = "sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker"
+        with (
+            patch(f"{module}.resolve_hybrid_device_pool_group", return_value=group),
+            patch(
+                f"{module}.get_memory",
+                return_value=SimpleNamespace(
+                    hicache_storage_backend_extra_config='{"namespace":"pd-test","layerwise_save":false}'
+                ),
+            ),
+            patch(
+                f"{module}.get_model", return_value=SimpleNamespace(model_path="model")
+            ),
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=tp_rank),
+            patch("torch.distributed.get_world_size", return_value=tp_size),
+            patch("threading.Thread.start"),
+        ):
+            return OceanDiskDirectLinker(
+                args, params, components=set(group.entry_map), storage=Mock()
+            )
+
+    def test_pd_prefill_cp_and_decode_tp_share_page_keys(self):
+        prefill = self.make_initialized_linker("prefill", 1, cp_size=4)
+        decode = self.make_initialized_linker("decode", 4)
+        self.assertEqual(prefill._object_key("p0"), decode._object_key("p0"))
+        self.assertTrue(prefill.offload_owner)
+        for rank in range(1, 4):
+            with self.subTest(rank=rank):
+                cp_peer = self.make_initialized_linker(
+                    "prefill", 1, cp_size=4, cp_rank=rank
+                )
+                tp_peer = self.make_initialized_linker("decode", 4, tp_rank=rank)
+                self.assertEqual(cp_peer._object_key("p0"), decode._object_key("p0"))
+                self.assertEqual(tp_peer._object_key("p0"), decode._object_key("p0"))
+                self.assertFalse(cp_peer.offload_owner)
+
+    def test_pd_cp_keys_preserve_non_cp_hybrid_and_sharded_namespaces(self):
+        decode = self.make_initialized_linker("decode", 4)
+        prefill = self.make_initialized_linker("prefill", 4)
+        hybrid = self.make_initialized_linker("null", 1, cp_size=4)
+        self.assertEqual(decode._object_key("p0"), prefill._object_key("p0"))
+        self.assertEqual(
+            decode._namespace,
+            (
+                "sglang-oceandisk-pool-pages",
+                "pd-test",
+                2,
+                4,
+                None,
+                1,
+                0,
+                1,
+                0,
+            ),
+        )
+        self.assertEqual(
+            hybrid._namespace,
+            (
+                "sglang-oceandisk-pool-pages",
+                "pd-test",
+                2,
+                1,
+                None,
+                4,
+                0,
+                1,
+                0,
+            ),
+        )
+        first = self.make_initialized_linker("decode", 4, replicated=False)
+        second = self.make_initialized_linker("decode", 4, tp_rank=1, replicated=False)
+        self.assertNotEqual(first._object_key("p0"), second._object_key("p0"))
+
     def test_fragment_keys_do_not_depend_on_gpu_slots(self):
         linker = self.make_linker()
         first = linker._page_fragments(PoolName.KV, ["p0", "p1"], [0, 2], 0)

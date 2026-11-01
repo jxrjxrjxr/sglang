@@ -13,6 +13,7 @@ from weakref import WeakValueDictionary
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
@@ -44,6 +45,7 @@ class LayerwiseSaveSession:
         self.phase = phase
         self.next_layer = 0
         self.on_submitted = None
+        self.on_layer_group_ready = None
         self.release_source = None
         self.completion = Future()
         self.finish_event = None
@@ -129,9 +131,10 @@ class LayerWiseLoadCounter:
         self.futures: dict[int, list[Future]] = {}
         self._perf_waits = {}
 
-    def update_producer(self) -> int:
+    def update_producer(self, num_layers=None) -> int:
         self.producer_index += 1
-        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
+        count = self.num_layers if num_layers is None else num_layers
+        self.futures[self.producer_index] = [Future() for _ in range(count)]
         return self.producer_index
 
     def set_consumer(self, index: int) -> None:
@@ -221,6 +224,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             and getattr(server_args, "cp_strategy", None) == "interleave"
             and getattr(server_args, "attention_backend", None) == "dsa"
         )
+        # PD decode uses TP without CP. Replicated prefill CP pages use the
+        # same namespace as that full-width TP layout.
+        pd_shared_cp_cache = (
+            shared_cp_cache and server_args.disaggregation_mode == "prefill"
+        )
         storage_cp_rank = 0 if shared_cp_cache else params.attn_cp_rank
         self.offload_owner = (not replicated or tp_rank == 0) and (
             not shared_cp_cache or params.attn_cp_rank == 0
@@ -237,13 +245,19 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             "sglang-oceandisk-pool-pages",
             namespace,
             params.page_size,
-            tp_size,
+            tp_size * params.attn_cp_size if pd_shared_cp_cache else tp_size,
             None if replicated else tp_rank,
-            params.attn_cp_size,
+            1 if pd_shared_cp_cache else params.attn_cp_size,
             storage_cp_rank,
             params.pp_size,
             params.pp_rank,
         )
+        if (
+            getattr(server_args, "disaggregation_linker_notify", False)
+            and server_args.disaggregation_mode == "prefill"
+            and tp_size != 1
+        ):
+            raise ValueError("Linker notifications require prefill attention TP=1.")
         self.storage = (
             OceanDiskStorage(
                 config,
@@ -265,6 +279,20 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self._layerwise_pending_keys = set()
         self._init_put_progress()
         self.layerwise_save_enabled = config.get("layerwise_save", True)
+        self.notify_enabled = (
+            getattr(server_args, "disaggregation_linker_notify", False)
+            and server_args.disaggregation_mode == "prefill"
+        )
+        self.notify_group_size = envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get()
+        if (
+            getattr(server_args, "disaggregation_linker_notify", False)
+            and not replicated
+        ):
+            raise ValueError("Linker notifications require rank-replicated DSA caches.")
+        if self.notify_enabled and not self.layerwise_save_enabled:
+            raise ValueError(
+                "Linker notifications require layerwise_save=true on prefill."
+            )
         # DSA interleave gathers both caches before the per-layer save hook.
         # Reuse the shared namespace and CP0 writer selected above; planning
         # uses the full ScheduleBatch token history and request-to-slot map.
@@ -500,15 +528,21 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         event.record(torch.cuda.current_stream(self.device))
         return event
 
-    def start_layer_wise_loading(self) -> int:
+    def start_layer_wise_loading(self, layer_range=None) -> int:
         self._ensure_open()
         if not self.pending_loads:
             return -1
         # Preserve published requests if event creation/recording fails.
         event = self._ready_event()
-        index = self.layer_done_counter.update_producer()
+        count = None
+        if layer_range is not None:
+            start, end = layer_range
+            if not 0 <= start < end <= self.num_layers:
+                raise ValueError(f"Invalid OceanDisk load layer range: {layer_range}")
+            count = end - start
+        index = self.layer_done_counter.update_producer(count)
         pending, self.pending_loads = self.pending_loads, {}
-        self.load_queue.put((index, pending, event))
+        self.load_queue.put((index, pending, event, layer_range))
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
@@ -631,17 +665,23 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         )
         return session
 
-    def get_layerwise_receipts(self, page_keys):
+    def get_layerwise_receipts(self, page_keys, *, unique=True):
         # Pages saved by one session share a Future; check each session once.
         # Keep None so a page with no receipt still makes its UC ack fail.
-        return list(
-            dict.fromkeys(
-                self._layerwise_receipts.get(self._object_key(key)) for key in page_keys
-            )
-        )
+        receipts = [
+            self._layerwise_receipts.get(self._object_key(key)) for key in page_keys
+        ]
+        return list(dict.fromkeys(receipts)) if unique else receipts
 
-    def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
+    def _run_transfers(
+        self, transfers, *, write: bool, counter_index=None, layer_range=None
+    ) -> None:
         layers = self._transfer_layers(transfers)
+        if layer_range is not None:
+            # Descriptors retain the original layer storage offsets. The native
+            # dispatch and counter index only the selected rows, starting at zero.
+            start, end = layer_range
+            layers = layers[start:end]
         if write:
             if layers and layers[0]:
                 self.storage.put_layers(layers)
@@ -674,13 +714,14 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 try:
                     if task is None:
                         return
-                    index, pending, event = task
+                    index, pending, event, layer_range = task
                     try:
                         event.synchronize()
                         self._run_transfers(
                             [t for transfers in pending.values() for t in transfers],
                             write=False,
                             counter_index=index,
+                            layer_range=layer_range,
                         )
                         trace_event("LOAD_DONE", counter=index, rids=list(pending))
                     except BaseException as error:
@@ -791,6 +832,23 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                     layer, session.prepared[layer], ready_event
                                 )
                                 session.native_call_times.extend(calls)
+                                group = getattr(
+                                    self, "notify_group_size", self.num_layers
+                                )
+                                if session.on_layer_group_ready is not None and (
+                                    (layer + 1) % group == 0
+                                    or layer + 1 == self.num_layers
+                                ):
+                                    event = self.storage.record_save_event()
+                                    event.synchronize()
+                                    start = layer // group * group
+                                    trace_event(
+                                        "PUT_DONE",
+                                        task=id(session),
+                                        layer_start=start,
+                                        layer_end=layer + 1,
+                                    )
+                                    session.on_layer_group_ready(start, layer + 1)
                             except BaseException:
                                 session.put_failed = True
                                 logger.exception("OceanDisk layer %d PUT failed", layer)

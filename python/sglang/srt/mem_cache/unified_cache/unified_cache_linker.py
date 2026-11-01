@@ -24,6 +24,9 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
+from functools import partial
+from itertools import groupby
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -177,6 +180,10 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self.bypass_storage_match = False
+        self.handoff_transfers: dict[str, list[PoolTransfer]] = {}
+        self.pending_handoff_loads: dict[str, int] = {}
+        self.completed_handoff_loads: dict[str, bool] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
@@ -193,6 +200,130 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def _notify_handoff_receipt(self, sender, start, end, receipt):
+        """Whole-session completion also covers shared/past request saves."""
+        try:
+            if receipt is None or not receipt.result():
+                raise RuntimeError("OceanDisk prefix PUT did not complete successfully")
+            sender.notify_linker_ready(start, end, 0, self.cache_linker.num_layers)
+        except Exception as error:
+            sender.fail_linker(str(error))
+
+    def _prepare_handoff_prefix(self, req, result):
+        backend = self.cache_linker
+        sender = getattr(req, "disagg_kv_sender", None)
+        if not getattr(backend, "notify_enabled", False) or sender is None:
+            return
+        if getattr(req, "_uc_linker_sender", None) is not sender:
+            req._uc_linker_sender = sender
+            req._uc_linker_checked_pages = 0
+            req._uc_linker_repair_start = None
+        page = self.cache.page_size
+        last = min(
+            int(result.device_indices.numel()) // page,
+            req._compute_max_prefix_len(len(req.origin_input_ids)) // page,
+        )
+        first = req._uc_linker_checked_pages
+        if first >= last:
+            return
+        repair = last
+        if backend.offload_owner:
+            # Optimistic prefill can run before D reports L/S. Only the owner
+            # has all destinations; synchronize its decision below, including
+            # an empty missing prefix, so dummy CP ranks take the same path.
+            bounds = sender.linker_page_bounds()
+            if bounds is not None:
+                first = max(first, bounds[0])
+                last = min(last, bounds[1])
+                repair = last
+        if backend.offload_owner and first < last:
+            try:
+                key = RadixKey(
+                    req.origin_input_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                    is_bigram=self.cache.tree_core.is_eagle,
+                )[: last * page]
+                hashes = get_storage_hash_str(key, prior_hash=None, page_size=page)
+                receipts = backend.get_layerwise_receipts(
+                    hashes[first:last], unique=False
+                )
+                # EXISTS cannot override a pending or failed PUT receipt.
+                # Publish only after that session has completed successfully.
+                offset = first
+                for receipt, entries in groupby(receipts):
+                    end = offset + sum(1 for _ in entries)
+                    if receipt is not None:
+                        receipt.add_done_callback(
+                            partial(self._notify_handoff_receipt, sender, offset, end)
+                        )
+                    else:
+                        transfers = [
+                            component.build_external_linker_transfer(
+                                LinkerTransferPhase.LOOKUP, None, hashes[offset:end]
+                            )
+                            for component in self._components
+                        ]
+                        hits = backend.lookup(req.rid, transfers)
+                        ready_end = offset + max(hits, default=0)
+                        if ready_end > offset:
+                            sender.notify_linker_ready(
+                                offset, ready_end, 0, backend.num_layers
+                            )
+                        if ready_end < end:
+                            repair = min(repair, ready_end)
+                    offset = end
+            except Exception as error:
+                # Every rank still enters the consensus below on owner failure.
+                repair = -1
+                sender.fail_linker(f"OceanDisk cached-prefix check failed: {error}")
+        # Only the storage owner checks saved HBM pages; all CP/TP ranks must
+        # plan the same forward/save session and retain the same page leases.
+        repair_tensor = torch.tensor([repair, last], dtype=torch.int, device="cpu")
+        self.cache._all_reduce_attn_groups(
+            repair_tensor, torch.distributed.ReduceOp.MIN
+        )
+        repair, last = map(int, repair_tensor.tolist())
+        if repair < 0:
+            return
+        if repair < last:
+            previous = req._uc_linker_repair_start
+            req._uc_linker_repair_start = (
+                repair if previous is None else min(previous, repair)
+            )
+        req._uc_linker_checked_pages = max(req._uc_linker_checked_pages, last)
+
+    def _bind_handoff_saves(self, transfers, completed, session):
+        backend = self.cache_linker
+        if not getattr(backend, "notify_enabled", False) or not backend.offload_owner:
+            return
+        grouped = []
+        page = self.cache.page_size
+        for transfer, (req, length) in zip(transfers, completed, strict=True):
+            sender = getattr(req, "disagg_kv_sender", None)
+            if sender is None:
+                continue
+            start = length // page - len(transfer.keys)
+            receipts = backend.get_layerwise_receipts(transfer.keys, unique=False)
+            for receipt, entries in groupby(receipts):
+                end = start + sum(1 for _ in entries)
+                if receipt is None:
+                    sender.fail_linker("OceanDisk save has no completion receipt")
+                else:
+                    receipt.add_done_callback(
+                        partial(self._notify_handoff_receipt, sender, start, end)
+                    )
+                    if session is not None and receipt is session.completion:
+                        grouped.append((sender, start, end))
+                start = end
+        if session is not None and grouped:
+
+            def on_layer_group_ready(layer_start, layer_end):
+                for sender, start, end in grouped:
+                    sender.notify_linker_ready(start, end, layer_start, layer_end)
+
+            session.on_layer_group_ready = on_layer_group_ready
 
     def prepare_layerwise_save(self, batch):
         """Plan full pages before forward; only OceanDisk opts into this hook."""
@@ -271,6 +402,9 @@ class UnifiedCacheLinkerWrapper:
                 req.kv.cache_protected_len // page_size,
                 getattr(req, "_uc_layerwise_submitted_tokens", 0) // page_size,
             )
+            repair = getattr(req, "_uc_linker_repair_start", None)
+            if repair is not None:
+                first = min(first, repair)
             last = end // page_size
             if first >= last:
                 continue
@@ -304,6 +438,7 @@ class UnifiedCacheLinkerWrapper:
             return None
         plan_done = time.perf_counter()
         session = self.cache_linker.begin_layerwise_save(transfers, phase=phase)
+        self._bind_handoff_saves(transfers, completed, session)
         for transfer, (req, _) in zip(transfers, completed, strict=True):
             receipts = getattr(req, "_uc_layerwise_receipts", None)
             if receipts is None:
@@ -329,6 +464,7 @@ class UnifiedCacheLinkerWrapper:
                 if not session.aborted:
                     for req, length in completed:
                         req._uc_layerwise_submitted_tokens = length
+                        req._uc_linker_repair_start = None
                 self.pending_layerwise_saves.append(session)
 
             session.on_submitted = on_submitted
@@ -377,6 +513,10 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        if self.bypass_storage_match:
+            self.hit_markers.pop(req.rid, None)
+            return result
+        self._prepare_handoff_prefix(req, result)
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -426,6 +566,27 @@ class UnifiedCacheLinkerWrapper:
             )
         if hit_pages == 0:
             return result
+        if (
+            getattr(self.cache_linker, "notify_enabled", False)
+            and self.cache_linker.offload_owner
+        ):
+            sender = getattr(req, "disagg_kv_sender", None)
+            if sender is not None:
+                start = device_hit_len // page
+                receipts = self.cache_linker.get_layerwise_receipts(
+                    tail_hashes[:hit_pages], unique=False
+                )
+                for receipt, entries in groupby(receipts):
+                    end = start + sum(1 for _ in entries)
+                    if receipt is None:
+                        sender.notify_linker_ready(
+                            start, end, 0, self.cache_linker.num_layers
+                        )
+                    else:
+                        receipt.add_done_callback(
+                            partial(self._notify_handoff_receipt, sender, start, end)
+                        )
+                    start = end
         hit_tokens = hit_pages * page
 
         swa_transfer = by_pool.get(PoolName.SWA)
@@ -491,6 +652,54 @@ class UnifiedCacheLinkerWrapper:
             last_hash,
             page_size=page,
         )
+
+    def build_handoff_transfers(self, req: Req, num_pages: int) -> list[PoolTransfer]:
+        """Build storage keys using prefill's hash chain, without probing storage."""
+        if num_pages == 0:
+            return []
+        if req.rid in self.handoff_transfers:
+            return self.handoff_transfers[req.rid]
+        page = self.cache.page_size
+        key = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+        )[: num_pages * page]
+        hashes = get_storage_hash_str(key, prior_hash=None, page_size=page)
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                raise RuntimeError(f"Cannot build Linker lookup for rid={req.rid!r}.")
+            transfers.append(transfer)
+        self.handoff_transfers[req.rid] = transfers
+        return transfers
+
+    def queue_handoff_loads(self, loads, layer_range=None) -> None:
+        """Queue (tag, start_page, end_page, device_indices), then start one batch."""
+        if not loads:
+            return
+        for tag, start, end, indices in loads:
+            rid = tag.rsplit("@", 1)[0]
+            # Component LOAD builders allocate new slots. Handoff already owns
+            # its slots; the same PoolTransfer carries them to the load backend.
+            transfers = [
+                replace(t, keys=t.keys[start:end], device_indices=indices)
+                for t in self.handoff_transfers[rid]
+            ]
+            if not self.cache_linker.load(tag, transfers):
+                raise RuntimeError(f"Failed to queue Linker handoff load {tag!r}.")
+        index = (
+            self.cache_linker.start_layer_wise_loading()
+            if layer_range is None
+            else self.cache_linker.start_layer_wise_loading(layer_range=layer_range)
+        )
+        if index < 0:
+            raise RuntimeError("Linker handoff batch did not start.")
+        self.pending_handoff_loads.update((tag, index) for tag, *_ in loads)
 
     # ---- init_load_back: remote -> device, then insert ----
 
@@ -761,9 +970,21 @@ class UnifiedCacheLinkerWrapper:
 
     def drain_loads(self, finish_count: int) -> None:
         for _ in range(finish_count):
+            results = {}
             for rid in self.cache_linker.pop_completed_load():
-                node_id, lock_params = self.pending_loads.pop(rid)
-                self.cache.dec_lock_ref(node_id, lock_params)
+                if rid in self.pending_loads:
+                    node_id, lock_params = self.pending_loads.pop(rid)
+                    self.cache.dec_lock_ref(node_id, lock_params)
+                    continue
+                index = self.pending_handoff_loads.pop(rid)
+                if index not in results:
+                    # All tags in this batch share the same per-layer futures.
+                    futures = self.layer_done_counter.futures.pop(index)
+                    results[index] = all(
+                        future.done() and future.exception() is None
+                        for future in futures
+                    )
+                self.completed_handoff_loads[rid] = results[index]
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -792,6 +1013,9 @@ class UnifiedCacheLinkerWrapper:
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
+        self.handoff_transfers.clear()
+        self.pending_handoff_loads.clear()
+        self.completed_handoff_loads.clear()
         for node_id, lock_params in self.pending_loads.values():
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
@@ -803,6 +1027,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
+        self.handoff_transfers.pop(rid, None)
         self.hit_markers.pop(rid, None)
         # TODO: Roll back the published tree and component state atomically before
         # canceling; otherwise the tree may retain device slots that were never loaded.

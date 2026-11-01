@@ -82,6 +82,24 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+def _merge_linker_ranges(ranges, start, end):
+    """Coalesce overlapping/adjacent ready pages without bridging a gap."""
+    merged = []
+    for left, right in sorted([*ranges, (start, end)]):
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+        else:
+            merged.append((left, right))
+    return merged
+
+
+def _linker_ready_end(ranges, start):
+    for left, right in ranges:
+        if left <= start < right:
+            return right
+    return start
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -96,6 +114,9 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    linker_start_page: Optional[int] = None
+    linker_group_size: int = 0
+    linker_num_layers: int = 0
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -124,6 +145,11 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),
+            linker_start_page=(
+                int(msg[11]) if len(msg) == 14 and msg[10] == b"LINKER_NOTIFY" else None
+            ),
+            linker_group_size=int(msg[12]) if len(msg) == 14 else 0,
+            linker_num_layers=int(msg[13]) if len(msg) == 14 else 0,
             dst_device_kv_indices=(
                 np.frombuffer(msg[9], dtype=np.int32)
                 if len(msg) > 9 and msg[9] != b""
@@ -217,6 +243,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.linker_notify = getattr(server_args, "disaggregation_linker_notify", False)
+        self.linker_group_size = envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get()
+        self.linker_num_layers = (
+            len(set(args.kv_layer_ids)) if self.linker_notify else 0
+        )
+        # Values are the existing sender/receiver objects, scoped to active rooms.
+        self.linker_senders = {}
+        self.linker_receivers = {}
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2176,6 +2210,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
 
+    def conclude_transfer(
+        self, *, bootstrap_room, status, targets=None, failure_reason=None
+    ):
+        sender = self.linker_senders.get(bootstrap_room)
+        if sender is not None and status == KVPoll.Success:
+            # Keep destinations alive when RDMA wins the race against PUT.
+            with sender.linker_lock:
+                sender.linker_rdma_done = True
+                sender.flush_linker_ready()
+            return self.request_status.get(bootstrap_room)
+        return super().conclude_transfer(
+            bootstrap_room=bootstrap_room,
+            status=status,
+            targets=targets,
+            failure_reason=failure_reason,
+        )
+
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -2299,6 +2350,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
+                    info = self.transfer_infos[room][mooncake_session_id]
+                    if not info.is_dummy and (
+                        self.linker_notify != (info.linker_start_page is not None)
+                        or (
+                            self.linker_notify
+                            and (
+                                info.linker_group_size != self.linker_group_size
+                                or info.linker_num_layers != self.linker_num_layers
+                                or not 0 <= info.linker_start_page
+                                <= (info.decode_prefix_len or 0) // self.kv_args.page_size
+                            )
+                        )
+                    ):
+                        self.conclude_failure(
+                            bootstrap_room=room,
+                            failure_reason=(
+                                "P/D Linker notification configuration mismatch"
+                            ),
+                            targets=[(info.endpoint, info.dst_port)],
+                        )
+                        continue
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -2311,6 +2383,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             0,
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
+                        sender = self.linker_senders.get(room)
+                        if sender is not None:
+                            sender.flush_linker_ready()
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2320,6 +2395,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
+                    continue
+
+                if msg[0] == b"LINKER_READY":
+                    try:
+                        room = int(msg[1])
+                        receiver = self.linker_receivers.get(room)
+                        if receiver is not None:
+                            receiver.receive_linker_ready(msg)
+                    except (ValueError, IndexError):
+                        logger.warning("Dropping malformed Linker READY message")
                     continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
@@ -2514,6 +2599,118 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
+        self.linker_lock = threading.RLock()
+        self.linker_ready = {}
+        self.linker_rdma_done = False
+        if self.kv_mgr.linker_notify and not self.kv_mgr.is_dummy_cp_rank:
+            self.kv_mgr.linker_senders[self.bootstrap_room] = self
+
+    def linker_page_bounds(self):
+        infos = list(self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).values())
+        if not infos or len(infos) < infos[0].required_dst_info_num:
+            return None
+        peers = [
+            info
+            for info in infos
+            if not info.is_dummy and info.linker_start_page is not None
+        ]
+        if not peers:
+            return None
+        return (
+            min(info.linker_start_page for info in peers),
+            max(info.decode_prefix_len for info in peers)
+            // self.kv_mgr.kv_args.page_size,
+        )
+
+    def notify_linker_ready(self, start, end, layer_start, layer_end):
+        with self.linker_lock:
+            if self.kv_mgr.linker_senders.get(self.bootstrap_room) is not self:
+                return
+            if (
+                start >= end
+                or self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed
+            ):
+                return
+            group = self.kv_mgr.linker_group_size
+            for layer in range(layer_start, layer_end, group):
+                key = (layer, min(layer + group, layer_end))
+                self.linker_ready[key] = _merge_linker_ranges(
+                    self.linker_ready.get(key, ()), start, end
+                )
+            self.flush_linker_ready()
+
+    def fail_linker(self, reason):
+        if self.kv_mgr.linker_senders.get(self.bootstrap_room) is self:
+            self.kv_mgr.conclude_failure(
+                bootstrap_room=self.bootstrap_room, failure_reason=reason
+            )
+
+    def flush_linker_ready(self):
+        with self.linker_lock:
+            mgr = self.kv_mgr
+            room = self.bootstrap_room
+            if mgr.linker_senders.get(room) is not self:
+                return
+            if mgr.request_status.get(room) == KVPoll.Failed:
+                return
+            infos = list(mgr.transfer_infos.get(room, {}).values())
+            if not infos or len(infos) < infos[0].required_dst_info_num:
+                return
+            peers = [info for info in infos if not info.is_dummy]
+            complete = True
+            try:
+                for info in peers:
+                    if info.linker_start_page is None:
+                        raise ValueError("Decode did not enable Linker notifications")
+                    start = info.linker_start_page
+                    end = info.decode_prefix_len // mgr.kv_args.page_size
+                    for layer in range(0, mgr.linker_num_layers, mgr.linker_group_size):
+                        layer_end = min(
+                            layer + mgr.linker_group_size, mgr.linker_num_layers
+                        )
+                        ranges = self.linker_ready.get((layer, layer_end), ())
+                        complete &= _linker_ready_end(ranges, start) >= end
+                        for left, right in ranges:
+                            left, right = max(left, start), min(right, end)
+                            if left >= right:
+                                continue
+                            addr = NetworkAddress(info.endpoint, info.dst_port)
+                            mgr._send_multipart_locked(
+                                addr.to_tcp(),
+                                [
+                                    b"LINKER_READY",
+                                    str(room).encode(),
+                                    info.mooncake_session_id.encode(),
+                                    *[
+                                        str(x).encode()
+                                        for x in (left, right, layer, layer_end)
+                                    ],
+                                ],
+                                is_ipv6=addr.is_ipv6,
+                            )
+                            if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
+                                logger.info(
+                                    "[Linker READY_SEND] room=%s "
+                                    "pages=%s:%s layers=%s:%s",
+                                    room,
+                                    left,
+                                    right,
+                                    layer,
+                                    layer_end,
+                                )
+                if self.linker_rdma_done and complete:
+                    CommonKVManager.conclude_transfer(
+                        mgr, bootstrap_room=room, status=KVPoll.Success
+                    )
+            except Exception as error:
+                self.fail_linker(f"Linker READY failed: {error}")
+
+    def clear(self):
+        with self.linker_lock:
+            self.kv_mgr.linker_senders.pop(self.bootstrap_room, None)
+            self.linker_ready.clear()
+            self.kv_mgr._staging_outstanding.pop(self.bootstrap_room, None)
+            super().clear()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2603,6 +2800,45 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         self.session_id = mgr.get_session_id()
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def receive_linker_ready(self, msg):
+        if len(msg) != 7 or msg[2].decode() != self.session_id:
+            raise ValueError("Invalid Linker READY session")
+        start, end, layer, layer_end = map(int, msg[3:])
+        mgr = self.kv_mgr
+        if not (
+            self.linker_start_page <= start < end <= self.linker_end_page
+            and layer % mgr.linker_group_size == 0
+            and 0 <= layer < layer_end <= mgr.linker_num_layers
+            and layer_end == min(layer + mgr.linker_group_size, mgr.linker_num_layers)
+        ):
+            mgr.record_failure(self.bootstrap_room, "Invalid Linker READY range")
+            mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+        with self.linker_lock:
+            key = (layer, layer_end)
+            self.linker_ready[key] = _merge_linker_ranges(
+                self.linker_ready.get(key, ()), start, end
+            )
+        if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
+            logger.info(
+                "[Linker READY_RECV] room=%s pages=%s:%s layers=%s:%s",
+                self.bootstrap_room,
+                start,
+                end,
+                layer,
+                layer_end,
+            )
+
+    def linker_ready_until(self, layer, layer_end, start):
+        with self.linker_lock:
+            return _linker_ready_end(
+                self.linker_ready.get((layer, layer_end), ()), start
+            )
+
+    def clear(self):
+        self.kv_mgr.linker_receivers.pop(self.bootstrap_room, None)
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -2701,7 +2937,25 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        linker_start_page: Optional[int] = None,
     ):
+        linker_metadata = []
+        if self.kv_mgr.linker_notify:
+            if linker_start_page is None:
+                raise ValueError("Linker metadata requires the HBM prefix boundary")
+            self.linker_lock = threading.Lock()
+            self.linker_ready = {}
+            self.linker_start_page = linker_start_page
+            self.linker_end_page = (
+                (decode_prefix_len or 0) // self.kv_mgr.kv_args.page_size
+            )
+            self.kv_mgr.linker_receivers[self.bootstrap_room] = self
+            linker_metadata = [
+                b"LINKER_NOTIFY",
+                str(linker_start_page).encode(),
+                str(self.kv_mgr.linker_group_size).encode(),
+                str(self.kv_mgr.linker_num_layers).encode(),
+            ]
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -2744,6 +2998,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if not is_dummy and device_kv_indices is not None
                                 else b""
                             ),
+                            *linker_metadata,
                         ]
                     )
             except zmq.ZMQError:
