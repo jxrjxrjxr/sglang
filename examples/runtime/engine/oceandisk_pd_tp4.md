@@ -53,6 +53,7 @@ pdrun() {  # pdrun <运行名> <check|bench|rounds> [变量=值 ...]
   else
     git -C "$REPO" remote add mine "$PD_URL"
   fi
+  git -C "$REPO" config --replace-all remote.mine.fetch '+refs/heads/*:refs/remotes/mine/*'
   git -C "$REPO" config http.proxy http://141.5.133.251:7777
   git -C "$REPO" config http.sslVerify false
   git -C "$REPO" fetch mine "refs/heads/$PD_BRANCH:refs/remotes/mine/$PD_BRANCH"
