@@ -55,6 +55,7 @@ GIDS 库位于 `$W/gids/lib`，8 份配置位于 `$W/gids/cfg_$H/`。132 的 `gi
   else
     git -C "$REPO" remote add mine "$PD_URL"
   fi
+  git -C "$REPO" config --replace-all remote.mine.fetch '+refs/heads/*:refs/remotes/mine/*'
   git -C "$REPO" config http.proxy http://141.5.133.251:7777
   git -C "$REPO" config http.sslVerify false
   git -C "$REPO" fetch mine "refs/heads/$PD_BRANCH:refs/remotes/mine/$PD_BRANCH"
