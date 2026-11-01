@@ -10,6 +10,8 @@ SGLang provides a direct inference engine without the need for an HTTP server. T
 
 ## Examples
 
+- [OceanDisk PD：132／134 单机 check、bench 与多轮对话](./oceandisk_pd_tp4.md)
+
 ### [Offline Batch Inference](./offline_batch_inference.py)
 
 In this example, we launch an SGLang engine and feed a batch of inputs for inference. If you provide a very large batch, the engine will intelligently schedule the requests to process efficiently and prevent OOM (Out of Memory) errors.
