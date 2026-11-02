@@ -1,5 +1,6 @@
 """Expand the real standalone scripts without starting GPU services."""
 
+import argparse
 import json
 import os
 import shutil
@@ -61,7 +62,7 @@ class TestOceanDiskNotifyEntrypoints(unittest.TestCase):
                 self.assertEqual(value("--base-gpu-id"), str(base))
                 self.assertEqual(value("--dist-init-addr"), ip + ":31501")
                 self.assertEqual(value("--chunked-prefill-size"), "16384")
-                self.assertEqual(value("--cuda-graph-max-bs"), "128")
+                self.assertEqual(value("--cuda-graph-max-bs-decode"), "128")
                 self.assertIn("--enable-dp-attention", args)
                 self.assertIn("--disaggregation-decode-enable-radix-cache", args)
                 config = json.loads(value("--hicache-storage-backend-extra-config"))
@@ -75,6 +76,28 @@ class TestOceanDiskNotifyEntrypoints(unittest.TestCase):
         self.assertIn("--disable-prefill-cuda-graph", args)
         self.assertEqual(args[args.index("--dist-init-addr") + 1], "141.111.65.132:31500")
         self.assertEqual(env["SGLANG_DISAGGREGATION_THREAD_POOL_SIZE"], "1")
+
+    def test_graph_options_are_accepted_by_current_cli(self):
+        from sglang.srt.arg_groups.arg_utils import add_cli_args_from_dataclass
+        from sglang.srt.arg_groups.fields.exec_ import ExecGraph
+
+        # Use the actual graph field declarations and CLI registration, so a
+        # renamed option cannot pass merely because the shell emits it.
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        add_cli_args_from_dataclass(parser, ExecGraph)
+        for role in ("prefill", "decode"):
+            for max_bs in (128, 256):
+                with self.subTest(role=role, max_bs=max_bs):
+                    args, _ = self.parse(role, CUDA_GRAPH_MAX_BS=str(max_bs))
+                    parsed, remaining = parser.parse_known_args(args[2:])
+                    self.assertFalse(
+                        [arg for arg in remaining if "cuda-graph" in arg]
+                    )
+                    self.assertIsNone(parsed.cuda_graph_max_bs_prefill)
+                    if role == "decode":
+                        self.assertEqual(parsed.cuda_graph_max_bs_decode, max_bs)
+                    else:
+                        self.assertTrue(parsed.disable_prefill_cuda_graph)
 
     def test_namespace_is_required_and_controls_are_overridable(self):
         for role in ("prefill", "decode"):

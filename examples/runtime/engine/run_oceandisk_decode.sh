@@ -53,7 +53,7 @@ python -m sglang.launch_server \
   --enable-dp-lm-head \
   --load-balance-method round_robin \
   --max-running-requests "${MAX_RUNNING_REQUESTS:-128}" \
-  --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS:-128}" \
+  --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS:-128}" \
   --disaggregation-decode-enable-radix-cache \
   --model-path "$MODEL_PATH" \
   --host "$LOCAL_IP" \

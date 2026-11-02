@@ -331,6 +331,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 | `--enable-nsa-prefill-context-parallel`、`--nsa-prefill-cp-mode round-robin-split` | P 用 `--enable-prefill-cp --cp-strategy interleave`；D 不开 CP |
 | D `TP8/DP4 + --enable-dp-attention --enable-dp-lm-head` | 双机恢复；单机等比例为 TP4/DP2，attention TP 都是2 |
 | `--prefill-round-robin-balance` | 移除；旧版本已是 deprecated no-op；D 用仍有效的 `--load-balance-method round_robin` |
+| `--cuda-graph-max-bs 128` | 当前版本已拆分；D 必须用 `--cuda-graph-max-bs-decode 128`，旧拼写会因 decode／prefill 两个候选而报 ambiguous option。脚本环境变量仍为 `CUDA_GRAPH_MAX_BS`；P 保持禁用 prefill graph |
 | P chunk16384 | 恢复；D notify load window 同为16384；tail 独立固定8192 |
 | P/D queue、thread | 恢复实际最终值 P=1/1、D=2/8；旧 D 后面的 export 覆盖了前面的1/1 |
 | dense-attention threshold | 恢复 P=0、D=20；对纯 D decode 的主路径收益不能据此推算 |
