@@ -12,6 +12,7 @@ SGLang Multi-Turn Conversation Benchmark (Optimized)
 7. 支持 --record-response 开关记录流式返回的对话内容，每轮增量保存，Ctrl+C 中断时保存已有数据。
 8. 支持 --increment-tokens 0 时每轮发送相同请求，不累积历史。
 9. 使用 io.StringIO 替代字符串拼接缓存流式响应，提升性能。
+10. 增加 TPOT (Time Per Output Token) 统计，一并输出到日志与 JSON。
 
 注意：获取每请求 kvcache 命中率依赖服务端返回 usage.prompt_tokens_details.cached_tokens，
 需加 --request-usage 并在启动 sglang 服务时加 --enable-cache-report；否则退回用全局指标增量估算。
@@ -39,6 +40,7 @@ class SingleRequestResult:
     response: Optional[str] = None
     ttft_ms: Optional[float] = None
     total_latency_ms: Optional[float] = None
+    tpot_ms: Optional[float] = None  # Time Per Output Token (排除首 token)
     error: Optional[str] = None
     output_tokens: int = 0
     prompt_tokens: Optional[int] = None  # 本次请求输入 prompt token 数（来自 usage.prompt_tokens）
@@ -56,6 +58,9 @@ class RoundBatchResult:
     avg_ttft_ms: float
     max_ttft_ms: float
     min_ttft_ms: float
+    avg_tpot_ms: float
+    max_tpot_ms: float
+    min_tpot_ms: float
     avg_total_latency_ms: float
     total_time_ms: float
     throughput_rps: float
@@ -270,11 +275,20 @@ class SGLangBatchBenchmark:
             ttft = (first_token_time - start_time) * 1000 if first_token_time else None
             output_tokens = self.count_tokens(full_response, kind="OUTPUT") if full_response else 0
 
+            # ---------- 新增: 计算 TPOT ----------
+            # TPOT = (总延迟 - TTFT) / (输出 token 数 - 1)
+            # 若输出 token <= 1，则无法度量 token 间延迟
+            tpot = None
+            total_latency_ms = total_time * 1000
+            if ttft is not None and output_tokens > 1:
+                tpot = (total_latency_ms - ttft) / (output_tokens - 1)
+
             return SingleRequestResult(
                 success=True,
                 response=full_response,
                 ttft_ms=ttft,
-                total_latency_ms=total_time * 1000,
+                total_latency_ms=total_latency_ms,
+                tpot_ms=tpot,
                 output_tokens=output_tokens,
                 prompt_tokens=usage_prompt_tokens,
                 cached_tokens=usage_cached_tokens if usage_prompt_tokens is not None else None,
@@ -379,15 +393,21 @@ class SGLangBatchBenchmark:
         else:
             real_cache_hit_rate = server_hit_rate
 
+        # ---------- 新增: TPOT 聚合 ----------
         if success_count > 0:
             ttfts = [r.ttft_ms for _, r in results if r.success and r.ttft_ms is not None]
             latencies = [r.total_latency_ms for _, r in results if r.success and r.total_latency_ms is not None]
+            tpots = [r.tpot_ms for _, r in results if r.success and r.tpot_ms is not None]
             avg_ttft = statistics.mean(ttfts) if ttfts else 0
             max_ttft = max(ttfts) if ttfts else 0
             min_ttft = min(ttfts) if ttfts else 0
             avg_lat = statistics.mean(latencies) if latencies else 0
+            avg_tpot = statistics.mean(tpots) if tpots else 0
+            max_tpot = max(tpots) if tpots else 0
+            min_tpot = min(tpots) if tpots else 0
         else:
             avg_ttft = max_ttft = min_ttft = avg_lat = 0
+            avg_tpot = max_tpot = min_tpot = 0
 
         throughput = success_count / (total_time_ms / 1000) if total_time_ms > 0 else 0
 
@@ -400,6 +420,9 @@ class SGLangBatchBenchmark:
             avg_ttft_ms=avg_ttft,
             max_ttft_ms=max_ttft,
             min_ttft_ms=min_ttft,
+            avg_tpot_ms=avg_tpot,
+            max_tpot_ms=max_tpot,
+            min_tpot_ms=min_tpot,
             avg_total_latency_ms=avg_lat,
             total_time_ms=total_time_ms,
             throughput_rps=throughput,
@@ -522,13 +545,16 @@ class SGLangBatchBenchmark:
 
     def _print_batch_result(self, result: RoundBatchResult):
         status = f"{result.successful_requests}/{result.batch_size} succ"
+        # ---------- 新增: 打印 TPOT ----------
         print(f"[Round {result.round_num:2d}] {status} | "
-              f"Total Input: {result.total_input_tokens:6d} tok | "
-              f"Avg TTFT: {result.avg_ttft_ms:8.2f} ms | "
-              f"Max TTFT: {result.max_ttft_ms:8.2f} ms | "
-              f"Throughput: {result.throughput_rps:6.2f} req/s | "
-              f"Cache Hit: {result.cache_hit_rate*100:5.1f}% | "
-              f"Cached: {result.cached_tokens_delta:6d}/{result.total_prompt_tokens_delta:6d} tok")
+            f"Total Input: {result.total_input_tokens:6d} tok | "
+            f"Avg TTFT: {result.avg_ttft_ms:8.2f} ms | "
+            f"Max TTFT: {result.max_ttft_ms:8.2f} ms | "
+            f"Avg TPOT: {result.avg_tpot_ms:7.2f} ms | "
+            f"Max TPOT: {result.max_tpot_ms:7.2f} ms | "
+            f"Throughput: {result.throughput_rps:6.2f} req/s | "
+            f"Cache Hit: {result.cache_hit_rate*100:5.1f}% | "
+            f"Cached: {result.cached_tokens_delta:6d}/{result.total_prompt_tokens_delta:6d} tok")
 
 
 def save_conversations(all_messages: List[List[Dict[str, str]]], conversation_dir: str):
@@ -649,7 +675,7 @@ def main():
     end_total = time.perf_counter()
 
     print("\n" + "=" * 80)
-    print("Summary (Using Incremental Cache Hit Rate)")
+    print("Summary (Using Incremental Cache Hit Rate, with TPOT)")
     print("=" * 80)
 
     successful_rounds = [r for r in results if r.successful_requests > 0]
@@ -657,10 +683,14 @@ def main():
         avg_ttft = statistics.mean(r.avg_ttft_ms for r in successful_rounds)
         avg_throughput = statistics.mean(r.throughput_rps for r in successful_rounds)
         avg_cache = statistics.mean(r.cache_hit_rate for r in successful_rounds)
+        # ---------- 新增: 汇总 TPOT ----------
+        tpot_rounds = [r for r in successful_rounds if r.avg_tpot_ms > 0]
+        avg_tpot = statistics.mean(r.avg_tpot_ms for r in tpot_rounds) if tpot_rounds else 0.0
         total_success = sum(r.successful_requests for r in results)
         total_fail = sum(r.failed_requests for r in results)
         print(f"Total Time: {end_total - start_total:.2f} s")
         print(f"Average TTFT (across rounds): {avg_ttft:.2f} ms")
+        print(f"Average TPOT (across rounds): {avg_tpot:.2f} ms/token")
         print(f"Average Throughput: {avg_throughput:.2f} req/s")
         print(f"Average Cache Hit Rate (real per-round): {avg_cache*100:.1f}%")
         print(f"Total successful requests: {total_success}")
@@ -670,14 +700,17 @@ def main():
         print("  (请查看上方 CRITICAL 分支打印的具体错误)")
 
     print("\nDetailed Results (per round):")
-    print("-" * 100)
-    print(f"{'Round':>6} | {'Total In':>12} | {'Succ/Total':>10} | {'Avg TTFT':>10} | {'Max TTFT':>10} | {'Throughput':>10} | {'Cache Hit':>10} | {'Cached/Prompt':>15}")
-    print("-" * 100)
+    print("-" * 150)
+    print(f"{'Round':>6} | {'Total Input':>12} | {'Succ/Total':>10} | {'Avg TTFT':>10} | {'Max TTFT':>10} | "
+        f"{'Avg TPOT':>10} | {'Max TPOT':>10} | {'Throughput':>10} | {'Cache Hit':>10} | {'Cached/Prompt':>15}")
+    print("-" * 150)
     for r in results:
         print(f"{r.round_num:6d} | {r.total_input_tokens:12d} | {r.successful_requests:3d}/{r.batch_size:3d}    | "
-              f"{r.avg_ttft_ms:10.2f} | {r.max_ttft_ms:10.2f} | {r.throughput_rps:10.2f} | "
-              f"{r.cache_hit_rate*100:9.1f}% | {r.cached_tokens_delta:6d}/{r.total_prompt_tokens_delta:6d}")
-    print("-" * 100)
+            f"{r.avg_ttft_ms:10.2f} | {r.max_ttft_ms:10.2f} | "
+            f"{r.avg_tpot_ms:10.2f} | {r.max_tpot_ms:10.2f} | "
+            f"{r.throughput_rps:10.2f} | "
+            f"{r.cache_hit_rate*100:9.1f}% | {r.cached_tokens_delta:6d}/{r.total_prompt_tokens_delta:6d}")
+    print("-" * 150)
 
     if args.output_json:
         output_data = {
@@ -688,6 +721,10 @@ def main():
                     "total_input_tokens": r.total_input_tokens,
                     "avg_ttft_ms": r.avg_ttft_ms,
                     "max_ttft_ms": r.max_ttft_ms,
+                    "min_ttft_ms": r.min_ttft_ms,
+                    "avg_tpot_ms": r.avg_tpot_ms,
+                    "max_tpot_ms": r.max_tpot_ms,
+                    "min_tpot_ms": r.min_tpot_ms,
                     "throughput_rps": r.throughput_rps,
                     "cache_hit_rate": r.cache_hit_rate,
                     "cached_tokens_delta": r.cached_tokens_delta,

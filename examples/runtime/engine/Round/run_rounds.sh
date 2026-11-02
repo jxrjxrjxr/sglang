@@ -3,8 +3,8 @@ python3 run_rounds.py \
   --model /home/models/GLM-5.2-W4AFP8/ \
   --rounds 10 \
   --batch-size 10 \
-  --initial-tokens 128000 \
-  --increment-tokens 256 \
+  --initial-tokens 16000 \
+  --increment-tokens 16000 \
   --output-len 16 \
   --record-response \
   --request-usage \

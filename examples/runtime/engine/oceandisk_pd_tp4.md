@@ -9,8 +9,8 @@
 | `run_oceandisk_prefill.sh` | 必要赋值＋一条 `python -m sglang.launch_server`；前台运行 P |
 | `run_oceandisk_decode.sh` | 同上；独立配置 D 的 TP、DP、物理 GPU 起点和 IP |
 | `run_oceandisk_router.sh` | 一条 router 命令；P/D 地址独立 |
-| `Round/run_rounds.py` | 原样复用 `D:\CodeSpace\LLMTest\Round`，保留人工清缓存、回车和统计口径 |
-| `Round/run_rounds.sh` | 只有 `python3 run_rounds.py` 与参数；128000 起步、每轮 +256、输出上限 16、10 会话 × 10 轮 |
+| `Round/run_rounds.py` | 基于 `D:\CodeSpace\LLMTest\Round`，保留人工清缓存、回车及原 TTFT／缓存统计口径；增加 TPOT |
+| `Round/run_rounds.sh` | 只有 `python3 run_rounds.py` 与参数；16000 起步、每轮 +16000、输出上限 16、10 会话 × 10 轮（约 16K→160K） |
 
 服务脚本不启动其他服务、不等待健康检查、不清理进程、不运行压测。先在三个终端启动 P、D、router，再用第四个终端跑 Round。前台服务用 Ctrl+C 停止；需要后台日志时使用第 5 节的外部命令。
 
@@ -223,18 +223,18 @@ curl --noproxy '*' -i --max-time 60 -X POST "http://$P_IP:31002/flush_cache?time
 
 请求全部结束后操作，确认每次均为 HTTP200／`Cache flushed.` 再回车；400 是清理失败。D 的服务端 flush 面向该实例全部 DP 组，仍需从各 scheduler 日志确认无在途请求。flush 释放缓存状态，模型和预分配 KV 池仍在，`nvidia-smi` 不会归零。独立实验重启服务并换 namespace；仅清 P+D 不清 OceanDisk。
 
-先用 batch=1 分离单请求成本，再跑默认 batch=10；完整 batch=1 参数：
+先用相同负载的 batch=1 分离单请求成本，再跑默认 batch=10；完整 batch=1 参数：
 
 ```bash
 python3 run_rounds.py \
   --base-url http://127.0.0.1:31345 \
   --model /home/models/GLM-5.2-W4AFP8/ \
-  --rounds 10 --batch-size 1 --initial-tokens 128000 --increment-tokens 256 \
+  --rounds 10 --batch-size 1 --initial-tokens 16000 --increment-tokens 16000 \
   --output-len 16 --record-response --request-usage \
-  --conversation-dir ./conversations_128k_b1 --output-json ./rounds_128k_b1.json
+  --conversation-dir ./conversations_16k_increment_b1 --output-json ./rounds_16k_increment_b1.json
 ```
 
-16K 递增负载（目标 16K→160K，包含实际历史／模板开销，以 usage 为准）：
+默认负载对齐张圆旧命令：initial=16000、increment=16000、10 轮、并发 10、输出上限 16（目标 16K→160K，包含实际历史／模板开销，以 usage 为准）。`bash run_rounds.sh` 使用同样的负载参数；以下命令另指定结果保存路径：
 
 ```bash
 python3 run_rounds.py \
@@ -245,7 +245,11 @@ python3 run_rounds.py \
   --conversation-dir ./conversations_16k_increment --output-json ./rounds_16k_increment.json
 ```
 
-Round 的输出 16 是请求上限，保留原件的 EOS／思考处理；可能提前结束，实际 output tokens 必须记录。它的 TTFT 是**首条非空 SSE 行**，不是首个内容 token；不能与 bench TTFT 混用。Round Python 原件 SHA256：`d94abd42e4da3b8447ca4992658e9d99dcd83f6e4f66147ae0fa47acc02a04f9`。
+Round 的输出 16 是请求上限，保留原件的 EOS／思考处理；可能提前结束，实际 output tokens 必须记录。它的 TTFT 是**首条非空 SSE 行**，不是首个内容 token；不能与 bench TTFT 混用。原始 128K 小增量对照仍可使用 `--initial-tokens 128000 --increment-tokens 256`。
+
+新增 `Avg TPOT`／`Max TPOT`，计算、聚合及输出直接复用 `run_test_rounds_v6.py`：每请求 `TPOT = (total_latency_ms - ttft_ms) / (output_tokens - 1)`，其中 TTFT 仍为首条非空 SSE，`output_tokens` 沿用回复正文的本地计数。输出不足两个 token 时该请求 TPOT 为 `None`；每轮只聚合成功且 TPOT 非 `None` 的请求，无有效值时 avg/max/min 为 0；跨轮平均只纳入 `avg_tpot_ms > 0` 的成功轮。JSON 与 v6 一致增加 `avg_tpot_ms`、`max_tpot_ms`、`min_tpot_ms`，终端显示 Avg／Max 两列、两位小数。
+
+Round Python 已在 LLMTest 原件上增加上述统计，当前文件不再与原件哈希相同；历史原件 SHA256 为 `d94abd42e4da3b8447ca4992658e9d99dcd83f6e4f66147ae0fa47acc02a04f9`。
 
 ## 7. 逐项性能对照与诊断客户端
 
@@ -349,7 +353,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 
 ## 10. 验证状态与旧入口
 
-本地用现有 uv Python、torch 执行实际源码的 CPU/mock 隔离测试：notify/加载/脚本74项中68通过、6项POSIX进程测试因Windows跳过；key专项5项、路由及descriptor专项6项通过。shell语法与真实参数展开（含必填变量、单双机和tail覆盖）通过；Round Python与用户原件哈希一致。模拟 hash 验证的是路由逻辑，跨语言 xxh3 和 native 可见性仍须实机确认。
+本地用现有 uv Python、torch 执行实际源码的 CPU/mock 隔离测试：notify/加载/脚本74项中68通过、6项POSIX进程测试因Windows跳过；key专项5项、路由及descriptor专项6项通过。shell语法与真实参数展开（含必填变量、单双机和tail覆盖）通过；首次对齐时 Round Python与用户原件哈希一致；本轮 TPOT 扩展后以当前文件为准。模拟 hash 验证的是路由逻辑，跨语言 xxh3 和 native 可见性仍须实机确认。
 
 扩大执行旧存储测试时发现既有失配：旧 fixture 缺 `_put_io_lock`、仍传 `max_ranges`，及旧逐层失败断言不适配当前批量接口。用 `9dc1fcf964` 原件复跑仍是1 failure／14 error记录（含subtest）；本轮不改这些旧接口和测试预期。完整Linux导入、GPU/RDMA/GIDS、DP实际容量、双机正确性和性能尚未验证。
 
