@@ -5,16 +5,128 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "examples/runtime/engine/run_oceandisk_pd_tp4.sh"
+
+
+class TestOceanDiskPDStop(unittest.TestCase):
+    def setUp(self):
+        self.code = (
+            SCRIPT.read_text(encoding="utf-8")
+            .split('if [ "$mode" = stop ]; then\n', 1)[1]
+            .split("<<'PY'\n", 1)[1]
+            .split("\nPY\n", 1)[0]
+        )
+        self.psutil = Mock(
+            CONN_LISTEN="LISTEN", STATUS_ZOMBIE="zombie", NoSuchProcess=ProcessLookupError
+        )
+        self.psutil.net_connections.return_value = []
+        self.psutil.wait_procs.return_value = ([], [])
+
+    def process(self, pid, command="sglang::tokenizer"):
+        proc = Mock(pid=pid)
+        proc.cmdline.return_value = [command]
+        proc.children.return_value = []
+        return proc
+
+    def connection(self, pid, port=31002, status="LISTEN", ip="127.0.0.1"):
+        return SimpleNamespace(
+            pid=pid, laddr=SimpleNamespace(ip=ip, port=port), status=status
+        )
+
+    def run_stop(self):
+        with patch.dict(sys.modules, psutil=self.psutil), patch("builtins.print"):
+            exec(compile(self.code, str(SCRIPT), "exec"), {})
+
+    def test_current_listeners_and_children_are_stopped_once(self):
+        parents = [self.process(pid) for pid in (101, 102, 103)]
+        child = self.process(201, "sglang::scheduler")
+        parents[0].children.return_value = [child]
+        self.psutil.Process.side_effect = {p.pid: p for p in parents}.__getitem__
+        connections = [
+            self.connection(p.pid, port)
+            for p, port in zip(parents, (31002, 31001, 31345))
+        ]
+        self.psutil.net_connections.return_value = connections + connections[:1]
+        self.run_stop()
+        for proc in [*parents, child]:
+            proc.terminate.assert_called_once_with()
+            proc.kill.assert_not_called()
+        for proc in parents:
+            proc.children.assert_called_with(recursive=True)
+
+    def test_other_ports_and_non_listeners_are_ignored(self):
+        self.psutil.net_connections.return_value = [
+            self.connection(101, port=9000),
+            self.connection(102, status="ESTABLISHED"),
+            self.connection(103, ip="127.0.0.2"),
+        ]
+        self.run_stop()
+        self.psutil.Process.assert_not_called()
+
+    def test_all_listeners_are_checked_before_signalling(self):
+        parent = self.process(101)
+        for other in (None, 102):
+            with self.subTest(other=other):
+                self.psutil.net_connections.return_value = [
+                    self.connection(101), self.connection(other, port=31345)
+                ]
+                self.psutil.Process.side_effect = lambda pid: (
+                    parent if pid == 101 else self.process(pid, "unrelated-server")
+                )
+                with self.assertRaises(SystemExit):
+                    self.run_stop()
+                parent.terminate.assert_not_called()
+
+    def test_exited_service_and_child_do_not_interrupt_cleanup(self):
+        parent, child = self.process(101), self.process(201)
+        parent.children.return_value = [child]
+        child.terminate.side_effect = ProcessLookupError
+        self.psutil.net_connections.return_value = [
+            self.connection(102), self.connection(101)
+        ]
+        self.psutil.Process.side_effect = [ProcessLookupError, parent]
+        self.run_stop()
+        parent.terminate.assert_called_once_with()
+
+    def test_term_timeout_kills_remaining_processes(self):
+        parent = self.process(101)
+        self.psutil.net_connections.return_value = [self.connection(101)]
+        self.psutil.Process.return_value = parent
+        self.psutil.wait_procs.side_effect = [([], [parent]), ([parent], [])]
+        self.run_stop()
+        parent.kill.assert_called_once_with()
+        self.assertEqual(self.psutil.wait_procs.call_args_list[0].kwargs, {"timeout": 5})
+        self.assertEqual(self.psutil.wait_procs.call_args_list[1].kwargs, {"timeout": 5})
+
+    def test_remaining_process_is_reported_as_failure(self):
+        parent = self.process(101)
+        self.psutil.net_connections.return_value = [self.connection(101)]
+        self.psutil.Process.return_value = parent
+        self.psutil.wait_procs.return_value = ([], [parent])
+        with self.assertRaisesRegex(SystemExit, "Processes still running: \\[101\\]"):
+            self.run_stop()
+
+    def test_zombie_or_reaped_process_is_already_stopped(self):
+        for status in ("zombie", ProcessLookupError):
+            with self.subTest(status=status):
+                parent = self.process(101)
+                parent.status.side_effect = [status]
+                self.psutil.net_connections.return_value = [self.connection(101)]
+                self.psutil.Process.return_value = parent
+                self.psutil.wait_procs.return_value = ([], [parent])
+                self.run_stop()
 
 
 @unittest.skipUnless(
@@ -183,6 +295,8 @@ wait
     def test_start_failure_stops_started_services(self):
         for role in ("prefill", "decode", "router"):
             with self.subTest(role=role):
+                (self.base / "logs").mkdir(exist_ok=True)
+                (self.base / "logs/server.pids").write_text("42\n")
                 process = self.start("start", FAIL_START_ROLE=role)
                 stdout, _ = process.communicate(timeout=15)
                 self.assertNotEqual(process.returncode, 0)

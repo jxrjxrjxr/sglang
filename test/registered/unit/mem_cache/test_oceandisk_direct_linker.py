@@ -1,6 +1,7 @@
 """CPU tests for OceanDisk layout conversion and backend completion contracts."""
 
 import gc
+import hashlib
 import inspect
 import itertools
 import tempfile
@@ -31,6 +32,7 @@ from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
     LayerwiseSaveSession,
     OceanDiskDirectLinker,
 )
+from sglang.srt.mem_cache.storage.oceandisk.connection_router import ConnectionRouter
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
     OceanDiskRange,
     OceanDiskStorage,
@@ -187,6 +189,50 @@ class TestOceanDiskStorage(CustomTestCase):
                     "cuda:0",
                     [],
                 )
+
+    def make_connection_router(self, groups, endpoint):
+        # Exercise routing independently of the installed xxhash implementation.
+        # Cross-language xxh3/native compatibility is an on-device check.
+        hasher = SimpleNamespace(
+            xxh3_64_hexdigest=lambda value: hashlib.sha256(value).hexdigest()[:16]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gids_config.txt"
+            path.write_text("".join(
+                f"ip_config = 10.0.0.1, {endpoint}, {1234 + index}, 3, 1, {dpu}\n"
+                for index, dpu in enumerate(groups)
+            ))
+            with patch.dict("sys.modules", {"xxhash3_py": hasher}):
+                return ConnectionRouter(path, tuple(range(len(groups))))
+
+    def test_multiple_connections_keep_dpu_routing_across_endpoints(self):
+        prefill = self.make_connection_router((11, 12, 11, 12), "10.0.0.10")
+        decode = self.make_connection_router((12, 11, 12, 11), "10.0.0.11")
+        self.assertEqual(prefill.ring, decode.ring)
+        seen = set()
+        for key in prefill.coordinates:
+            for _ in range(3):
+                p_conn, d_conn = prefill.select(key), decode.select(key)
+                seen.add(p_conn)
+                self.assertEqual(
+                    prefill.endpoints[p_conn][2], decode.endpoints[d_conn][2]
+                )
+        self.assertEqual(seen, {0, 1, 2, 3})
+
+    def test_multiple_connections_route_kv_and_indexer_together(self):
+        router = self.make_connection_router((11, 12, 11, 12), "10.0.0.10")
+        keys = router.coordinates[:4]
+        ranges = [OceanDiskRange(key, 1000 + i * 32, 32) for i, key in enumerate(keys)]
+        ranges += [OceanDiskRange(key, 5000 + i * 32, 32) for i, key in enumerate(keys)]
+        select = Mock(wraps=router.select)
+        for layer in range(3):
+            row = pack_io(
+                layer, ranges, [(1000, 128), (5000, 128)], (0, 1, 2, 3),
+                select_connection=select,
+            )
+            connections = row[-len(ranges):]
+            self.assertEqual(connections[:4], connections[4:])
+        self.assertEqual(select.call_count, 3 * len(keys))
 
     def make_storage(self):
         storage = OceanDiskStorage.__new__(OceanDiskStorage)
@@ -666,7 +712,17 @@ class TestOceanDiskDirectLinker(CustomTestCase):
         return linker
 
     def make_initialized_linker(
-        self, mode, tp_size, *, cp_size=1, cp_rank=0, tp_rank=0, replicated=True
+        self,
+        mode,
+        tp_size,
+        *,
+        cp_size=1,
+        cp_rank=0,
+        tp_rank=0,
+        replicated=True,
+        dp_size=1,
+        dp_rank=0,
+        notify=False,
     ):
         group = self.make_linker().pool_group
         group.rank_replicated = replicated
@@ -685,6 +741,11 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             attention_backend="dsa",
             cp_strategy="interleave" if cp_size > 1 else None,
             speculative_algorithm=None,
+            tp_size=tp_size * cp_size * dp_size,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            enable_dp_attention=dp_size > 1,
+            disaggregation_linker_notify=notify,
         )
         module = "sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker"
         with (
@@ -692,7 +753,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             patch(
                 f"{module}.get_memory",
                 return_value=SimpleNamespace(
-                    hicache_storage_backend_extra_config='{"namespace":"pd-test","layerwise_save":false}'
+                    hicache_storage_backend_extra_config='{"namespace":"pd-test","layerwise_save":true}'
                 ),
             ),
             patch(
@@ -700,8 +761,20 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             ),
             patch("torch.distributed.is_available", return_value=True),
             patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_rank", return_value=tp_rank),
-            patch("torch.distributed.get_world_size", return_value=tp_size),
+            patch(
+                "torch.distributed.get_rank",
+                side_effect=lambda group: (
+                    tp_rank if group is params.attn_tp_cache_group
+                    else tp_rank + tp_size * (dp_rank + cp_rank)
+                ),
+            ),
+            patch(
+                "torch.distributed.get_world_size",
+                side_effect=lambda group: (
+                    tp_size if group is params.attn_tp_cache_group
+                    else tp_size * cp_size * dp_size
+                ),
+            ),
             patch("threading.Thread.start"),
         ):
             return OceanDiskDirectLinker(
@@ -722,6 +795,42 @@ class TestOceanDiskDirectLinker(CustomTestCase):
                 self.assertEqual(cp_peer._object_key("p0"), decode._object_key("p0"))
                 self.assertEqual(tp_peer._object_key("p0"), decode._object_key("p0"))
                 self.assertFalse(cp_peer.offload_owner)
+
+    def test_notify_dp_groups_share_prefill_full_page_keys(self):
+        for total_tp, dp_size in ((4, 1), (4, 2), (8, 4)):
+            with self.subTest(total_tp=total_tp, dp_size=dp_size):
+                prefill = self.make_initialized_linker(
+                    "prefill", 1, cp_size=total_tp, notify=True
+                )
+                for dp_rank in range(dp_size):
+                    for rank in range(total_tp // dp_size):
+                        decode = self.make_initialized_linker(
+                            "decode",
+                            total_tp // dp_size,
+                            tp_rank=rank,
+                            dp_size=dp_size,
+                            dp_rank=dp_rank,
+                            notify=True,
+                        )
+                        self.assertEqual(
+                            prefill._object_key("p0"), decode._object_key("p0"),
+                            (dp_rank, rank),
+                        )
+                legacy = self.make_initialized_linker("decode", total_tp)
+                self.assertEqual(prefill._object_key("p0"), legacy._object_key("p0"))
+
+    def test_notify_dp_does_not_change_null_or_sharded_keys(self):
+        for mode, replicated in (("null", True), ("decode", False)):
+            first = self.make_initialized_linker(mode, 2, replicated=replicated)
+            # Non-notify deployments retain their attention-TP namespace.
+            second = self.make_initialized_linker(
+                mode, 2, dp_size=2, replicated=replicated
+            )
+            self.assertEqual(first._object_key("p0"), second._object_key("p0"))
+        with self.assertRaisesRegex(ValueError, "rank-replicated"):
+            self.make_initialized_linker(
+                "decode", 2, dp_size=2, notify=True, replicated=False
+            )
 
     def test_pd_cp_keys_preserve_non_cp_hybrid_and_sharded_namespaces(self):
         decode = self.make_initialized_linker("decode", 4)

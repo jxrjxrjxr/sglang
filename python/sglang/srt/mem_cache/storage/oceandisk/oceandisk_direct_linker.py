@@ -241,11 +241,22 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 "OceanDisk namespace must be a nonempty model/version identifier."
             )
+        storage_tp_size = tp_size * params.attn_cp_size if pd_shared_cp_cache else tp_size
+        # Notify stores one full DSA page, independent of decode's DP rank.
+        # P: attention TP=1 x CP; D: attention TP x DP. Both identify the
+        # same instance-wide TP layout without changing legacy/NULL keys.
+        if (
+            getattr(server_args, "disaggregation_linker_notify", False)
+            and server_args.disaggregation_mode == "decode"
+            and replicated
+            and getattr(server_args, "enable_dp_attention", False)
+        ):
+            storage_tp_size *= server_args.dp_size
         self._namespace = (
             "sglang-oceandisk-pool-pages",
             namespace,
             params.page_size,
-            tp_size * params.attn_cp_size if pd_shared_cp_cache else tp_size,
+            storage_tp_size,
             None if replicated else tp_rank,
             1 if pd_shared_cp_cache else params.attn_cp_size,
             storage_cp_rank,

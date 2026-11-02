@@ -150,6 +150,29 @@ class TestLinkerNotifyTransport(unittest.TestCase):
         self.mgr.conclude_transfer(bootstrap_room=7, status=KVPoll.Success)
         self.assertEqual(self.mgr.request_status[7], KVPoll.Success)
 
+    def test_ready_targets_only_registered_sessions_of_its_request(self):
+        second_peer = SimpleNamespace(**vars(self.peer))
+        second_peer.mooncake_session_id = "decode-peer"
+        second_peer.linker_start_page = 3
+        second_peer.required_dst_info_num = self.peer.required_dst_info_num = 2
+        self.mgr.transfer_infos[7]["decode-peer"] = second_peer
+        other_peer = SimpleNamespace(**vars(self.peer))
+        other_peer.mooncake_session_id = "other-dp"
+        other_peer.required_dst_info_num = 1
+        self.mgr.transfer_infos[9] = {"other-dp": other_peer}
+        self.mgr.request_status[9] = KVPoll.Transferring
+        self.mgr._send_multipart_locked.side_effect = (
+            lambda address, parts, **kwargs: self.messages.append(parts)
+        )
+        self.mgr.conclude_transfer(bootstrap_room=7, status=KVPoll.Success)
+        self.sender.notify_linker_ready(0, 8, 0, 3)
+        ready = [m for m in self.messages if m[0] == b"LINKER_READY"]
+        self.assertEqual({m[1] for m in ready}, {b"7"})
+        self.assertEqual({m[2] for m in ready}, {b"decode", b"decode-peer"})
+        self.assertTrue(all(int(m[3]) == 3 for m in ready if m[2] == b"decode-peer"))
+        self.assertEqual(self.mgr.request_status[7], KVPoll.Success)
+        self.assertEqual(self.mgr.request_status[9], KVPoll.Transferring)
+
     def test_late_bootstrap_replays_completed_ranges(self):
         infos = self.mgr.transfer_infos.pop(7)
         self.sender.notify_linker_ready(0, 8, 0, 3)

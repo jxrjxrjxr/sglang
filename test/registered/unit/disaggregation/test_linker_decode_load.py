@@ -596,6 +596,52 @@ class TestLinkerDecodeLoad(unittest.TestCase):
                         LinkerLoadGatedKVReceiver(dr).poll(), KVPoll.Success
                     )
 
+    def test_dp_groups_progress_independently_with_different_queue_lengths(self):
+        peer = TestLinkerDecodeLoad()
+        peer.setUp()
+        self.addCleanup(peer.doCleanups)
+        a = self.request("a", l1=0, prefix=8)
+        b = self.request("b", l1=4, prefix=12, slot=1)
+        c = peer.request("c", l1=0, prefix=16)
+        c.kv_receiver.linker_ready_until.return_value = 0
+        self.process(a, b)
+        peer.process(c)
+        self.assertEqual(len(self.batches), 1)
+        self.assertEqual(len(peer.batches), 0)
+        self.assertEqual(self.cache._all_reduce_attn_groups.call_args.args[0].numel(), 2)
+        self.assertEqual(peer.cache._all_reduce_attn_groups.call_args.args[0].numel(), 1)
+        self.complete_batch()
+        self.process(a, b)
+        self.assertEqual((a.linker_loaded_len, b.linker_loaded_len), (8, 12))
+        self.assertEqual(LinkerLoadGatedKVReceiver(a).poll(), KVPoll.Success)
+        self.assertEqual(c.linker_loaded_len, 0)
+        c.kv_receiver.linker_ready_until.return_value = 100
+        peer.process(c)
+        peer.complete_batch(success=False)
+        peer.process(c)
+        self.assertTrue(c.linker_failed)
+        self.assertFalse(a.linker_failed)
+        self.assertEqual(LinkerLoadGatedKVReceiver(a).poll(), KVPoll.Success)
+
+    def test_cache_consensus_stays_inside_each_attention_group(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        outer_tp = object()
+        attention_groups = [object(), object()]
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce") as reduce,
+        ):
+            for group, size in zip(attention_groups, (2, 1)):
+                cache = SimpleNamespace(
+                    attn_cp_group=None, attn_tp_group=group,
+                    tp_group=outer_tp, tp_world_size=4,
+                )
+                UnifiedRadixCache._all_reduce_attn_groups(
+                    cache, torch.ones(size), torch.distributed.ReduceOp.MIN
+                )
+        self.assertEqual([call.kwargs["group"] for call in reduce.call_args_list], attention_groups)
+
     def test_configuration_rejects_out_of_scope_combinations(self):
         defaults = dict(
             disaggregation_linker_notify=True,
@@ -606,6 +652,7 @@ class TestLinkerDecodeLoad(unittest.TestCase):
             disaggregation_decode_enable_radix_cache=True,
             pp_size=1,
             dp_size=1,
+            tp_size=4,
             enable_dp_attention=False,
             enable_hierarchical_cache=False,
             disaggregation_decode_retraction_backup=None,
@@ -648,7 +695,18 @@ class TestLinkerDecodeLoad(unittest.TestCase):
                 else:
                     pd_disaggregation_hook.handle_pd_disaggregation(cfg)
                     cfg.enable_dp_attention = True
-                    pd_disaggregation_hook.handle_pd_disaggregation(cfg)
+                    for tp, dp in ((4, 1), (4, 2), (8, 4)):
+                        cfg.tp_size, cfg.dp_size = tp, dp
+                        pd_disaggregation_hook.handle_pd_disaggregation(cfg)
+                    for tp, dp in ((4, 3), (4, 0), (4, 8)):
+                        cfg.tp_size, cfg.dp_size = tp, dp
+                        with self.assertRaisesRegex(ValueError, "decode DP attention"):
+                            pd_disaggregation_hook.handle_pd_disaggregation(cfg)
+                    cfg.tp_size, cfg.dp_size = 4, 2
+                    cfg.disaggregation_mode = "prefill"
+                    with self.assertRaisesRegex(ValueError, "prefill dp-size=1"):
+                        pd_disaggregation_hook.handle_pd_disaggregation(cfg)
+                    cfg.disaggregation_mode, cfg.dp_size = "decode", 1
                     for env, value in [
                         (envs.SGLANG_DISAGG_STAGING_BUFFER, True),
                         (envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER, True),

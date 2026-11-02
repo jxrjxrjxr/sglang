@@ -1,6 +1,6 @@
 # OceanDisk PD：PUT 完成通知驱动 GET
 
-更新：2026-11-01。分支：`dev_oceandisk_linker_pd_notify`。
+更新：2026-11-02。分支：`dev_oceandisk_linker_pd_notify`。
 
 本方案复用原生 Mooncake PD 的握手、ZMQ socket、尾部 RDMA、metadata 和失败处理。P 对每个 token chunk 分组完成 layerwise PUT，等待本地 save event 完成后发送 READY；D 收到通知后直接 GET 对应页和层，不调用 EXIST。D 保留 HBM radix cache，只有 P 做存储卸载。
 
@@ -67,42 +67,29 @@ P 自身缓存恢复沿用张圆的混部逻辑，没有新增 GET/EXIST 互斥�
 
 ## 配置与启动
 
-保持单机 8 卡布局：P GPU 0–3，D GPU 4–7，各 TP4，P 显式启用 `--enable-prefill-cp --cp-strategy interleave`，D 不开 CP。P、D 都带 `--disaggregation-linker-notify`；脚本会自动添加。
+2026-11-01 参数对齐改造基于 `9dc1fcf964`，2026-11-02 经用户检查批准，纳入当前 notify 分支交付。日常操作见 [notify 指南](examples/runtime/engine/oceandisk_pd_tp4.md)：P、D、router 三个独立前台脚本，加原样 Round Python／单命令 shell。旧聚合 launcher 保留，其停止修复和测试一并交付。
 
-两端需要同样的模型、page 大小、总 TP 宽度、namespace、层数及层组大小。当前支持 DSA 复制缓存、PP=1、DP=1、DCP=1，无 speculative decoding、staging、hierarchical cache、host_pool 回撤备份或 D offload；P 必须开启 interleave CP，保持 attention TP=1，并使用 `layerwise_save=true`。DSA 层切分和所有 CP rank 同时传输会在启动阶段被拒绝。
+- 单机：P GPU0–3 TP4/CP4/DP1；D GPU4–7 TP4/DP2、attention TP2。
+- 双机：132 P TP8/CP8/DP1；134 D TP8/DP4、attention TP2，router 在134。
+- P `--enable-prefill-cp --cp-strategy interleave`；D DP attention、DP LM head、round-robin、radix cache；共同 chunk/window16384、page64、BF16 KV。层组50，tail在新脚本显式固定8192，可另做tail0对照。
+- 同一实验两端显式设置相同 `OD_NAMESPACE`。复制式 notify KV 的存储 key 按实例总 TP 归一化：P attention TP×CP，D attention TP×DP；DP rank 不进入 key，原 DP1、NULL 混部及非复制行为不变。
+- READY 沿用请求/session登记的目的端；完成、失败和 DMA 排空仍在请求所属 attention TP 组同步，不增加通信协议、线程或单rank GET广播。
+- 多连接默认省略 `connection_indices`，使用全部已配置连接；`[0]` 只作显式A/B。native ABI不变，跨端口可见性和第6字段DPU/QP契约需实机确认。
 
-```sh
-# 先设置实际模型、数据集、GIDS 配置和动态库路径。
-export MODEL_PATH=/path/to/model
-export DATASET_PATH=/path/to/multifieldqa_zh.jsonl
-export OPEXTENSION=/path/to/libop_extension.so
-export GIDS_DIR=/path/to/gids/config
-export SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS=50
+两端需要同样的模型、page大小、总TP宽度、namespace、层数及层组大小。支持DSA复制缓存、PP1、DCP1、P DP1；D DP>1要求DP attention且总TP能被DP整除。无speculative、staging、hierarchical cache、host_pool回撤备份或D offload；P必须interleave CP、attention TP1、`layerwise_save=true`，DSA layer split和所有CP rank同时传输仍拒绝。
 
-sh examples/runtime/engine/run_oceandisk_pd_tp4.sh check
-sh examples/runtime/engine/run_oceandisk_pd_tp4.sh bench
-ROUNDS_DIR=/path/to/Round sh examples/runtime/engine/run_oceandisk_pd_tp4.sh rounds
-
-# 同一脚本的原生 Mooncake 对照。
-TRANSFER_BACKEND=mooncake sh examples/runtime/engine/run_oceandisk_pd_tp4.sh bench
-```
-
-- 默认 `TRANSFER_BACKEND=notify`。为兼容旧命令，本分支的 `chunkload` 值是 notify 的别名；要比较 EXIST 轮询方案，请在黄区同一 `sglang-pd` 目录切换到 chunkload 分支。
-- `SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS=-1` 默认保留一个 `chunked_prefill_size` 的尾部；设为非负数可指定保留量。`check` 未显式设置时使用 0，让可缓存缺失前缀尽量覆盖 GET；不可缓存尾部和 metadata 仍由原生 PD 传输。
-- `--chunked-prefill-size` 可作为脚本尾随参数传入，P、D 取同值。需要至少一个 page。
-- `rounds` 保留原参数、容量检查和 1800 秒握手/等待设置；`Round` 输入文件仍使用外部目录。
-- `check` 默认开 `SGLANG_OCEANDISK_TRACE=1`，`bench` 默认关。日志在 `LOG_DIR` 下；P、D、router 顺序启动及进程组清理逻辑保持一致。
+旧launcher的参数和自动启动/清理逻辑不随新入口改变；旧 `chunkload` 值仍为notify兼容别名。底层tail默认-1的语义仍为一个chunk，新脚本用显式8192避免chunk变化影响传输比例。Round默认128000起步、+256、输出上限16、10×10，人工轮间只清D。
 
 ## 验证与实机验收
 
-本地 CPU 检查通过 49 项，另有 4 项 POSIX 启动监督测试因 Windows 环境跳过。检查使用现有 uv Python、torch/numpy，通过临时 AST 隔离加载实际方法并执行仓库测试，绕过 Linux 专用导入。它覆盖：
+2026-11-01 本轮本地专项 CPU/mock 检查通过 79 项（notify/加载/脚本68项、key5项、路由/descriptor6项），另有6项POSIX进程测试因Windows跳过。检查使用现有 uv Python、torch/numpy，通过临时 AST 隔离加载实际方法并执行仓库测试，绕过 Linux 专用导入。它覆盖：
 
 - READY 早于/晚于 RDMA、晚握手、重复/有缺口通知、L/S 裁剪、旧 session、发送失败及失败状态不被后续成功覆盖。
 - P 在途/成功/失败回执、缺失回执 EXIST、owner 共识、HBM 补写页范围和源页 lease、共享请求回执。
 - D 仅 GET、不调用 lookup/offload；部分通知不发 GET，层组逐一推进；多请求、TP 失败、超时、DMA 排空、预分配与原生 metadata 门控。
 - 部分层 GET 保持原始存储 offset；PUT group event 完成后才发 READY；PUT 失败时不发布失败层组。
 
-本机未安装格式化或测试依赖。完整 SGLang 常规导入在 Windows 的 `resource` 模块处失败；CPU 隔离检查不代表 Linux 模块集成、CUDA、RDMA、GIDS 或性能验证。Python 语法、shell 语法和暂存 diff 空白检查另行核对。
+本机未安装格式化或测试依赖。完整 SGLang 常规导入在 Windows 的 `resource` 模块处失败；CPU 隔离检查不代表 Linux 模块集成、CUDA、RDMA、GIDS 或性能验证。Python语法、shell语法/参数展开、Round原件哈希和工作区diff另行核对。扩大检查时旧存储测试仍有1 failure/14 error记录（含subtest）；`9dc1fcf964`原件同样失败，涉及旧fixture缺锁、旧max_ranges参数和逐层失败预期，本轮未改其接口。
 
 在已有依赖的 Linux 环境运行正式单测：
 
@@ -110,9 +97,10 @@ TRANSFER_BACKEND=mooncake sh examples/runtime/engine/run_oceandisk_pd_tp4.sh ben
 PYTHONPATH=python python3 -m unittest discover -s test/registered/unit/disaggregation -p 'test_linker_notify.py'
 PYTHONPATH=python python3 -m unittest discover -s test/registered/unit/disaggregation -p 'test_linker_decode_load.py'
 PYTHONPATH=python python3 -m unittest discover -s test/registered/unit/disaggregation -p 'test_oceandisk_pd_launcher.py'
+PYTHONPATH=python python3 -m unittest discover -s test/registered/unit/disaggregation -p 'test_oceandisk_notify_entrypoints.py'
 ```
 
-实机先跑 `check`，对齐 P 的 `PUT_DONE`、`READY_SEND`，D 的 `READY_RECV`、`LOAD_STARTED/LOAD_DONE`；D 的 load tag 是 `rid@start_page:layer_start`。确认无 D EXIST/PUT，覆盖冷请求、P HBM 命中/D 无缓存、D 部分或全量 HBM 命中、多 chunk、末组不足 N 层、并发和 abort。确认所有 GET 完成与 metadata 就绪后才进入 decode，再进行同输入的 chunkload/notify/mooncake 对照。
+实机先按指南跑DP小请求和清D恢复；旧 `check` 的连续请求HBM命中假设只适用于DP1专项诊断。对齐 P 的 `PUT_DONE`、`READY_SEND`，D 的 `READY_RECV`、`LOAD_STARTED/LOAD_DONE`；D 的 load tag 是 `rid@start_page:layer_start`。确认无 D EXIST/PUT，覆盖冷请求、P HBM 命中/D 无缓存、D 部分或全量 HBM 命中、多 chunk、末组不足 N 层、并发和 abort。确认所有 GET 完成与 metadata 就绪后才进入 decode，再进行同输入的 chunkload/notify/mooncake 对照。
 
 本方案的 native 运行契约是：**P save event 完成代表该层组 PUT 完成，且相同 namespace/key 的 D GET 已可见**。Python 层捕获的失败通过原生失败路径传递；GIDS native 内部错误码传播和跨进程可见性保障不在本次 SGLang 改动内，需在实机确认此契约。
 

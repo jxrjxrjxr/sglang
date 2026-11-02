@@ -73,7 +73,18 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "no speculative decoding": cfg.speculative_algorithm is None,
             "dcp-size=1": cfg.dcp_size == 1,
             "pp-size=1": cfg.pp_size == 1,
-            "dp-size=1": cfg.dp_size == 1,
+            "prefill dp-size=1": (
+                cfg.disaggregation_mode != "prefill" or cfg.dp_size == 1
+            ),
+            "decode DP attention with tp-size divisible by dp-size": (
+                cfg.dp_size == 1
+                or (
+                    cfg.disaggregation_mode == "decode"
+                    and cfg.enable_dp_attention
+                    and cfg.dp_size > 0
+                    and cfg.tp_size % cfg.dp_size == 0
+                )
+            ),
             "no hierarchical cache": not cfg.enable_hierarchical_cache,
             "no host_pool retraction backup": (
                 cfg.disaggregation_decode_retraction_backup != "host_pool"

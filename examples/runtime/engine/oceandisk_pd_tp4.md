@@ -1,197 +1,359 @@
-# OceanDisk notify 运行指南（132／134）
+# OceanDisk notify 运行指南（单机 4P4D／双机 8P8D）
 
-**132、134 统一在 `/home/j00977581/sglang-pd` 内切换分支。** 当前运行分支为 `dev_oceandisk_linker_pd_notify`，个人远端为 `mine = https://github.com/jxrjxrjxr/sglang.git`。后续新分支继续使用同一目录，不新建 clone 或 worktree。
+更新：2026-11-02。分支 `dev_oceandisk_linker_pd_notify`，参数对齐实现基于 `9dc1fcf964`，本版包含独立 P／D／router 入口及 D DP 支持。两机按第 2 节拉取 notify 分支最新提交，并记录实际提交和工作区 diff。**GPU、RDMA、GIDS 及双机实测仍待验证。**两台机器继续使用 `/home/j00977581/sglang-pd`，复用已准备的环境、模型和 GIDS 库。
 
-notify 的路径是 P 分组 PUT 完成后发送 READY，D 按通知 GET，不在 D 端轮询 EXIST；尾部和 metadata 继续走 Mooncake。P 使用 interleave CP，D 不开 CP。单机 P GPU0–3、D GPU4–7，各总 TP4；router 端口 31345。
+## 1. 五个入口与固定行为
 
-服务和测试分两步运行：先 `sh run_oceandisk_pd_tp4.sh start`，看到三个端口就绪后，再进入 `Round` 目录执行 `sh run_rounds.sh`。多轮脚本前台读取回车，P、D、router 在后台继续运行。
+| 入口（相对 `examples/runtime/engine/`） | 用法 |
+|---|---|
+| `run_oceandisk_prefill.sh` | 必要赋值＋一条 `python -m sglang.launch_server`；前台运行 P |
+| `run_oceandisk_decode.sh` | 同上；独立配置 D 的 TP、DP、物理 GPU 起点和 IP |
+| `run_oceandisk_router.sh` | 一条 router 命令；P/D 地址独立 |
+| `Round/run_rounds.py` | 原样复用 `D:\CodeSpace\LLMTest\Round`，保留人工清缓存、回车和统计口径 |
+| `Round/run_rounds.sh` | 只有 `python3 run_rounds.py` 与参数；128000 起步、每轮 +256、输出上限 16、10 会话 × 10 轮 |
 
-## 1. 启动服务的容器终端设置环境
+服务脚本不启动其他服务、不等待健康检查、不清理进程、不运行压测。先在三个终端启动 P、D、router，再用第四个终端跑 Round。前台服务用 Ctrl+C 停止；需要后台日志时使用第 5 节的外部命令。
 
-复用已准备好的模型、数据集、GIDS 库与本机配置，在 Bash 中粘贴。132／134 共用同一段：
+| 场景 | P | D | Router |
+|---|---|---|---|
+| 132 或 134 单机 | GPU0–3；TP4、CP4、DP1 | GPU4–7；TP4、DP2、attention TP2 | 同机 |
+| 双机 | 132 GPU0–7；TP8、CP8、DP1 | 134 GPU0–7；TP8、DP4、attention TP2 | 134 |
+
+默认模型 `GLM-5.2-W4AFP8`；BF16 KV、DSA、page 64、mem-fraction 0.85、dense TP1、MoE A2A `none`。P 用 interleave CP，禁用 prefill CUDA graph；D 开启 DP attention、DP LM head、round-robin 和 radix cache，max-running／CUDA graph max batch 均为 128。P chunk 和 D 加载窗口均为 16384。
+
+notify 保持 **50 层一组，RDMA tail 显式为 8192**：P PUT 完成后发 READY，D 按通知 GET；P CP0 写出，D 每个 attention TP rank 读回；D 无存储 EXIST／PUT。加载完成、失败和 DMA 排空在请求所属 attention TP 组同步。复制式 KV 的存储 namespace 使用实例总 TP：P `attention TP × CP`、D `attention TP × DP`，DP rank 不进入 key。NULL 混部和非复制缓存规则不变。
+
+D radix cache 用于本方案的前缀匹配、锁定、回收及装载槽位复用，必须保留。原生 PD 可用 chunk cache 管理请求生命周期，因而可以关闭跨请求 radix 复用；这不意味着 D 无需管理 KV。DP round-robin 不保证同一会话回到同一 DP 组，不清 D 时的命中率仍取决于分组路由。
+
+## 2. 每个终端的环境与代码检查
+
+在已有 pd 容器、已准备好的 SGLang Python 环境中操作。132／134 的 `/home` **不共享**；代码、模型、动态库、本机 GIDS 配置各自准备，客户端机器另备 Round 语料和 bench 数据集。不要把 132 的本地网卡/IP 配置直接复制给 134。
+
+每个服务终端先执行本节公共块，再选一个机器块。一次实验所有终端、双机两端使用**同一个手工填写的 namespace**；下一组独立实验改新值。不要让两个脚本分别生成时间戳。下面的示例值应换为本次唯一标识，字符使用字母、数字、`-`、`_`。
 
 ```bash
 export W=/home/j00977581
-export H=$(hostname)
-case "$H" in
-  fbs-h20-01) export SGLANG_HOST_IP=141.111.65.132 ;;
-  fbs-h20-02) export SGLANG_HOST_IP=141.111.65.134 ;;
-esac
 export REPO=$W/sglang-pd
-export PD_BRANCH=dev_oceandisk_linker_pd_notify
-export TRANSFER_BACKEND=notify
-export LOGS=$W/pd_logs/$H
+export ENGINE=$REPO/examples/runtime/engine
 export MODEL_PATH=/home/models/GLM-5.2-W4AFP8/
 export DATASET_PATH=/home/z00591349/dataset/multifieldqa_zh.jsonl
 export OPEXTENSION=$W/gids/lib/libop_extension.so
 export LIBGIDS=$W/gids/lib/libgids_kv_host.so
-export GIDS_DIR=$W/gids/cfg_$H/
-export MOONCAKE_IB_DEVICES=mlx5_3,mlx5_5,mlx5_7,mlx5_9,mlx5_11,mlx5_13,mlx5_15
-export SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS=50
+export GIDS_DIR=$W/gids/cfg_$(hostname)/
+export OD_NAMESPACE=notify-20261101-run01
+export LOGS=$W/pd_logs/$(hostname)/$OD_NAMESPACE
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-mkdir -p "$LOGS"
+mkdir -p "$LOGS" /home/cache/deep_gemm /home/cache/triton /home/cache/inductor
+cd "$REPO"
 ```
 
-模型或数据集放在其他位置时，调整对应变量。GIDS 的 8 份配置仍在 `$W/gids/cfg_$H/`；132 的 `gids_config_4` 应已修正为 GID index 3，134 的本地 `.200` 应已修正为 `.201`。
-
-## 2. 切换到 notify 并拉取
-
-首次运行 notify 或以后切换分支时执行下段；换其他分支只需先设置其 `PD_BRANCH`，并采用该分支对应的后端配置。切换前保存当前工作，Git 会在本地改动与目标分支冲突时停止。
+132 的机器块：
 
 ```bash
-(
-  set -e
-  PD_URL=https://github.com/jxrjxrjxr/sglang.git
-  if git -C "$REPO" remote get-url mine >/dev/null 2>&1; then
-    git -C "$REPO" remote set-url mine "$PD_URL"
-  else
-    git -C "$REPO" remote add mine "$PD_URL"
-  fi
-  git -C "$REPO" config --replace-all remote.mine.fetch '+refs/heads/*:refs/remotes/mine/*'
-  git -C "$REPO" config http.proxy http://141.5.133.251:7777
-  git -C "$REPO" config http.sslVerify false
-  git -C "$REPO" fetch mine "refs/heads/$PD_BRANCH:refs/remotes/mine/$PD_BRANCH"
-  if git -C "$REPO" show-ref --verify --quiet "refs/heads/$PD_BRANCH"; then
-    git -C "$REPO" switch "$PD_BRANCH"
-  else
-    git -C "$REPO" switch --track -c "$PD_BRANCH" "mine/$PD_BRANCH"
-  fi
-  git -C "$REPO" branch --set-upstream-to="mine/$PD_BRANCH" "$PD_BRANCH"
-  git -C "$REPO" pull --ff-only
-  git -C "$REPO" status --short --branch
-  git -C "$REPO" log --oneline -1
-)
+export LOCAL_IP=141.111.65.132
+export MOONCAKE_IB_DEVICES=mlx5_1,mlx5_3,mlx5_5,mlx5_7,mlx5_9,mlx5_11,mlx5_13,mlx5_15
 ```
 
-本次输出的分支应为 `dev_oceandisk_linker_pd_notify`。远端名 `origin` 保留原用途，运行分支统一跟踪 `mine`。
-
-若 Git 提示目标分支已被旧 worktree 占用，先用 `git -C "$REPO" worktree list` 找到旧目录，在该旧目录执行 `git switch --detach`，再回到 `sglang-pd` 重跑上段。旧目录和文件保留；以后运行统一从 `sglang-pd` 发起。
-
-已处于目标分支时，后续更新只需：
+134 的机器块：
 
 ```bash
-git -C "$REPO" pull --ff-only &&
-git -C "$REPO" log --oneline -1
+export LOCAL_IP=141.111.65.134
+export MOONCAKE_IB_DEVICES=mlx5_3,mlx5_5,mlx5_7,mlx5_9,mlx5_11,mlx5_13,mlx5_15
 ```
 
-两台机器做同一轮对照时，提交号应相同。
+上述设备来自已有环境记录：132 有全部 16 个 mlx5 设备；134 未发现 mlx5_0／1，因此不沿用旧 decode 脚本的偶数列表。运行前用 `ibv_devices` 和 `nvidia-smi topo -m` 复核本机当前设备。GIDS 使用自己配置中的地址；Mooncake IB 列表不能替代 GIDS 配置。132 的 `gids_config_4.txt` 应已修正为 GID index 3，134 本地 `.200` 应已修正为 `.201`，以当前机器文件为准。
 
-## 3. 准备多轮脚本与语料
+脚本保留全部 8 卡可见，通过 `--base-gpu-id` 选卡；不要在外层改成 `CUDA_VISIBLE_DEVICES=4,5,6,7`，否则 native 选择 `gids_config_<GPU编号>.txt` 的编号会改变。
 
-仓库内 `examples/runtime/engine/Round/run_rounds.py` 原样复用 `D:\CodeSpace\LLMTest\Round` 的版本，保留轮间 `input("等待清洗hbm")`。同目录的 `run_rounds.sh` 只有一条 Python 命令，参数默认 10 条 128K、10 轮、每轮增量 256、输出 16 token，地址改为 router 的 `31345` 端口。
-
-语料继续使用机器上已有的 `/home/j00977581/Round/doupocangqiong.txt`。首次使用仓库内 Round 目录时创建链接；已有该文件或链接时跳过：
+两机各在原目录拉取远端 notify 分支；远端 `mine` 沿用已配置的个人 fork 和网络设置。切换前检查、保存已有工作，不做 reset 或强制覆盖：
 
 ```bash
-ln -s /home/j00977581/Round/doupocangqiong.txt /home/j00977581/sglang-pd/examples/runtime/engine/Round/doupocangqiong.txt
+git -C "$REPO" status --short --branch
+git -C "$REPO" remote get-url mine
+git -C "$REPO" fetch mine dev_oceandisk_linker_pd_notify
+git -C "$REPO" switch dev_oceandisk_linker_pd_notify
+git -C "$REPO" pull --ff-only mine dev_oceandisk_linker_pd_notify
+git -C "$REPO" rev-parse HEAD
+git -C "$REPO" diff --stat
 ```
 
-以后只需在 `sglang-pd` 内拉取分支，语料链接保留。
+没有本地分支时，用 `git switch --track -c dev_oceandisk_linker_pd_notify mine/dev_oceandisk_linker_pd_notify` 替换 switch 行。若分支被旧 worktree 占用，先检查 `git worktree list`，保存旧目录的工作，再在旧目录 detach；目录仍保留。
 
-## 4. 第一步：启动 P、D、router
-
-8 张卡空闲后，在已完成第 1 节环境设置的容器终端执行：
+两机应为同一提交，若部署未提交改动则额外对比 patch／文件哈希。保存配置来源：
 
 ```bash
-cd /home/j00977581/sglang-pd
-LOG_DIR="/home/j00977581/pd_logs/$(hostname)/notify_rounds" sh examples/runtime/engine/run_oceandisk_pd_tp4.sh start
+git -C "$REPO" rev-parse HEAD > "$LOGS/commit.txt"
+git -C "$REPO" diff > "$LOGS/worktree.patch"
+sha256sum "$OPEXTENSION" "$LIBGIDS" "$MODEL_PATH/config.json" > "$LOGS/artifacts.sha256"
+sha256sum "$ENGINE"/run_oceandisk_{prefill,decode,router}.sh "$ENGINE/Round/run_rounds.py" > "$LOGS/scripts.sha256"
+sha256sum "$GIDS_DIR"/gids_config_*.txt > "$LOGS/gids-config.sha256"
+printf '%s\n' "$OD_NAMESPACE" > "$LOGS/namespace.txt"
 ```
 
-脚本依次用 `nohup setsid` 启动 P、D、router。等待 P、D 的 `/health` 和 router 的 `/readiness` 成功后，打印：
+模型需同一权重版本、tokenizer 和模型配置；`config.json` 相同不能单独证明权重相同，另对照已有模型 manifest。两端 BF16 KV、page64、总 TP、层数、层组50必须一致。本机配置文件哈希允许不同，记录它们用于追溯。
 
-```text
-Ready: router=http://127.0.0.1:31345 prefill=http://127.0.0.1:31002 decode=http://127.0.0.1:31001
-logs=... pids=.../server.pids
+## 3. 单机：132 或 134 的 4P4D
+
+选择目标机器，在三个终端都完成第 2 节公共块和该机器块。P31002、D31001、router31345、P bootstrap31145 保持固定。
+
+P 终端：
+
+```bash
+TP_SIZE=4 BASE_GPU_ID=0 sh "$ENGINE/run_oceandisk_prefill.sh"
 ```
 
-随后脚本退出并让出终端，三个服务继续运行。启动过程中失败或 Ctrl+C 会清理已启动的服务。启动成功后，服务日志为该 `LOG_DIR` 下的 `prefill.log`、`decode.log`、`router.log`，`server.pids` 依次记录 P、D、router 的进程组 ID。再次启动前按第 7 节停止上一组服务，换运行名可保留原日志。
+D 终端：
 
-`start` 默认 context length 为 163840，传输及 bootstrap 超时为 1800 秒；P 开 interleave CP，D 不开 CP。notify 层组默认 50，尾部默认保留一个 chunk 走 Mooncake RDMA。
+```bash
+TP_SIZE=4 DP_SIZE=2 BASE_GPU_ID=4 sh "$ENGINE/run_oceandisk_decode.sh"
+```
 
-## 5. 第二步：前台运行多轮测试
+Router 终端：
 
-看到 `Ready` 后，在同一终端执行：
+```bash
+PREFILL_IP="$LOCAL_IP" DECODE_IP="$LOCAL_IP" sh "$ENGINE/run_oceandisk_router.sh"
+```
+
+P、D 的 dist-init 分别为本机 `:31500`、`:31501`。等待日志完成加载／预热，用第 5 节检查服务。三个脚本均保持前台运行，不会自行退出并提示总的 Ready。
+
+## 4. 双机：132 P＋134 D/router
+
+两边各完成第 2 节，namespace 完全相同。先确认两机同版本代码、模型和 GIDS 动态库；本地 RDMA 地址、GID、物理 GPU 编号各自正确。
+
+132 P 终端：
+
+```bash
+TP_SIZE=8 BASE_GPU_ID=0 sh "$ENGINE/run_oceandisk_prefill.sh"
+```
+
+134 D 终端：
+
+```bash
+TP_SIZE=8 DP_SIZE=4 BASE_GPU_ID=0 sh "$ENGINE/run_oceandisk_decode.sh"
+```
+
+134 Router 终端：
+
+```bash
+PREFILL_IP=141.111.65.132 DECODE_IP=141.111.65.134 sh "$ENGINE/run_oceandisk_router.sh"
+```
+
+这是两个独立 TP8 实例。P dist-init 是 `141.111.65.132:31500`，D 是 `141.111.65.134:31501`，不是跨两机的 TP16。两端要能访问服务/bootstrap 和 Mooncake 建立的数据／控制连接；仅 HTTP 端口通不能证明 RDMA 正常。
+
+多连接沿用张圆现有 `ConnectionRouter`：省略 `connection_indices` 选择配置中的全部连接（最多 8 条）；同一 DPU 的不同连接可轮转。同 key 的 P 写和 D 读必须选择同一个逻辑 DPU。
+
+- Python router 用配置第 6 字段作为 DPU 分组 ID；当前提供的 native 源码把它解释为 `qp_cnt`。实施未改 ABI、库或配置格式。先向库维护者核对部署版本中该字段的实际契约，不能直接把任意 QP 数当唯一 DPU ID。
+- 132 的 `.10/.12/.14/.16` 与 134 的 `.11/.13/.15/.17` 是不同存储端口。P/D 必须有一致的逻辑 DPU 集合／hash ring，并验证跨端口共享 key 空间及 PUT 完成后 GET 可见。
+- 同 key 可能从同一 DPU 的不同连接读取；即使单机，也需确认该 DPU 的端口间可见性。单连接成功不能替代多连接验证。
+
+先用小请求、固定 namespace、tail=0 验证 P PUT→READY→D GET，再清 D 重复读回；逐个 DP 组核对日志、输出和 native 完成状态。双机先跑同拓扑原生 Mooncake 小请求排除网络问题，再启用 notify。不满足跨端口可见性时先停在诊断阶段，不运行十轮长负载。
+
+## 5. 健康检查、外部后台运行与停止
+
+客户端／检查终端设置地址：单机全部填实际目标机器 IP；双机按下例。P/D 绑定实际 IP，不使用 `127.0.0.1` 检查它们；router 默认监听 `0.0.0.0`，在 router 所在机器可用 localhost。
+
+```bash
+export P_IP=141.111.65.132
+export D_IP=141.111.65.134
+export ROUTER_IP=141.111.65.134
+curl --noproxy '*' -fsS "http://$P_IP:31002/health"
+curl --noproxy '*' -fsS "http://$D_IP:31001/health"
+curl --noproxy '*' -fsS "http://$ROUTER_IP:31345/readiness"
+curl --noproxy '*' -fsS "http://$D_IP:31001/model_info"
+curl --noproxy '*' -sS "http://$ROUTER_IP:31345/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"/home/models/GLM-5.2-W4AFP8/","messages":[{"role":"user","content":"你好，请用一句话介绍自己。"}],"max_tokens":16,"temperature":0,"stream":false}'
+```
+
+若想保持终端可用，在**第 3／4 节对应启动位置**把前台命令换成下面的外部后台命令。不要重复启动；以下是单机示例，双机 P 改 TP8，D 改 TP8/DP4/base0，router 改远端 IP。PID 文件、日志均按角色分开。
+
+```bash
+TP_SIZE=4 BASE_GPU_ID=0 nohup setsid sh "$ENGINE/run_oceandisk_prefill.sh" > "$LOGS/prefill.log" 2>&1 < /dev/null &
+echo $! > "$LOGS/prefill.pid"
+TP_SIZE=4 DP_SIZE=2 BASE_GPU_ID=4 nohup setsid sh "$ENGINE/run_oceandisk_decode.sh" > "$LOGS/decode.log" 2>&1 < /dev/null &
+echo $! > "$LOGS/decode.pid"
+PREFILL_IP="$LOCAL_IP" DECODE_IP="$LOCAL_IP" nohup setsid sh "$ENGINE/run_oceandisk_router.sh" > "$LOGS/router.log" 2>&1 < /dev/null &
+echo $! > "$LOGS/router.pid"
+```
+
+`setsid` 可能 fork，因此 `$!` 是启动 PID 提示，停止前必须检查实际进程组；不能把旧 PID 文件直接当 kill 目标。用本次日志目录定位、核对当前命令与端口，然后向确认的 PGID 发 TERM（同一 pd 容器内）：
+
+```bash
+cat "$LOGS/decode.pid"
+ps -eo pid,ppid,pgid,sid,args --forest | grep -E 'run_oceandisk_|sglang.launch_server|sglang_router'
+ss -ltnp | grep -E ':31001|:31002|:31345'
+# 将下面数字替换为刚核对的本次 decode 进程组；P/router 分别处理。
+kill -TERM -- -12345
+```
+
+前台启动用各终端 Ctrl+C。停止后复核监听和 GPU worker 已退出，再启动下一组。客户端 Ctrl+C 只结束 Round，不会停止服务。日志查看：`tail -f "$LOGS/decode.log"`。短请求诊断在 P/D 启动前设置 `SGLANG_OCEANDISK_TRACE=1`，保存 `PUT_DONE/READY_SEND` 和 `READY_RECV/LOAD_STARTED/LOAD_DONE`；正式计时回到默认 0。load tag 为 `rid@start_page:layer_start`。
+
+## 6. Round 与三种清缓存流程
+
+在 router 所在机器准备语料。仓库不存语料副本；已有文件或链接时跳过 ln：
+
+```bash
+cd /home/j00977581/sglang-pd/examples/runtime/engine/Round
+ln -s /home/j00977581/Round/doupocangqiong.txt ./doupocangqiong.txt
+```
+
+默认十轮（客户端在 router 机器上，模型位于默认路径）：
 
 ```bash
 cd /home/j00977581/sglang-pd/examples/runtime/engine/Round
 sh run_rounds.sh
 ```
 
-参数直接修改 `run_rounds.sh`。它只运行同目录的 `python3 run_rounds.py`，没有环境设置、后台启动或管道包装。
+Round 的 `--model`、`--base-url` 是显式参数，**不会读取服务脚本的 MODEL_PATH**；改模型或从远端跑客户端时相应修改 sh 参数。默认输出为 `rounds.json` 和 `conversations/`，重跑前移走旧结果或改输出路径。
 
-每轮出现 `等待清洗hbm` 后，在另一个终端按第 6 节执行 flush，成功后回到测试终端按回车继续。原脚本最后一轮也会等待回车；按回车后输出汇总并保存 `rounds.json`，对话记录在同目录 `conversations/`。下一次运行会覆盖这些固定路径，保留结果时先移走或修改参数中的输出路径。
+每轮出现 `等待清洗hbm` 后，在另一个终端选择以下一种流程；最后一轮也要回车，之后才保存最终 JSON。默认延续最新 notify 测试：**只清 D**。
 
-测试结束或 Ctrl+C 只结束多轮客户端，后台服务继续运行。需要再次测试时，直接重跑 `sh run_rounds.sh`。
-
-## 6. 另一个终端：curl 对话与轮间清缓存
-
-以下命令在**同一个 pd 容器**内执行，不依赖第 1 节的环境变量。`--noproxy '*'` 使本机请求绕过黄区代理。
-
-确认端口：
+| 实验条件 | 轮间操作 |
+|---|---|
+| 只清 D（默认） | 只调用 D flush；保留 P HBM 及存储，下一轮验证 D 恢复 |
+| 清 P+D | 两端都 flush；存储数据保留，不等于存储冷启动 |
+| 不清缓存 | 不调用 flush，直接回车；记录 DP round-robin 导致的组间命中差异 |
 
 ```bash
-curl --noproxy '*' -i http://127.0.0.1:31345/readiness
-curl --noproxy '*' -sS http://127.0.0.1:31002/model_info
-curl --noproxy '*' -sS http://127.0.0.1:31001/model_info
+# 使用第 5 节的实际 P_IP/D_IP。只清 D：
+curl --noproxy '*' -i --max-time 60 -X POST "http://$D_IP:31001/flush_cache?timeout=30"
+# 清 P+D 时，再清 P：
+curl --noproxy '*' -i --max-time 60 -X POST "http://$P_IP:31002/flush_cache?timeout=30"
 ```
 
-通过 router 测一个简单对话，走完整 P/D 路径：
+请求全部结束后操作，确认每次均为 HTTP200／`Cache flushed.` 再回车；400 是清理失败。D 的服务端 flush 面向该实例全部 DP 组，仍需从各 scheduler 日志确认无在途请求。flush 释放缓存状态，模型和预分配 KV 池仍在，`nvidia-smi` 不会归零。独立实验重启服务并换 namespace；仅清 P+D 不清 OceanDisk。
+
+先用 batch=1 分离单请求成本，再跑默认 batch=10；完整 batch=1 参数：
 
 ```bash
-curl --noproxy '*' -sS http://127.0.0.1:31345/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"/home/models/GLM-5.2-W4AFP8/","messages":[{"role":"user","content":"你好，请用一句话介绍自己。"}],"max_tokens":32,"temperature":0,"stream":false}'
+python3 run_rounds.py \
+  --base-url http://127.0.0.1:31345 \
+  --model /home/models/GLM-5.2-W4AFP8/ \
+  --rounds 10 --batch-size 1 --initial-tokens 128000 --increment-tokens 256 \
+  --output-len 16 --record-response --request-usage \
+  --conversation-dir ./conversations_128k_b1 --output-json ./rounds_128k_b1.json
 ```
 
-**只清 D，验证下一轮 D 从 OceanDisk 读回**：
+16K 递增负载（目标 16K→160K，包含实际历史／模板开销，以 usage 为准）：
 
 ```bash
-curl --noproxy '*' -i --max-time 60 -X POST 'http://127.0.0.1:31001/flush_cache?timeout=30'
+python3 run_rounds.py \
+  --base-url http://127.0.0.1:31345 \
+  --model /home/models/GLM-5.2-W4AFP8/ \
+  --rounds 10 --batch-size 10 --initial-tokens 16000 --increment-tokens 16000 \
+  --output-len 16 --record-response --request-usage \
+  --conversation-dir ./conversations_16k_increment --output-json ./rounds_16k_increment.json
 ```
 
-**同时清 P、D，测试两侧缓存清空后的下一轮**：
+Round 的输出 16 是请求上限，保留原件的 EOS／思考处理；可能提前结束，实际 output tokens 必须记录。它的 TTFT 是**首条非空 SSE 行**，不是首个内容 token；不能与 bench TTFT 混用。Round Python 原件 SHA256：`d94abd42e4da3b8447ca4992658e9d99dcd83f6e4f66147ae0fa47acc02a04f9`。
+
+## 7. 逐项性能对照与诊断客户端
+
+旧 `9dc1fcf964` 的实测用于历史参照。为了只改一个因素，新的 A/B 共用模型、GPU、cache 条件、max-running128、graph128、timeouts、queue/thread、层组50和 tail8192；同一组 P/D 的 namespace 相同，不同组换值：
+
+| 档位 | D DP | P chunk／D window | 连接 |
+|---|---:|---:|---|
+| A | 1 | 8192 | `[0]` |
+| B | 2（双机4） | 8192 | `[0]` |
+| C | 2（双机4） | 16384 | `[0]` |
+| D（新默认） | 2（双机4） | 16384 | 全部配置 |
+
+在 P/D 启动终端都设置 `CHUNKED_PREFILL_SIZE=8192` 或 16384，D 用 `DP_SIZE=1/2/4`。单连接对照两端显式设置：
 
 ```bash
-curl --noproxy '*' -i --max-time 60 -X POST 'http://127.0.0.1:31002/flush_cache?timeout=30'
-curl --noproxy '*' -i --max-time 60 -X POST 'http://127.0.0.1:31001/flush_cache?timeout=30'
+export OD_STORAGE_CONFIG="{\"namespace\":\"${OD_NAMESPACE}\",\"layerwise_save\":true,\"connection_indices\":[0]}"
 ```
 
-在轮间暂停、请求已完成时调用。每个接口都返回 HTTP 200 和 `Cache flushed.` 后，再按回车；HTTP 400 表示本次未清理成功，查看响应和对应服务日志。`timeout=30` 允许等待服务空闲。
+恢复全部连接用 `unset OD_STORAGE_CONFIG`。跨机 `[0]` 必须对应同一个逻辑 DPU。override JSON 会整体替代默认配置，改 namespace 后要重新生成它。tail 对照在两端都设 `SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS=0`；其他对照固定 8192，不随 chunk 改动。
 
-这里清理的是服务端 KV/radix 缓存和分配状态，保留模型权重及 OceanDisk 中已写的数据。预分配的 KV 池仍在，`nvidia-smi` 的显存占用不需要降到零。清 D 与清 P+D 是不同实验条件，同一组对照保持一致。
-
-## 7. 日志与停止服务
+默认旧超时均为 600，watchdog3600。长队列实验在两端启动前覆盖：
 
 ```bash
-tail -f "/home/j00977581/pd_logs/$(hostname)/notify_rounds/prefill.log"
-tail -f "/home/j00977581/pd_logs/$(hostname)/notify_rounds/decode.log"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1800
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
+export SGLANG_HEALTH_CHECK_TIMEOUT=1800
+export SGLANG_TIMEOUT_KEEP_ALIVE=1800
 ```
 
-结束本组实验后，在同一个容器中停止记录的进程组，包括服务子进程：
+每档保存各 DP 组 `max_total_num_tokens`、实际 running／prealloc／queue、请求数、输入输出 tokens、TTFT 分布及错误。247616 token 是**旧 D TP4/DP1** 的容量，不能沿用为新 DP2 的容量。一个 attention TP 组内的复制 KV 不能按 rank 相加；跨 DP 组才是独立容量。先确认每组能容纳一条 128K，再评估总并发是否提升。
+
+现有诊断 Python 可直接连接已启动服务，不再用聚合 launcher 重启它们：
 
 ```bash
-while read -r pid; do
-  kill -TERM -- "-$pid"
-done < "/home/j00977581/pd_logs/$(hostname)/notify_rounds/server.pids"
+python "$ENGINE/oceandisk_pd_tp4.py" bench \
+  --model-path "$MODEL_PATH" --dataset-path "$DATASET_PATH" \
+  --router-url "http://$ROUTER_IP:31345" --decode-url "http://$D_IP:31001"
 ```
 
-需要查看 PUT/READY/GET 时，启动服务的命令前加 `SGLANG_OCEANDISK_TRACE=1`。默认关闭，避免影响计时。
+bench 有自己的输入长度、输出数和采样口径，报告 TBT mean/max；不是默认十轮的 TBT。它会在单请求 cold/reload 对照中清 D，运行时不要同时跑 Round；cold 标签只表示该次新 prompt，是否真正冷缓存仍需控制初始状态。
+
+旧 `check` 第二次请求要求同一 D HBM 命中，不能直接作为 DP round-robin 的验收。做这项专项诊断时，重启 D 为 DP1，P/D 打开 trace、tail=0，然后直接运行：
 
 ```bash
-grep -E 'PUT_DONE|READY_SEND' "/home/j00977581/pd_logs/$(hostname)/notify_rounds/prefill.log"
-grep -E 'READY_RECV|LOAD_STARTED|LOAD_DONE' "/home/j00977581/pd_logs/$(hostname)/notify_rounds/decode.log"
+python "$ENGINE/oceandisk_pd_tp4.py" check \
+  --model-path "$MODEL_PATH" --dataset-path "$DATASET_PATH" \
+  --router-url "http://$ROUTER_IP:31345" --decode-url "http://$D_IP:31001" \
+  --decode-log "$LOGS/decode.log"
 ```
 
-P 应先完成 PUT 再发 READY；D 收到 READY 后装载对应页／层组。D 的 load tag 为 `rid@start_page:layer_start`。
-
-## 8. check、bench 与 Mooncake 对照
-
-check、bench 仍保留原来的自动启动、测试、收尾流程；运行前先停止上面的常驻服务，避免占用相同端口。
+DP 小请求示例：P/D 两端先设置 tail=0 和 trace=1 后启动，随后在 Round 目录执行；两轮之间按默认流程只清 D。batch4 可覆盖单机两组或双机四组，但是否实际分发到每组仍以日志为准。
 
 ```bash
-cd /home/j00977581/sglang-pd
-LOG_DIR="/home/j00977581/pd_logs/$(hostname)/notify_check" sh examples/runtime/engine/run_oceandisk_pd_tp4.sh check
-LOG_DIR="/home/j00977581/pd_logs/$(hostname)/notify_bench_tail0" SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS=0 sh examples/runtime/engine/run_oceandisk_pd_tp4.sh bench
+python3 run_rounds.py \
+  --base-url http://127.0.0.1:31345 \
+  --model /home/models/GLM-5.2-W4AFP8/ \
+  --rounds 2 --batch-size 4 --initial-tokens 16000 --increment-tokens 256 \
+  --output-len 16 --record-response --request-usage \
+  --conversation-dir ./conversations_dp_smoke --output-json ./rounds_dp_smoke.json
 ```
 
-check 默认 trace 开启、tail=0；上面的 bench 显式指定 tail=0。原生 Mooncake 对照使用同一分支，启动命令前加 `TRANSFER_BACKEND=mooncake` 并更换 `LOG_DIR`，多轮客户端命令相同。EXIST 轮询方案需在同一 `sglang-pd` 目录切到 `dev_oceandisk_linker_pd_chunkload`，按该分支 guide 运行；notify 分支的 `chunkload` 值只是 notify 的兼容别名。
+DP2/4 验收另外进行：先发超过 DP 组数的小请求，确认每组收到请求且能独立完成；清 D 后恢复；再混合不同前缀长度和完成时刻，观察一个组等 READY／GET 时其他组仍能推进。查各组 rid 与 READY/load 范围，确认 D 无 EXIST／PUT、失败时 DMA 排空。小请求用 tail0 才能覆盖 OceanDisk 读回，默认 tail8192 可能让短 prompt 全走 RDMA。
+
+## 8. 同配置原生 Mooncake 对照
+
+停掉本组服务、更换实验 namespace／日志目录，保持相同模型、TP/DP、chunk、cache 和负载。用下面命令从新脚本生成临时对照脚本，删除四条 notify/linker 参数；原始日常入口不变，router 与 Round 照常使用：
+
+```bash
+sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-linker /d; /^  --unified-cache-external-linker-backend /d; /^  --hicache-storage-backend-extra-config /d' \
+  "$ENGINE/run_oceandisk_prefill.sh" > "$LOGS/prefill_mooncake.sh"
+sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-linker /d; /^  --unified-cache-external-linker-backend /d; /^  --hicache-storage-backend-extra-config /d' \
+  "$ENGINE/run_oceandisk_decode.sh" > "$LOGS/decode_mooncake.sh"
+```
+
+在 P/D 各自机器和终端、用第 3／4 节相同的 TP/DP/base 设置启动对应临时脚本。剩余 notify 环境变量在关闭该功能时不参与传输，原生 Mooncake 负责全部缺失 KV；native 基线也保留 D radix cache，避免比较时改变命中条件。
+
+## 9. 0.5.13 → 当前 0.5.20 分支的参数迁移
+
+以下按提供的 132 prefill、134 decode 原件和本分支实际消费点核对；旧脚本同名不代表同参数。
+
+| 旧项 | 新入口处理／原因 |
+|---|---|
+| `--enable-nsa-prefill-context-parallel`、`--nsa-prefill-cp-mode round-robin-split` | P 用 `--enable-prefill-cp --cp-strategy interleave`；D 不开 CP |
+| D `TP8/DP4 + --enable-dp-attention --enable-dp-lm-head` | 双机恢复；单机等比例为 TP4/DP2，attention TP 都是2 |
+| `--prefill-round-robin-balance` | 移除；旧版本已是 deprecated no-op；D 用仍有效的 `--load-balance-method round_robin` |
+| P chunk16384 | 恢复；D notify load window 同为16384；tail 独立固定8192 |
+| P/D queue、thread | 恢复实际最终值 P=1/1、D=2/8；旧 D 后面的 export 覆盖了前面的1/1 |
+| dense-attention threshold | 恢复 P=0、D=20；对纯 D decode 的主路径收益不能据此推算 |
+| `SGLANG_DG_CACHE_DIR`、Triton/Inductor cache、JIT/fast warmup | 恢复持久目录和有效开关；主要减少重复启动编译，不能直接算进稳态 TTFT/TBT 收益 |
+| `SGLANG_DG_USE_NVRTC=1` | 使用实际被 `srt/layers/deep_gemm_wrapper/compile_utils.py` 消费的 `SGL_DG_USE_NVRTC=1`（映射 `DG_JIT_USE_NVRTC`）；旧 SGLANG 拼写只声明而未被这条路径消费 |
+| `SGLANG_USE_DEEPGEMM_BMM=true` | 移除；GLM 路径无该拼写消费点，不自动换成会改变行为的 `SGL_USE_DEEPGEMM_BMM` |
+| `--deepep-mode normal/low_latency`、`moe_bk=deepep` | `--moe-a2a-backend none` 下不选择 DeepEP；移除无效搭配和未引用赋值 |
+| `ENABLE_SWAPAB`、`USE_MULTI_LINK`、`--enable-transfer-metadata` | 不复制到当前路径；前两者未找到有效消费，后者为旧私有扩展；现有 Mooncake metadata 机制继续使用 |
+| 单连接 `connection_indices:[0]` | 默认省略，使用 native 配置中全部连接；单连接留作显式 A/B |
+| watchdog／旧超时 | watchdog3600、bootstrap/wait/health/keepalive600、heartbeat6；长队列另按第7节覆盖1800 |
+
+源码定位：`arg_groups/pd_disaggregation_hook.py`（支持范围）、`mem_cache/storage/oceandisk/oceandisk_direct_linker.py`（key）、`connection_router.py`／`oceandisk_storage.py`（连接及 native ABI）、`disaggregation/decode_linker_mixin.py`／`unified_radix_cache.py`（attention 组同步）、`srt/layers/deep_gemm_wrapper/compile_utils.py`（NVRTC）。
+
+仍有意保留的差异：0.5.13 使用 GLM-5-FP8，现用 GLM-5.2-W4AFP8；单机4P4D资源少于旧双机8P8D；notify 50层通知、存储前缀＋RDMA tail8192、P持有缓存而轮间只清D，均不等同于张圆 NULL 混部。Q8KV8、FP8 KV、layer split、NVLS 和 speculative decoding 不进入本轮对齐基线，单列后续实验，不承诺耗时下降比例。notify 当前拒绝非复制 DSA、PP>1、DCP>1、P DP>1、无 DP attention 的 D DP，以及 speculative／D offload／staging／HiCache 组合。
+
+## 10. 验证状态与旧入口
+
+本地用现有 uv Python、torch 执行实际源码的 CPU/mock 隔离测试：notify/加载/脚本74项中68通过、6项POSIX进程测试因Windows跳过；key专项5项、路由及descriptor专项6项通过。shell语法与真实参数展开（含必填变量、单双机和tail覆盖）通过；Round Python与用户原件哈希一致。模拟 hash 验证的是路由逻辑，跨语言 xxh3 和 native 可见性仍须实机确认。
+
+扩大执行旧存储测试时发现既有失配：旧 fixture 缺 `_put_io_lock`、仍传 `max_ranges`，及旧逐层失败断言不适配当前批量接口。用 `9dc1fcf964` 原件复跑仍是1 failure／14 error记录（含subtest）；本轮不改这些旧接口和测试预期。完整Linux导入、GPU/RDMA/GIDS、DP实际容量、双机正确性和性能尚未验证。
+
+黄区顺序：小请求各DP组→清D恢复→A/B单因素→128K batch1→batch10十轮→16K递增十轮→同配置Mooncake及独立TBT；双机先验证版本、网络和跨端口可见性再重复。100/100客户端完成不替代原生状态和答案核查；1842／Batch_Retrive 等 native 错误必须单独记录。
+
+旧 `run_oceandisk_pd_tp4.sh`、`oceandisk_pd_tp4.py` 保留；原有 launcher 停止修复与测试随本版交付。旧 launcher 的 `start/check/bench/rounds/stop` 继续按旧参数运行，不会继承新脚本的 DP／chunk／连接默认值。日常使用本指南五个入口。
+
+旧 launcher 的 `server.pids` 只是当次容器进程组快照，与宿主机或GPU worker PID不一定一致。它的 `stop` 按当前监听的 `127.0.0.1:31002/:31001/:31345` 查找 SGLang，先收集主进程及子进程，TERM后等5秒再KILL残留，不依赖旧PID文件，且不结束端口上的非SGLang进程。**该 stop 仅用于旧 launcher 的 localhost 服务**；新入口绑定实际IP，按第5节停止，避免留下P/D却只停掉router。

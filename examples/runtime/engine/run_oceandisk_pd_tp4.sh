@@ -8,6 +8,7 @@ set -eu
 # 默认 notify：P 分组 PUT 完成后发 ZMQ，D 分窗口／层组 GET；尾部走 Mooncake RDMA。
 # start：nohup 启动 P、D、router，就绪后打印端口并退出；Round/run_rounds.sh 单独前台运行。
 # LOG_DIR=/path/to/logs sh examples/runtime/engine/run_oceandisk_pd_tp4.sh start
+# stop：按当前监听端口找到 P、D、router，并终止各自的子进程。
 # 10 x 128K 约需 1.3M token 的 D 容量，不足时排队；保留日志里的容量与排队数据。
 # notify、mooncake 各跑一次；服务日志在 LOG_DIR，多轮对话和 JSON 由 Round 参数指定。
 # 原生 PD 对照（mooncake，不经过 OceanDisk）：TRANSFER_BACKEND=mooncake sh ... bench
@@ -28,11 +29,62 @@ LOG_DIR="${LOG_DIR:-/tmp/oceandisk_pd/${run_id}}"
 
 mode=check
 case "${1:-}" in
-    start|check|bench)
+    start|stop|check|bench)
         mode="$1"
         shift
         ;;
 esac
+if [ "$mode" = stop ]; then
+    "${PYTHON_BIN:-python3}" - <<'PY'
+import psutil
+
+ports = {31002, 31001, 31345}
+processes = {}
+for conn in psutil.net_connections(kind="tcp"):
+    if (
+        conn.status != psutil.CONN_LISTEN
+        or conn.laddr.ip != "127.0.0.1"
+        or conn.laddr.port not in ports
+    ):
+        continue
+    if conn.pid is None:
+        raise SystemExit(f"Cannot identify service on port {conn.laddr.port}")
+    try:
+        parent = psutil.Process(conn.pid)
+        if not any("sglang" in arg for arg in parent.cmdline()):
+            raise SystemExit(f"Port {conn.laddr.port} belongs to a non-SGLang process")
+        for proc in [parent, *parent.children(recursive=True)]:
+            processes[proc.pid] = proc
+    except psutil.NoSuchProcess:
+        continue
+
+for proc in processes.values():
+    try:
+        proc.terminate()
+    except psutil.NoSuchProcess:
+        pass
+_, alive = psutil.wait_procs(list(processes.values()), timeout=5)
+for proc in alive:
+    try:
+        proc.kill()
+    except psutil.NoSuchProcess:
+        pass
+_, alive = psutil.wait_procs(alive, timeout=5)
+remaining = []
+for proc in alive:
+    try:
+        if proc.status() != psutil.STATUS_ZOMBIE:
+            remaining.append(proc.pid)
+    except psutil.NoSuchProcess:
+        pass
+if remaining:
+    raise SystemExit(f"Processes still running: {remaining}")
+print("Stopped P/D/router on ports 31002, 31001, 31345")
+PY
+    exit 0
+fi
+# A failed start must not leave the previous run's process-group IDs behind.
+rm -f "$LOG_DIR/server.pids"
 if [ "$mode" = check ]; then
     export SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS="${SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS:-0}"
 fi
