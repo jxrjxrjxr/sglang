@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Switchable event recorder for UCLinker flow and timing diagnostics.
+
+Enable with ``SGLANG_UCL_TRACE=1`` and ``SGLANG_UCL_TRACE_DIR=<run dir>``.
+Each process appends JSONL records to ``<dir>/<host>_<pid>.jsonl`` from a
+background thread; ``examples/runtime/engine/Round/ucl_trace_tool.py`` merges
+the files into a Chrome/Perfetto timeline and a Markdown report.
+
+Call sites must guard with ``if ucl_trace.ON:`` so a disabled recorder costs
+one module attribute check and never builds arguments. Recording never
+synchronizes CUDA, takes no I/O on the caller thread and does not change
+control flow. Timestamps are ``time.perf_counter_ns()``; on Linux this is
+CLOCK_MONOTONIC and therefore comparable across processes on one host only.
+
+This module is stdlib-only so the benchmark client can load it by path.
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import socket
+import threading
+import time
+from collections import deque
+
+_LEVEL = os.environ.get("SGLANG_UCL_TRACE", "0").strip()
+_DIR = os.environ.get("SGLANG_UCL_TRACE_DIR", "").strip()
+ON = _LEVEL not in ("", "0") and bool(_DIR)
+
+FORMAT_VERSION = 1
+FLUSH_INTERVAL_S = float(os.environ.get("SGLANG_UCL_TRACE_FLUSH_S", "1.0"))
+MAX_BUFFERED = int(os.environ.get("SGLANG_UCL_TRACE_MAX_BUFFERED", "1000000"))
+SLOW_NS = int(float(os.environ.get("SGLANG_UCL_TRACE_SLOW_MS", "2")) * 1e6)
+
+now = time.perf_counter_ns
+
+_events: deque = deque()
+_stats: dict = {}
+_stats_lock = threading.Lock()
+_dropped = 0
+_writer = None
+_file = None
+_identity = None
+_closed = False
+_init_lock = threading.Lock()
+
+
+def emit(name, rid=None, **fields):
+    """Record an instant event."""
+    _push((now(), -1, name, rid, threading.get_ident(), fields or None))
+
+
+def span(name, start_ns, rid=None, **fields):
+    """Record a completed interval that started at ``start_ns``."""
+    end = now()
+    _push((start_ns, end - start_ns, name, rid, threading.get_ident(), fields or None))
+
+
+def stat(name, start_ns, slow_ns=SLOW_NS, **fields):
+    """Aggregate a frequent call; keep an individual span only when slow."""
+    end = now()
+    duration = end - start_ns
+    with _stats_lock:
+        entry = _stats.get(name)
+        if entry is None:
+            _stats[name] = [1, duration, duration]
+        else:
+            entry[0] += 1
+            entry[1] += duration
+            if duration > entry[2]:
+                entry[2] = duration
+    if slow_ns is not None and duration >= slow_ns:
+        _push((start_ns, duration, name, None, threading.get_ident(), fields or None))
+
+
+def set_identity(role, label=None, **fields):
+    """Name this process (e.g. role=prefill, label=scheduler_DP0_TP0)."""
+    global _identity
+    if label is None:
+        label = _process_title()
+    _identity = dict(role=str(role), label=label, **fields)
+    _push((now(), -1, "process.identity", None, threading.get_ident(), _identity))
+
+
+def _push(record):
+    global _dropped
+    if len(_events) >= MAX_BUFFERED:
+        _dropped += 1
+        return
+    _events.append(record)
+    if _writer is None:
+        _start()
+
+
+def _process_title():
+    try:
+        import setproctitle
+
+        return setproctitle.getproctitle()
+    except Exception:
+        return f"pid{os.getpid()}"
+
+
+def _start():
+    global _writer, _file
+    with _init_lock:
+        if _writer is not None or _closed:
+            return
+        os.makedirs(_DIR, exist_ok=True)
+        host = socket.gethostname()
+        path = os.path.join(_DIR, f"{host}_{os.getpid()}.jsonl")
+        _file = open(path, "a", encoding="utf-8")
+        _write_line(
+            dict(
+                type="header",
+                version=FORMAT_VERSION,
+                run=os.environ.get("SGLANG_UCL_TRACE_RUN")
+                or os.path.basename(os.path.normpath(_DIR)),
+                host=host,
+                pid=os.getpid(),
+                level=_LEVEL,
+                clock="perf_counter_ns",
+                perf_anchor_ns=now(),
+                wall_anchor_ns=time.time_ns(),
+                flush_interval_s=FLUSH_INTERVAL_S,
+                slow_ms=SLOW_NS / 1e6,
+            )
+        )
+        _file.flush()
+        thread = threading.Thread(
+            target=_writer_loop, name="ucl-trace-writer", daemon=True
+        )
+        _writer = thread
+        thread.start()
+        atexit.register(close)
+
+
+def _write_line(obj):
+    _file.write(json.dumps(obj, separators=(",", ":"), default=str))
+    _file.write("\n")
+
+
+def _drain():
+    """Write buffered records and one flush marker; writer thread or atexit."""
+    global _stats
+    count = 0
+    names = {t.ident: t.name for t in threading.enumerate()}
+    while True:
+        try:
+            t, d, n, r, th, f = _events.popleft()
+        except IndexError:
+            break
+        record = {"t": t, "n": n, "th": names.get(th, th)}
+        if d >= 0:
+            record["d"] = d
+        if r is not None:
+            record["r"] = r
+        if f:
+            record["f"] = f
+        _write_line(record)
+        count += 1
+    with _stats_lock:
+        stats, _stats = _stats, {}
+    flushed = now()
+    for name, (calls, total, peak) in stats.items():
+        _write_line(dict(type="stat", t=flushed, n=name, c=calls, s=total, m=peak))
+    _write_line(dict(type="flush", t=flushed, events=count, dropped=_dropped))
+    _file.flush()
+
+
+def _writer_loop():
+    while not _closed:
+        time.sleep(FLUSH_INTERVAL_S)
+        try:
+            with _init_lock:
+                if not _closed:
+                    _drain()
+        except Exception:
+            # A full or vanished disk must not affect serving; the report flags
+            # the missing end marker and the last flush timestamp.
+            return
+
+
+def close():
+    """Flush everything and write the end marker (atexit, or tests)."""
+    global _closed
+    with _init_lock:
+        if _closed or _file is None:
+            return
+        _closed = True
+        try:
+            _drain()
+            _write_line(dict(type="end", t=now(), dropped=_dropped))
+            _file.close()
+        except Exception:
+            pass
