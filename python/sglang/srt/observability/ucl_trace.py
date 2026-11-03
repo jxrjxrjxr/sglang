@@ -9,7 +9,8 @@ the files into a Chrome/Perfetto timeline and a Markdown report.
 Call sites must guard with ``if ucl_trace.ON:`` so a disabled recorder costs
 one module attribute check and never builds arguments. Recording never
 synchronizes CUDA, takes no I/O on the caller thread and does not change
-control flow. Timestamps are ``time.perf_counter_ns()``; on Linux this is
+control flow; if the directory cannot be written the recorder turns itself
+off. Timestamps are ``time.perf_counter_ns()``; on Linux this is
 CLOCK_MONOTONIC and therefore comparable across processes on one host only.
 
 This module is stdlib-only so the benchmark client can load it by path.
@@ -21,6 +22,7 @@ import atexit
 import json
 import os
 import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -43,7 +45,7 @@ _dropped = 0
 _writer = None
 _file = None
 _identity = None
-_closed = False
+_closed = True  # until _start()
 _init_lock = threading.Lock()
 
 
@@ -85,13 +87,15 @@ def set_identity(role, label=None, **fields):
 
 
 def _push(record):
+    # Callers only append. The file is created and written by the writer
+    # thread, which turns the recorder off if the directory fails.
     global _dropped
+    if _closed:
+        return
     if len(_events) >= MAX_BUFFERED:
         _dropped += 1
         return
     _events.append(record)
-    if _writer is None:
-        _start()
 
 
 def _process_title():
@@ -103,38 +107,29 @@ def _process_title():
         return f"pid{os.getpid()}"
 
 
-def _start():
-    global _writer, _file
-    with _init_lock:
-        if _writer is not None or _closed:
-            return
-        os.makedirs(_DIR, exist_ok=True)
-        host = socket.gethostname()
-        path = os.path.join(_DIR, f"{host}_{os.getpid()}.jsonl")
-        _file = open(path, "a", encoding="utf-8")
-        _write_line(
-            dict(
-                type="header",
-                version=FORMAT_VERSION,
-                run=os.environ.get("SGLANG_UCL_TRACE_RUN")
-                or os.path.basename(os.path.normpath(_DIR)),
-                host=host,
-                pid=os.getpid(),
-                level=_LEVEL,
-                clock="perf_counter_ns",
-                perf_anchor_ns=now(),
-                wall_anchor_ns=time.time_ns(),
-                flush_interval_s=FLUSH_INTERVAL_S,
-                slow_ms=SLOW_NS / 1e6,
-            )
+def _open():
+    """Create the process file on first data, so idle importers leave none."""
+    global _file
+    os.makedirs(_DIR, exist_ok=True)
+    host = socket.gethostname()
+    path = os.path.join(_DIR, f"{host}_{os.getpid()}.jsonl")
+    _file = open(path, "a", encoding="utf-8")
+    _write_line(
+        dict(
+            type="header",
+            version=FORMAT_VERSION,
+            run=os.environ.get("SGLANG_UCL_TRACE_RUN")
+            or os.path.basename(os.path.normpath(_DIR)),
+            host=host,
+            pid=os.getpid(),
+            level=_LEVEL,
+            clock="perf_counter_ns",
+            perf_anchor_ns=now(),
+            wall_anchor_ns=time.time_ns(),
+            flush_interval_s=FLUSH_INTERVAL_S,
+            slow_ms=SLOW_NS / 1e6,
         )
-        _file.flush()
-        thread = threading.Thread(
-            target=_writer_loop, name="ucl-trace-writer", daemon=True
-        )
-        _writer = thread
-        thread.start()
-        atexit.register(close)
+    )
 
 
 def _write_line(obj):
@@ -145,6 +140,10 @@ def _write_line(obj):
 def _drain():
     """Write buffered records and one flush marker; writer thread or atexit."""
     global _stats
+    if _file is None:
+        if not _events and not _stats:
+            return
+        _open()
     count = 0
     names = {t.ident: t.name for t in threading.enumerate()}
     while True:
@@ -170,29 +169,67 @@ def _drain():
     _file.flush()
 
 
+def _disable(error):
+    """Stop recording after an I/O failure; serving continues untouched."""
+    global ON, _closed
+    ON = False
+    _closed = True
+    _events.clear()
+    try:
+        sys.stderr.write(f"UCL trace disabled: {error!r}\n")
+    except Exception:
+        pass
+
+
 def _writer_loop():
     while not _closed:
         time.sleep(FLUSH_INTERVAL_S)
-        try:
-            with _init_lock:
-                if not _closed:
-                    _drain()
-        except Exception:
-            # A full or vanished disk must not affect serving; the report flags
-            # the missing end marker and the last flush timestamp.
-            return
+        with _init_lock:
+            if _closed:
+                return
+            try:
+                _drain()
+            except Exception as error:
+                # The report flags the missing end marker and last flush time.
+                _disable(error)
+                return
+
+
+def _start():
+    global _writer, _closed, _file, _dropped, _init_lock, _stats_lock
+    # Fresh locks too: a fork may copy one held by the parent's writer.
+    _init_lock, _stats_lock = threading.Lock(), threading.Lock()
+    _file, _dropped = None, 0
+    _events.clear()
+    _stats.clear()
+    _closed = False
+    _writer = threading.Thread(
+        target=_writer_loop, name="ucl-trace-writer", daemon=True
+    )
+    _writer.start()
 
 
 def close():
     """Flush everything and write the end marker (atexit, or tests)."""
-    global _closed
+    global _closed, ON
     with _init_lock:
-        if _closed or _file is None:
+        if _closed:
             return
         _closed = True
+        ON = False
         try:
             _drain()
-            _write_line(dict(type="end", t=now(), dropped=_dropped))
-            _file.close()
-        except Exception:
-            pass
+            if _file is not None:
+                _write_line(dict(type="end", t=now(), dropped=_dropped))
+                _file.close()
+        except Exception as error:
+            _disable(error)
+
+
+if ON:
+    # Started once at import (process startup); call sites never do setup.
+    _start()
+    atexit.register(close)
+    if hasattr(os, "register_at_fork"):
+        # A forked child gets an empty buffer, its own file and writer thread.
+        os.register_at_fork(after_in_child=lambda: ON and _start())

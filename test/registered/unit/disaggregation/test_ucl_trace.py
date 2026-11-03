@@ -152,7 +152,21 @@ def notify_run(directory, *, merged_wait=False):
     ]
     p = [
         (-50, "req.arrive", RID, dict(room=ROOM, input_len=3000)),
-        (8, "od.put.group_done", None, dict(session=1, layer_start=0, layer_end=50)),
+        (0.5, "uc.save.begin", None, dict(session=1, phase="prefill", rids=[RID])),
+        (1, "od.put.enqueue", None, dict(session=1, layer=0)),
+        (2, "od.put.dequeue", None, dict(session=1, layer=0), None, 3),
+        (3, "od.put.dep_ready", None, dict(layer=0), None, 3),
+        (3, "od.native", None, dict(op="put", wait_us=0), 4, 3),
+        (
+            8,
+            "od.put.group_done",
+            None,
+            dict(session=1, layer_start=0, layer_end=50),
+            None,
+            3,
+        ),
+        (8.5, "od.put.session_done", None, dict(session=1, ok=True), None, 3),
+        (9, "uc.save.consumed", None, dict(session=1, ok=True)),
         (9, "notify.ready", None, dict(room=ROOM, pages=[0, 32], layers=g0)),
         (9.5, "notify.send", None, dict(room=ROOM, pages=[0, 32], layers=g0)),
         (19, "notify.send", None, dict(room=ROOM, pages=[0, 32], layers=g1)),
@@ -225,6 +239,35 @@ class TestRecorder(unittest.TestCase):
             self.assertEqual(run.files[0].role, "decode")
             self.assertTrue(run.files[0].ended)
 
+    def test_unwritable_directory_disables_without_raising(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "file")
+            write_text(blocker, "")
+            bad = os.path.join(blocker, "sub")
+            env = {"SGLANG_UCL_TRACE": "1", "SGLANG_UCL_TRACE_DIR": bad}
+            module = load(RECORDER, "ucl_bad_close", env)
+            with contextlib.redirect_stderr(io.StringIO()):
+                module.set_identity("decode")
+                module.emit("req.arrive", "rid")  # caller does no I/O
+                module.close()
+            self.assertFalse(module.ON)
+            env["SGLANG_UCL_TRACE_FLUSH_S"] = "0.02"
+            module = load(RECORDER, "ucl_bad_writer", env)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                module.emit("req.arrive", "rid")
+                module._writer.join(5)
+            self.assertFalse(module.ON)
+            self.assertIn("UCL trace disabled", err.getvalue())
+            module.emit("after.disable")  # no-op
+            self.assertEqual(len(module._events), 0)
+
+    def test_no_file_without_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"SGLANG_UCL_TRACE": "1", "SGLANG_UCL_TRACE_DIR": tmp}
+            load(RECORDER, "ucl_idle", env).close()
+            self.assertEqual(os.listdir(tmp), [])
+
     def test_round_client_finds_recorder(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {"SGLANG_UCL_TRACE": "1", "SGLANG_UCL_TRACE_DIR": tmp}
@@ -275,15 +318,25 @@ class TestReport(unittest.TestCase):
             # 20-46 (group 1), 50-70 (window 1 group 0), 72-90 (window 1 group 1).
             hint = sum((b - a) / MS for a, b in states[RID]["hints"])
             self.assertAlmostEqual(hint, 26 + 20 + 18)
-            get, _, native, _, _ = tool.storage_section(run)
+            get, put, native, _, _ = tool.storage_section(run)
             self.assertEqual(get["入队→worker取出"], [2.0])
             self.assertEqual(get["取出→前置依赖就绪"], [1.0])
             self.assertEqual(get["最后native返回→worker观察完成"], [18.0])
             self.assertEqual(get["worker观察完成→scheduler消费"], [4.0])
             self.assertEqual(native["get"], [4.0])
-            delays, group_to_ready = tool.notify_section(run)
+            # A real PUT chain (it used to crash the report with KeyError).
+            self.assertEqual(native["put"], [4.0])
+            self.assertEqual(put["入队→worker取出(每层)"], [1.0])
+            self.assertEqual(put["取出→前置依赖就绪(每层)"], [1.0])
+            self.assertEqual(put["层组最后native返回→worker观察完成"], [1.0])
+            self.assertEqual(put["session开始→worker观察完成"], [8.0])
+            self.assertEqual(put["session完成→scheduler回收"], [0.5])
+            delays, group_to_ready, ambiguous = tool.notify_section(run)
             self.assertEqual(delays, [0.5, 1.0])
             self.assertEqual(group_to_ready, [1.0])
+            self.assertEqual(ambiguous, 0)
+            self.assertEqual(states[RID]["outcome"], "released")
+            self.assertEqual(states[RID]["open_ms"], 0)
 
     def test_rank_wait_is_separated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -304,7 +357,12 @@ class TestReport(unittest.TestCase):
             self.assertIn("| r1 | 1/1 | 185.0 | 190.0 |", text)
             trace = json.loads(read_text(os.path.join(tmp, "trace.json")))
             names = {e["args"]["name"] for e in trace["traceEvents"] if e["ph"] == "M"}
-            self.assertIn("D 请求状态", names)
+            self.assertIn("请求并行轨道", names)
+            for lane in ("客户端", "P PUT", "P READY", "D READY", "D 状态", "D load"):
+                self.assertIn(f"{RID} · {lane}", names)
+            spans = {e["name"] for e in trace["traceEvents"] if e["ph"] == "X"}
+            for name in ("GET batch 0", "PUT session", "0:50", "传输完成·放行"):
+                self.assertIn(name, spans)
             summary = json.loads(read_text(os.path.join(tmp, "summary.json")))
             self.assertFalse(summary["incomplete"])
             out = io.StringIO()
@@ -353,7 +411,68 @@ class TestReport(unittest.TestCase):
             )
             text, summary = tool.build_report(run)
             self.assertTrue(summary["incomplete"])
-            self.assertIn("| r1-1-x | D 未放行 | linker.load_submit |", text)
+            # The stall after the last event is counted up to the last flush.
+            s = tool.decode_states(run)["r1-1-x"]
+            self.assertEqual(s["outcome"], "open")
+            self.assertAlmostEqual(s["open_ms"], 295)
+            self.assertEqual(s["segments"][-1][2], "load进行中")
+            self.assertAlmostEqual(s["segments"][-1][1] / MS, 300)
+            self.assertIn(
+                "| r1-1-x | D 未放行（停在 load进行中 295 ms，仍在进行） "
+                "| linker.load_submit |",
+                text,
+            )
+
+    def test_abort_is_not_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = dict(room=2, prefix_len=1024, page=64, window_pages=16, group=50)
+            write_trace(
+                tmp,
+                "decode",
+                "decode",
+                [
+                    (0, "linker.plan", "r1-2-x", plan),
+                    (7, "req.abort", "r1-2-x", dict(reason="boom")),
+                    (9, "pd.transferred", "r1-2-x", dict(room=2)),
+                ],
+            )
+            run = tool.Run(tmp)
+            s = tool.decode_states(run)["r1-2-x"]
+            self.assertEqual(s["outcome"], "aborted")
+            self.assertAlmostEqual(sum((b - a) / MS for a, b, _ in s["segments"]), 7)
+            text = tool.build_report(run)[0]
+            self.assertIn("| abort |", text)
+            self.assertNotIn("已放行", text)
+
+    def test_notify_pairs_per_receiver_and_skips_ambiguous_senders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rng = dict(room=1, pages=[0, 8], layers=[0, 50])
+            write_trace(
+                tmp,
+                "p0",
+                "prefill",
+                [
+                    (1, "notify.send", None, dict(rng, dst="d0")),
+                    (2, "notify.send", None, dict(rng, dst="d1")),
+                    (3, "notify.send", None, dict(rng, dst="dx")),
+                ],
+            )
+            write_trace(
+                tmp, "p1", "prefill", [(4, "notify.send", None, dict(rng, dst="dx"))]
+            )
+            write_trace(
+                tmp,
+                "d",
+                "decode",
+                [
+                    (5, "notify.recv", None, dict(rng, dst="d1")),
+                    (6, "notify.recv", None, dict(rng, dst="d0")),
+                    (7, "notify.recv", None, dict(rng, dst="dx")),
+                ],
+            )
+            delays, _, ambiguous = tool.notify_section(tool.Run(tmp))
+            self.assertEqual(sorted(delays), [3.0, 5.0])
+            self.assertEqual(ambiguous, 1)
 
     def test_cross_host_notify_delay_is_not_computed(self):
         with tempfile.TemporaryDirectory() as tmp:

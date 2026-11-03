@@ -316,11 +316,15 @@ def decode_states(run):
             and e["w"] >= plan["w"]
             and (run.rid_of(e) == rid or (room is not None and f_(e, "room") == room))
         ]
-        out[rid] = _walk_states(plan, evs)
+        f = run.files[src]
+        cutoff = None if f.last_flush is None else f.last_flush + f.offset
+        out[rid] = _walk_states(plan, evs, cutoff)
     return out
 
 
-def _walk_states(plan, evs):
+def _walk_states(plan, evs, cutoff=None):
+    """``cutoff``: the process's last confirmed flush; an unfinished request
+    stays in its last state until then (a stall leaves no further events)."""
     page = f_(plan, "page", 1)
     window = f_(plan, "window_pages", 1)
     group = f_(plan, "group", 1)
@@ -335,7 +339,8 @@ def _walk_states(plan, evs):
     ready = defaultdict(list)
     inflight = None  # (start_page, end_page, layer, layer_end)
     decide = (None, None)
-    released = None
+    released = None  # the event that ended the D-side interval
+    outcome = "open"  # released | aborted | open
     failed = False
     segments, hints = [], []
 
@@ -369,14 +374,16 @@ def _walk_states(plan, evs):
         return window_ready(start, layer_end)
 
     last_w = plan["w"]
-    for e in evs + [None]:
-        w = e["w"] if e is not None else None
-        if w is None:
-            break
+
+    def advance(w):
         if w > last_w:
             segments.append((last_w, w, state()))
             if hint():
                 hints.append((last_w, w))
+
+    for e in evs:
+        w = e["w"]
+        advance(w)
         last_w = w
         n = e["n"]
         if n == "notify.recv":
@@ -397,13 +404,20 @@ def _walk_states(plan, evs):
             loaded_layers = f_(e, "loaded_layers", loaded_layers)
         elif n in ("pd.transferred", "req.abort"):
             released = e
+            outcome = "released" if n == "pd.transferred" else "aborted"
             break
+    open_ms = 0.0
+    if released is None and cutoff is not None and cutoff > last_w:
+        open_ms = (cutoff - last_w) / 1e6
+        advance(cutoff)
     return dict(
         plan=plan,
         segments=segments,
         hints=hints,
         released=released,
-        last=evs[-1] if evs else plan,
+        outcome=outcome,
+        open_ms=open_ms,  # time in the last state up to the capture cutoff
+        last=released or (evs[-1] if evs else plan),
         prefix_pages=prefix_pages,
         num_layers=num_layers,
     )
@@ -461,13 +475,15 @@ def storage_section(run):
                     cur["native"] += e["d"] / 1e6
             elif n == "od.get.dequeue":
                 enq = enqueued.get((src, f_(e, "batch")))
-                cur = dict(batch=f_(e, "batch"), deq=e["w"], native=0.0, enq=enq)
+                cur = dict(
+                    op="get", batch=f_(e, "batch"), deq=e["w"], native=0.0, enq=enq
+                )
                 if enq is not None:
                     get["入队→worker取出"].append((e["w"] - enq["w"]) / 1e6)
-            elif n == "od.get.dep_ready" and cur is not None:
+            elif n == "od.get.dep_ready" and cur is not None and cur["op"] == "get":
                 cur["dep"] = e["w"]
                 get["取出→前置依赖就绪"].append((e["w"] - cur["deq"]) / 1e6)
-            elif n == "od.get.done" and cur is not None:
+            elif n == "od.get.done" and cur is not None and cur["op"] == "get":
                 get["native调用合计"].append(cur["native"])
                 if last_native_end is not None and "dep" in cur:
                     get["最后native返回→worker观察完成"].append(
@@ -484,8 +500,8 @@ def storage_section(run):
                     slow_batches.append((total, src, cur["batch"], cur["enq"]))
                 cur = None
             elif n == "od.put.dequeue":
-                cur = dict(deq=e["w"], session=f_(e, "session"), layer=f_(e, "layer"))
-            elif n == "od.put.dep_ready" and cur is not None:
+                cur = dict(op="put", deq=e["w"], native=0.0)
+            elif n == "od.put.dep_ready" and cur is not None and cur["op"] == "put":
                 put["取出→前置依赖就绪(每层)"].append((e["w"] - cur["deq"]) / 1e6)
             elif n == "od.put.group_done":
                 if last_native_end is not None:
@@ -522,15 +538,36 @@ def storage_section(run):
 
 
 def notify_section(run):
-    sent, delays, group_to_ready = {}, [], []
+    """P send -> D receive delay, paired per receiver (``dst`` session) in
+    FIFO order. A key sent by more than one P process cannot be attributed to
+    one sender, so it is counted as ambiguous instead of mixing rank skew in.
+    Returns (delays, group_to_ready, ambiguous)."""
+
+    def key(e):
+        return (
+            f_(e, "room"),
+            f_(e, "dst"),
+            tuple(f_(e, "pages")),
+            tuple(f_(e, "layers")),
+        )
+
+    senders = defaultdict(set)
     for e in run.events:
         if e["n"] == "notify.send":
-            key = (f_(e, "room"), tuple(f_(e, "pages")), tuple(f_(e, "layers")))
-            sent.setdefault(key, e)
+            senders[key(e)].add(e["src"])
+    sent, delays, group_to_ready, ambiguous = defaultdict(list), [], [], 0
+    for e in run.events:
+        if e["n"] == "notify.send":
+            sent[key(e)].append(e)
         elif e["n"] == "notify.recv":
-            key = (f_(e, "room"), tuple(f_(e, "pages")), tuple(f_(e, "layers")))
-            s = sent.get(key)
-            if s is not None and run.files[s["src"]].host == run.files[e["src"]].host:
+            k = key(e)
+            if len(senders.get(k, ())) > 1:
+                ambiguous += 1
+                continue
+            if not sent.get(k):
+                continue
+            s = sent[k].pop(0)
+            if run.files[s["src"]].host == run.files[e["src"]].host:
                 delays.append((e["w"] - s["w"]) / 1e6)
     last_group = {}
     for e in run.events:
@@ -540,7 +577,7 @@ def notify_section(run):
             gap = (e["w"] - last_group[e["src"]]) / 1e6
             if gap >= 0:
                 group_to_ready.append(gap)
-    return delays, group_to_ready
+    return delays, group_to_ready, ambiguous
 
 
 # -------------------------------------------------------------- scheduler
@@ -637,8 +674,9 @@ def build_report(run):
     lines += ["## 3. D 侧请求状态（毫秒）", ""]
     if states:
         lines += [
-            "状态互斥，按事件逐段划分，加起来等于从 D 预分配到放行的时间；用于摘要，"
-            "并行进度看 trace.json。最后一列是提示，可与 load进行中 重叠。",
+            "状态互斥，按事件逐段划分，加起来等于从 D 预分配到放行（或 abort）的时间；"
+            "未结束的请求停在最后状态，计到该进程最后一次刷盘（仍在进行）。"
+            "并行进度看 trace.json 的“请求并行轨道”。最后一列是提示，可与 load进行中 重叠。",
             "",
         ]
         rows = []
@@ -649,11 +687,7 @@ def build_report(run):
         lines += ["最慢 10 个请求：", ""]
         rows = []
         for total, rid, acc, hint_ms, s in per_rid[:10]:
-            end = (
-                "已放行"
-                if s["released"] is not None
-                else f"未放行，最后事件 {s['last']['n']}"
-            )
+            end = outcome_text(s)
             parts = "，".join(f"{k} {acc[k]:.0f}" for k in STATE_ORDER if acc.get(k))
             first = cdetail.get(rid, {}).get("first_content_ms")
             rows.append([rid, fmt(total), parts, fmt(hint_ms), fmt(first), end])
@@ -702,14 +736,20 @@ def build_report(run):
     summary["get"] = {k: dist(v) for k, v in get.items()}
     summary["put"] = {k: dist(v) for k, v in put.items()}
 
-    delays, group_to_ready = notify_section(run)
+    delays, group_to_ready, ambiguous = notify_section(run)
     lines += ["## 5. notify（毫秒）", ""]
     rows = [["P 层组完成被观察→notify.ready", *dist_cells(group_to_ready)]]
     if run.cross_host:
         rows.append(["P 发送→D 接收", "跨机未校准，不计算", "", "", ""])
     else:
-        rows.append(["P 发送→D 接收", *dist_cells(delays)])
+        rows.append(["P 发送→D 接收（同一接收方按顺序配对）", *dist_cells(delays)])
     lines += [table(["阶段", "次数", "p50", "p99", "max"], rows), ""]
+    if ambiguous:
+        lines += [
+            f"- {ambiguous} 条接收无法归属到唯一发送进程（多个 P 进程向同一接收方"
+            "发送了相同范围），未计入传递延迟。",
+            "",
+        ]
 
     stats, batches, slow = scheduler_section(run)
     lines += [
@@ -751,9 +791,17 @@ def build_report(run):
     lines += ["## 7. 未完成与异常", ""]
     issues = []
     for rid, s in states.items():
-        if s["released"] is None:
+        if s["outcome"] == "open":
             issues.append(
-                [rid, "D 未放行", s["last"]["n"], fmt(run.ms(s["last"]["w"]) / 1000, 3)]
+                [
+                    rid,
+                    f"D 未放行（停在 {s['segments'][-1][2]} {s['open_ms']:.0f} ms，"
+                    "仍在进行）"
+                    if s["open_ms"] and s["segments"]
+                    else "D 未放行",
+                    s["last"]["n"],
+                    fmt(run.ms(s["last"]["w"]) / 1000, 3),
+                ]
             )
     for e in run.events:
         if e["n"] in ("req.abort", "notify.fail", "notify.recv_invalid") or (
@@ -773,6 +821,15 @@ def build_report(run):
     else:
         lines += ["无。", ""]
     return "\n".join(lines) + "\n", summary
+
+
+def outcome_text(s):
+    if s["outcome"] == "released":
+        return "已放行"
+    if s["outcome"] == "aborted":
+        return "abort"
+    tail = f"，最后状态已持续 {s['open_ms']:.0f}（仍在进行）" if s["open_ms"] else ""
+    return f"未放行，最后事件 {s['last']['n']}{tail}"
 
 
 def dist_cells(values):
@@ -800,44 +857,162 @@ def build_trace(run):
         else:
             item.update(ph="i", s="t")
         out.append(item)
-    pid = len(run.files)
-    out.append(dict(ph="M", name="process_name", pid=pid, args=dict(name="D 请求状态")))
-    for rid, s in decode_states(run).items():
-        for a, b, name in s["segments"]:
-            out.append(
-                dict(ph="X", name=name, pid=pid, tid=rid, ts=us(a), dur=(b - a) / 1000)
-            )
-        for a, b in s["hints"]:
-            out.append(
-                dict(
-                    ph="X",
-                    name=HINT,
-                    pid=pid,
-                    tid=f"{rid} 提示",
-                    ts=us(a),
-                    dur=(b - a) / 1000,
-                )
-            )
-    pid += 1
-    out.append(dict(ph="M", name="process_name", pid=pid, args=dict(name="客户端请求")))
-    sends = {}
-    for e in run.events:
-        if e["n"] == "client.send":
-            sends[e["r"]] = e
-        elif e["n"] == "client.end" and e["r"] in sends:
-            a = sends.pop(e["r"])
-            out.append(
-                dict(
-                    ph="X",
-                    name=f_(a, "tag", e["r"]),
-                    pid=pid,
-                    tid=e["r"],
-                    ts=us(a["w"]),
-                    dur=(e["w"] - a["w"]) / 1000,
-                    args=dict(ok=f_(e, "ok")),
-                )
-            )
+    out += request_tracks(run, decode_states(run), len(run.files), us)
     return dict(traceEvents=out, displayTimeUnit="ms")
+
+
+LANES = (
+    "客户端",
+    "P 调度",
+    "P PUT",
+    "P READY",
+    "D READY",
+    "D 状态",
+    "D 提示",
+    "D load",
+    "D 传输/放行",
+    "D 调度",
+)
+
+
+def request_tracks(run, states, pid, us):
+    """One group of lanes per request, joined through rid, room, load tag,
+    GET batch and PUT session, so READY, load, transfer and release of
+    concurrent requests line up without hunting across threads."""
+    role = lambda e: run.files[e["src"]].role  # noqa: E731
+    owner = {}  # (rid, role) -> representative src (first scheduler seen)
+    first = {}
+    for e in run.events:
+        rid = run.rid_of(e)
+        if rid is None:
+            for r in f_(e, "rids") or ():
+                first.setdefault(r, e["w"])
+            continue
+        first.setdefault(rid, e["w"])
+        if e["n"] in ("req.arrive", "linker.plan"):
+            owner.setdefault((rid, role(e)), e["src"])
+    for rid, s in states.items():
+        owner[(rid, "decode")] = s["plan"]["src"]
+    order = {rid: i for i, rid in enumerate(sorted(first, key=first.get))}
+    lane_of = {name: i for i, name in enumerate(LANES)}
+    out, used = [], set()
+
+    def tid(rid, lane):
+        t = order[rid] * len(LANES) + lane_of[lane] if rid in order else None
+        if t is not None and t not in used:
+            used.add(t)
+            out.append(
+                dict(
+                    ph="M",
+                    name="thread_name",
+                    pid=pid,
+                    tid=t,
+                    args=dict(name=f"{rid} · {lane}"),
+                )
+            )
+        return t
+
+    def add(rid, lane, name, a, b=None, **args):
+        t = tid(rid, lane)
+        if t is None:
+            return
+        item = dict(name=name, pid=pid, tid=t, ts=us(a), args=args)
+        if b is None:
+            item.update(ph="i", s="t")
+        else:
+            item.update(ph="X", dur=max(b - a, 0) / 1000)
+        out.append(item)
+
+    def mine(e, rid, r):
+        return owner.get((rid, r)) == e["src"]
+
+    sends, loads, batches, sessions, prealloc = {}, {}, {}, {}, {}
+    for e in run.events:
+        n, rid = e["n"], run.rid_of(e)
+        if n == "client.send":
+            sends[e["r"]] = e
+        elif n == "client.sse" and f_(e, "content") and e["r"] in sends:
+            if not sends[e["r"]].get("_first"):
+                sends[e["r"]]["_first"] = True
+                add(e["r"], "客户端", "首内容", e["w"])
+        elif n == "client.end" and e["r"] in sends:
+            a = sends.pop(e["r"])
+            add(e["r"], "客户端", f_(a, "tag", e["r"]), a["w"], e["w"], ok=f_(e, "ok"))
+        elif n == "sched.run_batch":
+            for r in f_(e, "rids") or ():
+                lane = "P 调度" if role(e) == "prefill" else "D 调度"
+                if mine(e, r, role(e)):
+                    add(r, lane, f"run_batch {f_(e, 'mode')}", e["w"], e["w"] + e["d"])
+        elif n == "uc.save.begin":
+            for r in f_(e, "rids") or ():
+                if mine(e, r, "prefill"):
+                    sessions.setdefault((e["src"], f_(e, "session")), []).append(
+                        (r, e["w"])
+                    )
+        elif n in ("od.put.session_done", "uc.save.consumed"):
+            for r, begin in sessions.get((e["src"], f_(e, "session")), ()):
+                if n == "od.put.session_done":
+                    add(r, "P PUT", "PUT session", begin, e["w"], ok=f_(e, "ok"))
+                else:
+                    add(r, "P PUT", "scheduler 回收", e["w"])
+        elif n in ("notify.ready", "notify.send", "notify.rdma_done", "notify.fail"):
+            if rid and role(e) == "prefill" and mine(e, rid, "prefill"):
+                add(rid, "P READY", n, e["w"], pages=f_(e, "pages"))
+        elif n in ("notify.recv", "notify.recv_invalid"):
+            if rid and mine(e, rid, "decode"):
+                add(
+                    rid,
+                    "D READY",
+                    n,
+                    e["w"],
+                    pages=f_(e, "pages"),
+                    layers=f_(e, "layers"),
+                )
+        elif n == "linker.load_submit" and mine(e, rid, "decode"):
+            loads[(e["src"], e["r"])] = e
+        elif n == "linker.load_applied" and (e["src"], e["r"]) in loads:
+            a = loads.pop((e["src"], e["r"]))
+            add(rid, "D load", e["r"].split("@", 1)[-1], a["w"], e["w"], ok=f_(e, "ok"))
+        elif n == "od.get.enqueue":
+            batches[(e["src"], f_(e, "batch"))] = e
+        elif n == "od.get.done" and (e["src"], f_(e, "batch")) in batches:
+            a = batches.pop((e["src"], f_(e, "batch")))
+            for tag in f_(a, "tags") or ():
+                r = tag.split("@", 1)[0]
+                if mine(a, r, "decode"):
+                    name = f"GET batch {f_(e, 'batch')}"
+                    add(r, "D load", name, a["w"], e["w"], ok=f_(e, "ok"))
+        elif n == "pd.prealloc" and mine(e, rid, "decode"):
+            prealloc[rid] = e
+        elif n in ("pd.transferred", "req.abort") and mine(e, rid, "decode"):
+            if rid not in prealloc:
+                continue
+            a = prealloc.pop(rid)
+            label = "传输完成·放行" if n == "pd.transferred" else "abort"
+            add(rid, "D 传输/放行", label, a["w"], e["w"])
+        elif n == "pd.conclude" and rid and mine(e, rid, role(e)):
+            lane = "D 传输/放行" if role(e) == "decode" else "P READY"
+            add(rid, lane, f"conclude {f_(e, 'status')}", e["w"])
+    # Still open at the capture cutoff: draw to the owner's last flush.
+    for rid, a in prealloc.items():
+        f = run.files[a["src"]]
+        if f.last_flush is not None:
+            add(
+                rid,
+                "D 传输/放行",
+                "未放行（仍在进行）",
+                a["w"],
+                f.last_flush + f.offset,
+            )
+    for rid, s in states.items():
+        for a, b, name in s["segments"]:
+            add(rid, "D 状态", name, a, b)
+        for a, b in s["hints"]:
+            add(rid, "D 提示", HINT, a, b)
+    out.insert(
+        0, dict(ph="M", name="process_name", pid=pid, args=dict(name="请求并行轨道"))
+    )
+    return out
 
 
 # -------------------------------------------------------------------- CLI

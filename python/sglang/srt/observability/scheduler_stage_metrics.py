@@ -143,15 +143,6 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
 
         @wraps(func)
         def wrapper(self, *args, **kwargs):
-            if ucl_trace.ON:
-                start = ucl_trace.now()
-                try:
-                    return run(self, *args, **kwargs)
-                finally:
-                    _ucl_trace_stage(stage, start, args)
-            return run(self, *args, **kwargs)
-
-        def run(self, *args, **kwargs):
             recorder = self.scheduler_stage_metrics
             if recorder is None:
                 return profiled_func(self, *args, **kwargs)
@@ -168,7 +159,20 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
                     recorder._trace_stage = previous_trace_stage
                 recorder.exit(previous_stage)
 
-        return cast(_F, wrapper)
+        if not ucl_trace.ON:
+            return cast(_F, wrapper)
+
+        # Chosen at decoration time: a disabled trace leaves the call path as is.
+        @wraps(func)
+        def traced(self, *args, **kwargs):
+            start = ucl_trace.now()
+            try:
+                return wrapper(self, *args, **kwargs)
+            finally:
+                if ucl_trace.ON:
+                    _ucl_trace_stage(stage, start, args)
+
+        return cast(_F, traced)
 
     return decorator
 

@@ -2709,6 +2709,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                                 ucl_trace.emit(
                                     "notify.send",
                                     room=room,
+                                    dst=info.mooncake_session_id,
                                     pages=[left, right],
                                     layers=[layer, layer_end],
                                 )
@@ -2855,6 +2856,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             ucl_trace.emit(
                 "notify.recv",
                 room=self.bootstrap_room,
+                dst=self.session_id,
                 pages=[start, end],
                 layers=[layer, layer_end],
             )

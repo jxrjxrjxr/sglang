@@ -366,15 +366,6 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
-        if ucl_trace.ON:
-            start = ucl_trace.now()
-            try:
-                return self._exists_many_locked(keys, timings=timings)
-            finally:
-                ucl_trace.span("od.exists", start, keys=len(keys))
-        return self._exists_many_locked(keys, timings=timings)
-
-    def _exists_many_locked(self, keys: list[int], *, timings=None) -> list[bool]:
         # Exclude new PUT submissions until the synchronous query returns.
         with self._torch.cuda.device(self.device):
             started = time.perf_counter() if timings is not None else 0.0
@@ -395,6 +386,17 @@ class OceanDiskStorage(HiCacheStorage):
                 if timings is not None:
                     timings["exists_ms"] = (time.perf_counter() - started) * 1000
                 return result
+
+    if ucl_trace.ON:
+        # Wrapped only when tracing, so the disabled path keeps one call.
+        _exists_many_untraced = exists_many
+
+        def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
+            start = ucl_trace.now()
+            try:
+                return self._exists_many_untraced(keys, timings=timings)
+            finally:
+                ucl_trace.span("od.exists", start, keys=len(keys))
 
     def _exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.

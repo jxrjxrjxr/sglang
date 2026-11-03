@@ -365,7 +365,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 
 ## 11. 性能打点（UCL trace）
 
-默认关闭；关闭时每个埋点只多一次布尔判断。打开后各进程把事件写入同一目录（`<host>_<pid>.jsonl`，后台线程每秒刷盘），跑完生成报告和时间线。与上面的 `SGLANG_OCEANDISK_*` 日志相互独立，做开销对照时两组保持相同设置，建议都关闭。
+默认关闭；关闭时每个埋点只多一次布尔判断，调度阶段装饰器和 `exists_many` 不加任何包装层。打开后各进程把事件写入同一目录（`<host>_<pid>.jsonl`，由后台线程建文件并每秒刷盘；目录不可写时只在 stderr 提示一次并自动关闭打点，不影响服务），跑完生成报告和时间线。与上面的 `SGLANG_OCEANDISK_*` 日志相互独立，做开销对照时两组保持相同设置，建议都关闭。
 
 1. P、D、客户端三个终端设置相同的两个变量，然后**重启 P/D**（启动时读取，不能热切换）。每次实验用新目录：
 
@@ -376,7 +376,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 
    双机时每台机器写本地同名目录，结束后把 132 的目录拷到 134 再合并；报告会标注“跨机未校准”，不计算跨机差值。
 
-2. 照常 `sh run_rounds.sh`。结束后自动等待3秒并生成 `report.md`、`trace.json`、`summary.json`。客户端会给每个请求传 `rid=r<轮>-<序号>-<随机>`；若 router 拒绝该字段，设 `SGLANG_UCL_TRACE_CLIENT_RID=0`（仍记录客户端时间，但无法与服务端按 rid 关联）。
+2. 照常 `sh run_rounds.sh`。结束后自动等待3秒并生成 `report.md`、`trace.json`、`summary.json`。客户端会给每个请求传 `rid=r<轮>-<序号>-<随机>`；若 router 拒绝该字段，设 `SGLANG_UCL_TRACE_CLIENT_RID=0`（仍记录客户端时间，但无法与服务端按 rid 关联）。自动报告在 P/D 仍运行时执行，会占用少量 CPU 和磁盘；连续正式测数时不要让它与下一次运行重叠。
 
 3. 手动生成或对比：
 
@@ -386,17 +386,18 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
    python3 ucl_trace_tool.py compare 目录A 目录B
    ```
 
-   `trace.json` 用 Chrome 的 `chrome://tracing` 或 Perfetto 打开：每个进程一组轨道，另有“D 请求状态”和“客户端请求”两组合成轨道。
+   `trace.json` 用 Chrome 的 `chrome://tracing` 或 Perfetto 打开：每个进程一组原始线程轨道；另有“请求并行轨道”，每个请求一组泳道（客户端、P 调度、P PUT、P READY、D READY、D 状态、D 提示、D load、D 传输/放行、D 调度），按 rid、room、load tag、GET batch 和 PUT session 关联，可以直接对比并发请求的进度。
 
-4. 服务卡住时不必先停服务：直接对目录执行 report。第1节列出没有结束标记的进程和未闭合的操作，第7节列出每个未放行请求最后到达的事件。
+4. 服务卡住时不必先停服务：直接对目录执行 report。第1节列出没有结束标记的进程和未闭合的操作，第7节列出每个未放行请求最后到达的事件，以及它在最后状态已经停留的时间（计到该进程最后一次刷盘）。
 
 报告口径：
 
 | 报告项 | 含义与限制 |
 |---|---|
 | 客户端首帧／首内容 | 首帧是 rounds.json 旧 TTFT 口径；首内容是第一个带 content 的帧；帧间隔不等于逐 token TBT |
-| D 请求状态 | 等待READY → READY已到·未提交 → 本rank就绪·等其他rank → load进行中 → prefix完成·等传输/放行，互斥且加总等于 D 侧时间；“READY已满足·被inflight限制”是可重叠的提示，属于候选优化点，需再验证 |
-| GET／PUT 事件链 | 入队 → worker 取出 → 前置依赖就绪 → native 调用（另列进入前的锁/上下文等待）→ worker 观察完成 → scheduler 消费；“worker 观察完成”不等于设备完成 |
+| D 请求状态 | 等待READY → READY已到·未提交 → 本rank就绪·等其他rank → load进行中 → prefix完成·等传输/放行，互斥且加总等于 D 侧时间（到放行或 abort；未结束的计到最后一次刷盘）；“READY已满足·被inflight限制”是可重叠的提示，属于候选优化点，需再验证 |
+| GET／PUT 事件链 | 入队 → worker 取出 → 前置依赖就绪 → native 调用（另列进入前的锁/上下文等待）→ worker 观察完成 → scheduler 消费；“worker 观察完成”不等于设备完成；入队时间在放入队列之前记录 |
+| notify 传递 | P 发送→D 接收按同一接收方 session 顺序配对，仅同机计算；多个 P 进程向同一接收方发送相同范围时无法归属，单独计数、不计入延迟 |
 | 调度 | 实际执行的 batch 逐个记录；其他调度阶段和 rank 一致性检查按次数／合计／最大值累计，超过 `SGLANG_UCL_TRACE_SLOW_MS`（默认2）单独记录；run_batch 是 CPU 侧耗时 |
 
 L1 不证明 GPU 计算与 I/O 的真实重叠；要下“已实现掩盖”的结论，先用短时 nsys 核验。开销初筛：同负载 L0/L1 交替各跑3次，比较 TTFT、平均 TPOT、帧间隔尾部和吞吐；六次本身波动超过2%时判为暂时无法判断。

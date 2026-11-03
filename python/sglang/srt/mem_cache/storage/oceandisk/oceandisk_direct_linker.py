@@ -76,9 +76,10 @@ class LayerwiseSaveSession:
             hook_start = time.perf_counter()
             event = self.linker._ready_event()
             self.ready_events.append(event)
-            self.linker.offload_queue.put((self, layer, event))
+            # Recorded before put(): the worker may dequeue before put returns.
             if ucl_trace.ON:
                 ucl_trace.emit("od.put.enqueue", session=id(self), layer=layer)
+            self.linker.offload_queue.put((self, layer, event))
             self.hook_cpu_ms += (time.perf_counter() - hook_start) * 1000
         self.next_layer += 1
 
@@ -556,7 +557,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             count = end - start
         index = self.layer_done_counter.update_producer(count)
         pending, self.pending_loads = self.pending_loads, {}
-        self.load_queue.put((index, pending, event, layer_range))
+        # Recorded before put(): the worker may dequeue before put returns.
         if ucl_trace.ON:
             ucl_trace.emit(
                 "od.get.enqueue",
@@ -565,6 +566,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 pages=[len(transfers[0].keys) for transfers in pending.values()],
                 layers=list(layer_range or (0, self.num_layers)),
             )
+        self.load_queue.put((index, pending, event, layer_range))
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
