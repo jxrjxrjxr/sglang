@@ -186,7 +186,7 @@ ss -ltnp | grep -E ':31001|:31002|:31345'
 kill -TERM -- -12345
 ```
 
-前台启动用各终端 Ctrl+C。停止后复核监听和 GPU worker 已退出，再启动下一组。客户端 Ctrl+C 只结束 Round，不会停止服务。日志查看：`tail -f "$LOGS/decode.log"`。短请求诊断在 P/D 启动前设置 `SGLANG_OCEANDISK_TRACE=1`，保存 `PUT_DONE/READY_SEND` 和 `READY_RECV/LOAD_STARTED/LOAD_DONE`；正式计时回到默认 0。load tag 为 `rid@start_page:layer_start`。
+前台启动用各终端 Ctrl+C。停止后复核监听和 GPU worker 已退出，再启动下一组。客户端 Ctrl+C 只结束 Round，不会停止服务。日志查看：`tail -f "$LOGS/decode.log"`。短请求诊断在 P/D 启动前设置 `SGLANG_OCEANDISK_TRACE=1`，保存 `PUT_DONE/READY_SEND` 和 `READY_RECV/LOAD_STARTED/LOAD_DONE`；正式计时回到默认 0。load tag 为 `rid@start_page:layer_start`。结构化的流程与耗时记录见第11节 UCL trace。
 
 ## 6. Round 与三种清缓存流程
 
@@ -362,3 +362,41 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 旧 `run_oceandisk_pd_tp4.sh`、`oceandisk_pd_tp4.py` 保留；原有 launcher 停止修复与测试随本版交付。旧 launcher 的 `start/check/bench/rounds/stop` 继续按旧参数运行，不会继承新脚本的 DP／chunk／连接默认值。日常使用本指南五个入口。
 
 旧 launcher 的 `server.pids` 只是当次容器进程组快照，与宿主机或GPU worker PID不一定一致。它的 `stop` 按当前监听的 `127.0.0.1:31002/:31001/:31345` 查找 SGLang，先收集主进程及子进程，TERM后等5秒再KILL残留，不依赖旧PID文件，且不结束端口上的非SGLang进程。**该 stop 仅用于旧 launcher 的 localhost 服务**；新入口绑定实际IP，按第5节停止，避免留下P/D却只停掉router。
+
+## 11. 性能打点（UCL trace）
+
+默认关闭；关闭时每个埋点只多一次布尔判断。打开后各进程把事件写入同一目录（`<host>_<pid>.jsonl`，后台线程每秒刷盘），跑完生成报告和时间线。与上面的 `SGLANG_OCEANDISK_*` 日志相互独立，做开销对照时两组保持相同设置，建议都关闭。
+
+1. P、D、客户端三个终端设置相同的两个变量，然后**重启 P/D**（启动时读取，不能热切换）。每次实验用新目录：
+
+   ```bash
+   export SGLANG_UCL_TRACE=1
+   export SGLANG_UCL_TRACE_DIR=/home/j00977581/ucl_trace/$(date +%m%d_%H%M)_notify_16k
+   ```
+
+   双机时每台机器写本地同名目录，结束后把 132 的目录拷到 134 再合并；报告会标注“跨机未校准”，不计算跨机差值。
+
+2. 照常 `sh run_rounds.sh`。结束后自动等待3秒并生成 `report.md`、`trace.json`、`summary.json`。客户端会给每个请求传 `rid=r<轮>-<序号>-<随机>`；若 router 拒绝该字段，设 `SGLANG_UCL_TRACE_CLIENT_RID=0`（仍记录客户端时间，但无法与服务端按 rid 关联）。
+
+3. 手动生成或对比：
+
+   ```bash
+   cd /home/j00977581/sglang-pd/examples/runtime/engine/Round
+   python3 ucl_trace_tool.py report  "$SGLANG_UCL_TRACE_DIR"
+   python3 ucl_trace_tool.py compare 目录A 目录B
+   ```
+
+   `trace.json` 用 Chrome 的 `chrome://tracing` 或 Perfetto 打开：每个进程一组轨道，另有“D 请求状态”和“客户端请求”两组合成轨道。
+
+4. 服务卡住时不必先停服务：直接对目录执行 report。第1节列出没有结束标记的进程和未闭合的操作，第7节列出每个未放行请求最后到达的事件。
+
+报告口径：
+
+| 报告项 | 含义与限制 |
+|---|---|
+| 客户端首帧／首内容 | 首帧是 rounds.json 旧 TTFT 口径；首内容是第一个带 content 的帧；帧间隔不等于逐 token TBT |
+| D 请求状态 | 等待READY → READY已到·未提交 → 本rank就绪·等其他rank → load进行中 → prefix完成·等传输/放行，互斥且加总等于 D 侧时间；“READY已满足·被inflight限制”是可重叠的提示，属于候选优化点，需再验证 |
+| GET／PUT 事件链 | 入队 → worker 取出 → 前置依赖就绪 → native 调用（另列进入前的锁/上下文等待）→ worker 观察完成 → scheduler 消费；“worker 观察完成”不等于设备完成 |
+| 调度 | 实际执行的 batch 逐个记录；其他调度阶段和 rank 一致性检查按次数／合计／最大值累计，超过 `SGLANG_UCL_TRACE_SLOW_MS`（默认2）单独记录；run_batch 是 CPU 侧耗时 |
+
+L1 不证明 GPU 计算与 I/O 的真实重叠；要下“已实现掩盖”的结论，先用短时 nsys 核验。开销初筛：同负载 L0/L1 交替各跑3次，比较 TTFT、平均 TPOT、帧间隔尾部和吞吐；六次本身波动超过2%时判为暂时无法判断。
