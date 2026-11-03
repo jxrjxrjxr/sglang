@@ -149,6 +149,7 @@ def notify_run(directory, *, merged_wait=False):
         (115, "linker.kv_poll", RID, dict(state="Success")),
         (120, "pd.transferred", RID, dict(room=ROOM)),
         (121, "sched.run_batch", None, dict(mode="PREBUILT", bs=1, rids=[RID]), 0.5),
+        (122, "sched.run_batch", None, dict(mode="DECODE", bs=1, rids=[RID]), 0.5),
     ]
     p = [
         (-50, "req.arrive", RID, dict(room=ROOM, input_len=3000)),
@@ -331,10 +332,10 @@ class TestReport(unittest.TestCase):
             self.assertEqual(put["层组最后native返回→worker观察完成"], [1.0])
             self.assertEqual(put["session开始→worker观察完成"], [8.0])
             self.assertEqual(put["session完成→scheduler回收"], [0.5])
-            delays, group_to_ready, ambiguous = tool.notify_section(run)
+            delays, group_to_ready, ambiguous, unmatched = tool.notify_section(run)
             self.assertEqual(delays, [0.5, 1.0])
             self.assertEqual(group_to_ready, [1.0])
-            self.assertEqual(ambiguous, 0)
+            self.assertEqual((ambiguous, unmatched), (0, 0))
             self.assertEqual(states[RID]["outcome"], "released")
             self.assertEqual(states[RID]["open_ms"], 0)
 
@@ -358,10 +359,24 @@ class TestReport(unittest.TestCase):
             trace = json.loads(read_text(os.path.join(tmp, "trace.json")))
             names = {e["args"]["name"] for e in trace["traceEvents"] if e["ph"] == "M"}
             self.assertIn("请求并行轨道", names)
-            for lane in ("客户端", "P PUT", "P READY", "D READY", "D 状态", "D load"):
+            for lane in (
+                "客户端",
+                "P PUT",
+                "P READY",
+                "D READY",
+                "D 状态",
+                "D load",
+                "D 调度",
+            ):
                 self.assertIn(f"{RID} · {lane}", names)
             spans = {e["name"] for e in trace["traceEvents"] if e["ph"] == "X"}
-            for name in ("GET batch 0", "PUT session", "0:50", "传输完成·放行"):
+            for name in (
+                "GET batch 0",
+                "PUT session",
+                "0:50",
+                "传输完成·放行",
+                "run_batch DECODE",
+            ):
                 self.assertIn(name, spans)
             summary = json.loads(read_text(os.path.join(tmp, "summary.json")))
             self.assertFalse(summary["incomplete"])
@@ -411,6 +426,18 @@ class TestReport(unittest.TestCase):
             )
             text, summary = tool.build_report(run)
             self.assertTrue(summary["incomplete"])
+            # The stuck load and GET batch are drawn on the request's D load
+            # lane up to the last flush.
+            trace = tool.build_trace(run)["traceEvents"]
+            open_ops = {
+                e["name"]: e["ts"] + e["dur"]
+                for e in trace
+                if e.get("ph") == "X" and e["name"].endswith(" 进行中")
+            }
+            self.assertEqual(
+                open_ops,
+                {"0:0 进行中": 300_000, "GET batch 3 进行中": 300_000},
+            )
             # The stall after the last event is counted up to the last flush.
             s = tool.decode_states(run)["r1-1-x"]
             self.assertEqual(s["outcome"], "open")
@@ -470,9 +497,18 @@ class TestReport(unittest.TestCase):
                     (7, "notify.recv", None, dict(rng, dst="dx")),
                 ],
             )
-            delays, _, ambiguous = tool.notify_section(tool.Run(tmp))
+            delays, _, ambiguous, unmatched = tool.notify_section(tool.Run(tmp))
             self.assertEqual(sorted(delays), [3.0, 5.0])
-            self.assertEqual(ambiguous, 1)
+            self.assertEqual((ambiguous, unmatched), (1, 0))
+
+    def test_notify_receive_without_earlier_send_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rng = dict(room=1, dst="d0", pages=[0, 8], layers=[0, 50])
+            write_trace(tmp, "p", "prefill", [(5, "notify.send", None, rng)])
+            write_trace(tmp, "d", "decode", [(4, "notify.recv", None, rng)])
+            run = tool.Run(tmp)
+            self.assertEqual(tool.notify_section(run)[::3], ([], 1))
+            self.assertIn("1 条接收找不到更早的发送记录", tool.build_report(run)[0])
 
     def test_cross_host_notify_delay_is_not_computed(self):
         with tempfile.TemporaryDirectory() as tmp:

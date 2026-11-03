@@ -541,7 +541,9 @@ def notify_section(run):
     """P send -> D receive delay, paired per receiver (``dst`` session) in
     FIFO order. A key sent by more than one P process cannot be attributed to
     one sender, so it is counted as ambiguous instead of mixing rank skew in.
-    Returns (delays, group_to_ready, ambiguous)."""
+    Receives with no earlier send record are counted as unmatched (the send
+    is recorded before the send call, so this means missing data).
+    Returns (delays, group_to_ready, ambiguous, unmatched)."""
 
     def key(e):
         return (
@@ -555,7 +557,8 @@ def notify_section(run):
     for e in run.events:
         if e["n"] == "notify.send":
             senders[key(e)].add(e["src"])
-    sent, delays, group_to_ready, ambiguous = defaultdict(list), [], [], 0
+    sent, delays, group_to_ready = defaultdict(list), [], []
+    ambiguous = unmatched = 0
     for e in run.events:
         if e["n"] == "notify.send":
             sent[key(e)].append(e)
@@ -565,6 +568,7 @@ def notify_section(run):
                 ambiguous += 1
                 continue
             if not sent.get(k):
+                unmatched += 1
                 continue
             s = sent[k].pop(0)
             if run.files[s["src"]].host == run.files[e["src"]].host:
@@ -577,7 +581,7 @@ def notify_section(run):
             gap = (e["w"] - last_group[e["src"]]) / 1e6
             if gap >= 0:
                 group_to_ready.append(gap)
-    return delays, group_to_ready, ambiguous
+    return delays, group_to_ready, ambiguous, unmatched
 
 
 # -------------------------------------------------------------- scheduler
@@ -736,18 +740,26 @@ def build_report(run):
     summary["get"] = {k: dist(v) for k, v in get.items()}
     summary["put"] = {k: dist(v) for k, v in put.items()}
 
-    delays, group_to_ready, ambiguous = notify_section(run)
+    delays, group_to_ready, ambiguous, unmatched = notify_section(run)
     lines += ["## 5. notify（毫秒）", ""]
     rows = [["P 层组完成被观察→notify.ready", *dist_cells(group_to_ready)]]
     if run.cross_host:
         rows.append(["P 发送→D 接收", "跨机未校准，不计算", "", "", ""])
     else:
-        rows.append(["P 发送→D 接收（同一接收方按顺序配对）", *dist_cells(delays)])
+        rows.append(
+            ["P 发送→D 接收（含发送调用，同一接收方按顺序配对）", *dist_cells(delays)]
+        )
     lines += [table(["阶段", "次数", "p50", "p99", "max"], rows), ""]
     if ambiguous:
         lines += [
             f"- {ambiguous} 条接收无法归属到唯一发送进程（多个 P 进程向同一接收方"
             "发送了相同范围），未计入传递延迟。",
+            "",
+        ]
+    if unmatched:
+        lines += [
+            f"- {unmatched} 条接收找不到更早的发送记录（P 侧事件丢失或 P 未开 trace），"
+            "未计入传递延迟。",
             "",
         ]
 
@@ -993,7 +1005,22 @@ def request_tracks(run, states, pid, us):
         elif n == "pd.conclude" and rid and mine(e, rid, role(e)):
             lane = "D 传输/放行" if role(e) == "decode" else "P READY"
             add(rid, lane, f"conclude {f_(e, 'status')}", e["w"])
-    # Still open at the capture cutoff: draw to the owner's last flush.
+
+    # Still open at the capture cutoff: draw to the owner's last flush, named
+    # as in progress (trace only; report distributions use completed ones).
+    def cutoff(e):
+        f = run.files[e["src"]]
+        return None if f.last_flush is None else f.last_flush + f.offset
+
+    for (_, tag), a in loads.items():
+        if cutoff(a) is not None:
+            name = f"{tag.split('@', 1)[-1]} 进行中"
+            add(run.rid_of(a), "D load", name, a["w"], cutoff(a))
+    for (_, batch), a in batches.items():
+        for tag in f_(a, "tags") or ():
+            r = tag.split("@", 1)[0]
+            if mine(a, r, "decode") and cutoff(a) is not None:
+                add(r, "D load", f"GET batch {batch} 进行中", a["w"], cutoff(a))
     for rid, a in prealloc.items():
         f = run.files[a["src"]]
         if f.last_flush is not None:

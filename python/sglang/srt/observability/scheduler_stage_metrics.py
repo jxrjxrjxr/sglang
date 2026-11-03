@@ -187,7 +187,8 @@ def _ucl_trace_stage(stage: str, start: int, args: tuple) -> None:
         tokens = getattr(batch, "extend_num_tokens", None)
         if tokens:
             fields["tokens"] = tokens
-        if mode not in ("DECODE", "IDLE"):
+        if mode != "IDLE":
+            # Decode too, so per-request lanes show every step it was in.
             fields["rids"] = [req.rid for req in reqs]
         ucl_trace.span("sched.run_batch", start, **fields)
     else:

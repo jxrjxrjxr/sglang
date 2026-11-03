@@ -2692,6 +2692,16 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                             if left >= right:
                                 continue
                             addr = NetworkAddress(info.endpoint, info.dst_port)
+                            # Before the send: D may receive before it returns.
+                            # Send -> receive delay includes the send call.
+                            if ucl_trace.ON:
+                                ucl_trace.emit(
+                                    "notify.send",
+                                    room=room,
+                                    dst=info.mooncake_session_id,
+                                    pages=[left, right],
+                                    layers=[layer, layer_end],
+                                )
                             mgr._send_multipart_locked(
                                 addr.to_tcp(),
                                 [
@@ -2705,14 +2715,6 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                                 ],
                                 is_ipv6=addr.is_ipv6,
                             )
-                            if ucl_trace.ON:
-                                ucl_trace.emit(
-                                    "notify.send",
-                                    room=room,
-                                    dst=info.mooncake_session_id,
-                                    pages=[left, right],
-                                    layers=[layer, layer_end],
-                                )
                             if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
                                 logger.info(
                                     "[Linker READY_SEND] room=%s "

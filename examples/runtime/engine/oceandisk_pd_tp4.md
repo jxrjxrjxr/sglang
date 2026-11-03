@@ -386,7 +386,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
    python3 ucl_trace_tool.py compare 目录A 目录B
    ```
 
-   `trace.json` 用 Chrome 的 `chrome://tracing` 或 Perfetto 打开：每个进程一组原始线程轨道；另有“请求并行轨道”，每个请求一组泳道（客户端、P 调度、P PUT、P READY、D READY、D 状态、D 提示、D load、D 传输/放行、D 调度），按 rid、room、load tag、GET batch 和 PUT session 关联，可以直接对比并发请求的进度。
+   `trace.json` 用 Chrome 的 `chrome://tracing` 或 Perfetto 打开：每个进程一组原始线程轨道；另有“请求并行轨道”，每个请求一组泳道（客户端、P 调度、P PUT、P READY、D READY、D 状态、D 提示、D load、D 传输/放行、D 调度），按 rid、room、load tag、GET batch 和 PUT session 关联，可以直接对比并发请求的进度；“D 调度”含该请求参与的每个 decode batch，可与客户端帧间隔对照；卡住的 load／GET batch 画到最后一次刷盘并标“进行中”。
 
 4. 服务卡住时不必先停服务：直接对目录执行 report。第1节列出没有结束标记的进程和未闭合的操作，第7节列出每个未放行请求最后到达的事件，以及它在最后状态已经停留的时间（计到该进程最后一次刷盘）。
 
@@ -397,7 +397,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 | 客户端首帧／首内容 | 首帧是 rounds.json 旧 TTFT 口径；首内容是第一个带 content 的帧；帧间隔不等于逐 token TBT |
 | D 请求状态 | 等待READY → READY已到·未提交 → 本rank就绪·等其他rank → load进行中 → prefix完成·等传输/放行，互斥且加总等于 D 侧时间（到放行或 abort；未结束的计到最后一次刷盘）；“READY已满足·被inflight限制”是可重叠的提示，属于候选优化点，需再验证 |
 | GET／PUT 事件链 | 入队 → worker 取出 → 前置依赖就绪 → native 调用（另列进入前的锁/上下文等待）→ worker 观察完成 → scheduler 消费；“worker 观察完成”不等于设备完成；入队时间在放入队列之前记录 |
-| notify 传递 | P 发送→D 接收按同一接收方 session 顺序配对，仅同机计算；多个 P 进程向同一接收方发送相同范围时无法归属，单独计数、不计入延迟 |
+| notify 传递 | 发送时间在发送调用之前记录，延迟包含发送调用本身；按同一接收方 session 顺序配对，仅同机计算；多个 P 进程向同一接收方发送相同范围、或找不到更早发送记录的接收，分别计数、不计入延迟 |
 | 调度 | 实际执行的 batch 逐个记录；其他调度阶段和 rank 一致性检查按次数／合计／最大值累计，超过 `SGLANG_UCL_TRACE_SLOW_MS`（默认2）单独记录；run_batch 是 CPU 侧耗时 |
 
 L1 不证明 GPU 计算与 I/O 的真实重叠；要下“已实现掩盖”的结论，先用短时 nsys 核验。开销初筛：同负载 L0/L1 交替各跑3次，比较 TTFT、平均 TPOT、帧间隔尾部和吞吐；六次本身波动超过2%时判为暂时无法判断。
