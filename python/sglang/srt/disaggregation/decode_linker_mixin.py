@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.observability import ucl_trace
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -64,6 +65,11 @@ class LinkerLoadGatedKVReceiver:
     def poll(self) -> KVPoll:
         dr = self.decode_req
         poll = dr.kv_receiver.poll()
+        if ucl_trace.ON and getattr(dr, "_ucl_kv_poll", None) != poll:
+            dr._ucl_kv_poll = poll
+            ucl_trace.emit(
+                "linker.kv_poll", dr.req.rid, state=getattr(poll, "name", poll)
+            )
         if dr.linker_prefix_len <= len(dr.req.prefix_indices):
             return poll
         if poll == KVPoll.Failed or dr.kv_receiver.abort_notified:
@@ -124,6 +130,14 @@ class DecodeLinkerTransferMixin:
                     f"tokens={dr.linker_loaded_len}:{dr.linker_inflight_end}, "
                     f"layers={dr.linker_loaded_layers}:{dr.linker_inflight_layers}",
                 )
+            if ucl_trace.ON:
+                ucl_trace.emit(
+                    "linker.load_applied",
+                    tag,
+                    ok=success,
+                    loaded_len=dr.linker_loaded_len,
+                    loaded_layers=dr.linker_loaded_layers,
+                )
             dr.linker_inflight_end = dr.linker_inflight_layers = 0
 
         # Only CPU bookkeeping and rank consensus run here; EXISTS is never
@@ -148,8 +162,13 @@ class DecodeLinkerTransferMixin:
                     ) >= end
                 )
             states.append(-1 if failed else int(due))
+        local_states = states
         states = torch.tensor(states, dtype=torch.int, device="cpu")
+        consensus_start = ucl_trace.now() if ucl_trace.ON else 0
         self.tree_cache._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MIN)
+        if ucl_trace.ON:
+            ucl_trace.stat("linker.consensus", consensus_start, reqs=len(active))
+            _trace_linker_decisions(active, local_states, states.tolist(), page, window)
 
         batches = {}
         for dr, state in zip(active, states.tolist()):
@@ -167,6 +186,13 @@ class DecodeLinkerTransferMixin:
                 batches.setdefault((layer, layer_end), []).append(
                     (f"{dr.req.rid}@{start}:{layer}", start, end, indices)
                 )
+                if ucl_trace.ON:
+                    ucl_trace.emit(
+                        "linker.load_submit",
+                        f"{dr.req.rid}@{start}:{layer}",
+                        pages=[start, end],
+                        layers=[layer, layer_end],
+                    )
                 dr.linker_inflight_end = end * page
                 dr.linker_inflight_layers = layer_end
             if not dr.linker_inflight_end and (
@@ -176,3 +202,33 @@ class DecodeLinkerTransferMixin:
         # The same rank-consistent candidates produce the same ordered batches.
         for layer_range, loads in sorted(batches.items()):
             linker.queue_handoff_loads(loads, layer_range=layer_range)
+
+
+def _trace_linker_decisions(active, local_states, global_states, page, window):
+    """Emit one event per request whenever its local/consensus decision changes.
+
+    local/global: -1 failed, 0 cannot advance, 1 next window/layer group due.
+    local=1 with global=0 means another rank is not ready yet.
+    """
+    for dr, local, merged in zip(active, local_states, global_states):
+        start = dr.linker_loaded_len // page
+        key = (
+            local,
+            merged,
+            dr.linker_loaded_len,
+            dr.linker_loaded_layers,
+            dr.linker_inflight_end,
+        )
+        if getattr(dr, "_ucl_decision", None) == key:
+            continue
+        dr._ucl_decision = key
+        ucl_trace.emit(
+            "linker.decide",
+            dr.req.rid,
+            local=local,
+            merged=merged,
+            loaded_len=dr.linker_loaded_len,
+            loaded_layers=dr.linker_loaded_layers,
+            inflight=bool(dr.linker_inflight_end),
+            window=[start, min(start + window, dr.linker_prefix_len // page)],
+        )

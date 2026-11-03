@@ -1612,6 +1612,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     local_prefix=len(decode_req.req.prefix_indices),
                     decode_prefix_len=metadata_kwargs["decode_prefix_len"],
                 )
+                if use_linker_notify:
+                    page = self.tree_cache.page_size
+                    ucl_trace.emit(
+                        "linker.plan",
+                        decode_req.req.rid,
+                        room=decode_req.req.bootstrap_room,
+                        prefix_len=decode_req.linker_prefix_len,
+                        loaded_len=decode_req.linker_loaded_len,
+                        page=page,
+                        window_pages=self.scheduler.chunked_prefill_size // page,
+                        group=envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get(),
+                    )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,

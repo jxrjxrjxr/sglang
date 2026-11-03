@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.observability import ucl_trace
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -2221,6 +2222,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Keep destinations alive when RDMA wins the race against PUT.
             with sender.linker_lock:
                 sender.linker_rdma_done = True
+                if ucl_trace.ON:
+                    ucl_trace.emit("notify.rdma_done", room=bootstrap_room)
                 sender.flush_linker_ready()
             return self.request_status.get(bootstrap_room)
         return super().conclude_transfer(
@@ -2640,9 +2643,20 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 self.linker_ready[key] = _merge_linker_ranges(
                     self.linker_ready.get(key, ()), start, end
                 )
+            if ucl_trace.ON:
+                ucl_trace.emit(
+                    "notify.ready",
+                    room=self.bootstrap_room,
+                    pages=[start, end],
+                    layers=[layer_start, layer_end],
+                )
             self.flush_linker_ready()
 
     def fail_linker(self, reason):
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "notify.fail", room=self.bootstrap_room, reason=str(reason)[:300]
+            )
         if self.kv_mgr.linker_senders.get(self.bootstrap_room) is self:
             self.kv_mgr.conclude_failure(
                 bootstrap_room=self.bootstrap_room, failure_reason=reason
@@ -2691,6 +2705,13 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                                 ],
                                 is_ipv6=addr.is_ipv6,
                             )
+                            if ucl_trace.ON:
+                                ucl_trace.emit(
+                                    "notify.send",
+                                    room=room,
+                                    pages=[left, right],
+                                    layers=[layer, layer_end],
+                                )
                             if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
                                 logger.info(
                                     "[Linker READY_SEND] room=%s "
@@ -2817,11 +2838,25 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         ):
             mgr.record_failure(self.bootstrap_room, "Invalid Linker READY range")
             mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            if ucl_trace.ON:
+                ucl_trace.emit(
+                    "notify.recv_invalid",
+                    room=self.bootstrap_room,
+                    pages=[start, end],
+                    layers=[layer, layer_end],
+                )
             return
         with self.linker_lock:
             key = (layer, layer_end)
             self.linker_ready[key] = _merge_linker_ranges(
                 self.linker_ready.get(key, ()), start, end
+            )
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "notify.recv",
+                room=self.bootstrap_room,
+                pages=[start, end],
+                layers=[layer, layer_end],
             )
         if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
             logger.info(
