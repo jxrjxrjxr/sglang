@@ -701,6 +701,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self, transfers, *, write: bool, counter_index=None, layer_range=None
     ) -> None:
         layers = self._transfer_layers(transfers)
+        if ucl_trace.ON and not write:
+            ucl_trace.emit("od.get.ranges", batch=counter_index)
         if layer_range is not None:
             # Descriptors retain the original layer storage offsets. The native
             # dispatch and counter index only the selected rows, starting at zero.
@@ -849,6 +851,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                     session=id(task),
                                     pages=len(task.keys),
                                     ok=success,
+                                    receipt=id(task.completion),
                                 )
                             if self.offload_owner:
                                 cache_debug(
@@ -961,6 +964,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     break
         self.layer_done_counter.reset()
         self._layerwise_receipts.clear()
+        if ucl_trace.ON:
+            # GET batch numbers restart here; the report pairs per generation.
+            ucl_trace.emit("od.reset")
 
     def close(self) -> None:
         if self._closed:

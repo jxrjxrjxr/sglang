@@ -2628,7 +2628,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             // self.kv_mgr.kv_args.page_size,
         )
 
-    def notify_linker_ready(self, start, end, layer_start, layer_end):
+    def notify_linker_ready(
+        self, start, end, layer_start, layer_end, origin="exists", receipt=None
+    ):
+        """``origin``/``receipt`` only label the trace: group (layer group PUT
+        done), receipt (a PUT session's completion) or exists (lookup hit)."""
         with self.linker_lock:
             if self.kv_mgr.linker_senders.get(self.bootstrap_room) is not self:
                 return
@@ -2649,6 +2653,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                     room=self.bootstrap_room,
                     pages=[start, end],
                     layers=[layer_start, layer_end],
+                    origin=origin,
+                    receipt=receipt,
                 )
             self.flush_linker_ready()
 

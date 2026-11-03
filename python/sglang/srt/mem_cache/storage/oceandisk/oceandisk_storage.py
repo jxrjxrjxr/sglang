@@ -583,6 +583,8 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             descriptors = self._pack_layer_batches(layers)
             packed = time.perf_counter()
+            if ucl_trace.ON:
+                ucl_trace.emit("od.get.packed")
             cpu_tensor_ms = upload_ms = 0.0
             submitted = []
             trace_event(

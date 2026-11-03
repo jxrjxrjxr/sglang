@@ -306,7 +306,9 @@ class TestLinkerNotifyPrefix(unittest.TestCase):
         self.backend.lookup.assert_not_called()
         self.sender.notify_linker_ready.assert_not_called()
         receipt.set_result(True)
-        self.sender.notify_linker_ready.assert_called_once_with(0, 4, 0, 3)
+        self.sender.notify_linker_ready.assert_called_once_with(
+            0, 4, 0, 3, origin="receipt", receipt=id(receipt)
+        )
 
     def test_completed_receipt_avoids_exists_and_repair(self):
         receipt = Future()
@@ -317,7 +319,9 @@ class TestLinkerNotifyPrefix(unittest.TestCase):
         self.inspect()
         self.backend.lookup.assert_not_called()
         self.assertIsNone(self.req._uc_linker_repair_start)
-        self.sender.notify_linker_ready.assert_called_once_with(0, 4, 0, 3)
+        self.sender.notify_linker_ready.assert_called_once_with(
+            0, 4, 0, 3, origin="receipt", receipt=id(receipt)
+        )
 
     def test_missing_receipt_checks_once_and_repairs_missing_suffix(self):
         self.backend.lookup.return_value = [1, 2]
@@ -438,8 +442,12 @@ class TestLinkerNotifyPrefix(unittest.TestCase):
             transfers, [(self.req, 8), (other, 8)], session
         )
         session.on_layer_group_ready(0, 2)
-        self.sender.notify_linker_ready.assert_called_once_with(0, 2, 0, 2)
-        other.disagg_kv_sender.notify_linker_ready.assert_called_once_with(0, 2, 0, 2)
+        self.sender.notify_linker_ready.assert_called_once_with(
+            0, 2, 0, 2, origin="group"
+        )
+        other.disagg_kv_sender.notify_linker_ready.assert_called_once_with(
+            0, 2, 0, 2, origin="group"
+        )
         receipt.set_result(False)
         self.sender.fail_linker.assert_called_once()
         other.disagg_kv_sender.fail_linker.assert_called_once()

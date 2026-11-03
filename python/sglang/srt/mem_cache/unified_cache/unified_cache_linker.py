@@ -207,7 +207,14 @@ class UnifiedCacheLinkerWrapper:
         try:
             if receipt is None or not receipt.result():
                 raise RuntimeError("OceanDisk prefix PUT did not complete successfully")
-            sender.notify_linker_ready(start, end, 0, self.cache_linker.num_layers)
+            sender.notify_linker_ready(
+                start,
+                end,
+                0,
+                self.cache_linker.num_layers,
+                origin="receipt",
+                receipt=id(receipt),
+            )
         except Exception as error:
             sender.fail_linker(str(error))
 
@@ -322,7 +329,9 @@ class UnifiedCacheLinkerWrapper:
 
             def on_layer_group_ready(layer_start, layer_end):
                 for sender, start, end in grouped:
-                    sender.notify_linker_ready(start, end, layer_start, layer_end)
+                    sender.notify_linker_ready(
+                        start, end, layer_start, layer_end, origin="group"
+                    )
 
             session.on_layer_group_ready = on_layer_group_ready
 
@@ -439,14 +448,6 @@ class UnifiedCacheLinkerWrapper:
             return None
         plan_done = time.perf_counter()
         session = self.cache_linker.begin_layerwise_save(transfers, phase=phase)
-        if ucl_trace.ON and session is not None:
-            ucl_trace.emit(
-                "uc.save.begin",
-                session=id(session),
-                phase=phase,
-                rids=[req.rid for req, _ in completed],
-                pages=[len(transfer.keys) for transfer in transfers],
-            )
         self._bind_handoff_saves(transfers, completed, session)
         for transfer, (req, _) in zip(transfers, completed, strict=True):
             receipts = getattr(req, "_uc_layerwise_receipts", None)
@@ -485,6 +486,17 @@ class UnifiedCacheLinkerWrapper:
             session.prepare_details["other"] = session.prepare_ms - sum(
                 session.prepare_details.values()
             )
+            if ucl_trace.ON:
+                # After planning: prepare_ms is the scheduler-thread CPU cost
+                # of hashing, descriptors and pinning, before the forward.
+                ucl_trace.emit(
+                    "uc.save.begin",
+                    session=id(session),
+                    phase=phase,
+                    rids=[req.rid for req, _ in completed],
+                    pages=[len(transfer.keys) for transfer in transfers],
+                    prepare_ms=round(session.prepare_ms, 3),
+                )
         return session
 
     def get_layerwise_page_hashes(self, req, key: RadixKey) -> list[str] | None:
