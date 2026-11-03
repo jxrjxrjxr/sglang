@@ -357,6 +357,78 @@ class TestReport(unittest.TestCase):
                 acc[name] = acc.get(name, 0) + (b - a) / MS
             self.assertAlmostEqual(acc["本rank就绪·等其他rank"], 5)
 
+    def test_all_layer_range_shorter_than_window_counts_as_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = dict(room=1, prefix_len=4 * 64, page=64, window_pages=2, group=50)
+            rng = dict(room=1, pages=[0, 1])
+            write_trace(
+                tmp,
+                "decode",
+                "decode",
+                [
+                    (0, "linker.plan", "r1-1-x", plan),
+                    (10, "notify.recv", None, dict(rng, layers=[0, 50])),
+                    (10, "notify.recv", None, dict(rng, layers=[50, 61])),
+                    (
+                        10,
+                        "linker.decide",
+                        "r1-1-x",
+                        dict(local=1, merged=1, ends=[1, 1]),
+                    ),
+                    (
+                        20,
+                        "linker.load_submit",
+                        "r1-1-x@0:0",
+                        dict(pages=[0, 1], layers=[0, 61]),
+                    ),
+                    (30, "pd.transferred", "r1-1-x", dict(room=1)),
+                ],
+            )
+            acc = {}
+            for a, b, name in tool.decode_states(tool.Run(tmp))["r1-1-x"]["segments"]:
+                acc[name] = acc.get(name, 0) + (b - a) / MS
+            self.assertEqual(acc["等待READY"], 10)
+            self.assertEqual(acc["READY已到·未提交"], 10)
+
+    def test_window_stops_unfinished_states_at_window_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = dict(room=1, prefix_len=1024, page=64, window_pages=16, group=50)
+            write_trace(
+                tmp,
+                "client",
+                "client",
+                [
+                    (10, "client.send", "r1-1-x", dict(tag="r1-1")),
+                    (30, "client.end", "r1-1-x", dict(ok=False)),
+                ],
+            )
+            write_trace(
+                tmp,
+                "decode",
+                "decode",
+                [
+                    (12, "linker.plan", "r1-1-x", plan),
+                    (
+                        15,
+                        "linker.load_submit",
+                        "r1-1-x@0:0",
+                        dict(pages=[0, 16], layers=[0, 50]),
+                    ),
+                    (100, "pd.transferred", "r1-1-x", dict(room=1)),
+                ],
+            )
+            run = tool.Run(tmp)
+            s = tool.decode_states(run.windowed(10 * MS, 30 * MS))["r1-1-x"]
+            self.assertTrue(s["window_cut"])
+            self.assertAlmostEqual(s["open_ms"], 15)
+            self.assertAlmostEqual(s["segments"][-1][1] / MS, 30)
+            self.assertIn(
+                "D 窗口结束时未放行（停在 load进行中 15 ms，全程采集中随后放行）",
+                tool.build_report(run)[0],
+            )
+            # The unwindowed capture still sees the release.
+            self.assertEqual(tool.decode_states(run)["r1-1-x"]["outcome"], "released")
+
     def test_report_files_client_columns_and_compare(self):
         with tempfile.TemporaryDirectory() as tmp:
             notify_run(tmp)
@@ -557,8 +629,22 @@ class TestReport(unittest.TestCase):
                 "p",
                 "prefill",
                 [
-                    (1, "od.put.session_done", None, dict(session=1, receipt=11), None, 3),
-                    (2, "notify.ready", None, dict(rng, origin="receipt", receipt=11), None, 3),
+                    (
+                        1,
+                        "od.put.session_done",
+                        None,
+                        dict(session=1, receipt=11),
+                        None,
+                        3,
+                    ),
+                    (
+                        2,
+                        "notify.ready",
+                        None,
+                        dict(rng, origin="receipt", receipt=11),
+                        None,
+                        3,
+                    ),
                     # Registered after completion: fires in the scheduler thread.
                     (9, "notify.ready", None, dict(rng, origin="receipt", receipt=11)),
                     (10, "notify.ready", None, dict(rng, origin="exists")),

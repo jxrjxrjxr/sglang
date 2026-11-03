@@ -372,7 +372,11 @@ def decode_states(run):
         ]
         f = run.files[src]
         cutoff = None if f.last_flush is None else f.last_flush + f.offset
-        out[rid] = _walk_states(plan, evs, cutoff)
+        cut = run.window is not None and cutoff is not None and run.window[1] < cutoff
+        if cut:
+            cutoff = run.window[1]  # a windowed run stops at the window end
+        out[rid] = s = _walk_states(plan, evs, cutoff)
+        s["window_cut"] = cut and s["outcome"] == "open"
     return out
 
 
@@ -402,6 +406,17 @@ def _walk_states(plan, evs, cutoff=None):
         return (layer, min(layer + group, num_layers))
 
     def window_ready(start, layer):
+        # Same rule as the decode scheduler: a range READY in every layer group
+        # loads at once (any length); otherwise a whole window x one group.
+        if (
+            layer == 0
+            and start < prefix_pages
+            and all(
+                covered_until(ready[key(g)], start) > start
+                for g in range(0, num_layers, group)
+            )
+        ):
+            return True
         end = min(start + window, prefix_pages)
         return start < end and covered_until(ready[key(layer)], start) >= end
 
@@ -928,12 +943,25 @@ def build_report(run):
         ]
 
     states = decode_states(run)
+    for rid, s in states.items():
+        if s["window_cut"]:  # what the full capture says happened afterwards
+            s["final"] = next(
+                (
+                    e["n"]
+                    for e in full.events
+                    if e["w"] > run.window[1]
+                    and e["n"] in ("pd.transferred", "req.abort")
+                    and full.rid_of(e) == rid
+                ),
+                None,
+            )
     totals, per_rid = state_section(states)
     lines += ["## 3. D 侧请求状态（毫秒）", ""]
     if states:
         lines += [
             "状态互斥，按事件逐段划分，加起来等于从 D 预分配到放行（或 abort）的时间；"
-            "未结束的请求停在最后状态，计到该进程最后一次刷盘（仍在进行）。"
+            "未结束的请求停在最后状态，计到该进程最后一次刷盘（仍在进行），"
+            "有实验窗口时最多计到窗口末尾。"
             "并行进度看 trace.json 的“请求并行轨道”。最后一列是提示，可与 load进行中 重叠。",
             "",
         ]
@@ -1100,7 +1128,9 @@ def build_report(run):
         ratio = p["exists_count"] / p["admitted"] if p["admitted"] else 0
         lines += [
             f"- owner 的 od.exists 次数 {p['exists_count']}，被执行的请求 {p['admitted']}，"
-            f"比值 {ratio:.2f}（明显大于 1 说明同一请求被重复查询）。",
+            f"比值 {ratio:.2f}。只作排查信号：一个请求正常就会查询两次"
+            "（handoff 前缀页、match 剩余前缀），比值大于 1 不等于重复查询；"
+            "实施 C2 前须确认重复的是同一请求、同一查询区间。",
             "",
         ]
         summary["prefill"] = {
@@ -1176,13 +1206,16 @@ def build_report(run):
     issues = []
     for rid, s in states.items():
         if s["outcome"] == "open":
+            where = "窗口结束时" if s["window_cut"] else ""
             issues.append(
                 [
                     rid,
-                    f"D 未放行（停在 {s['segments'][-1][2]} {s['open_ms']:.0f} ms，"
-                    "仍在进行）"
-                    if s["open_ms"] and s["segments"]
-                    else "D 未放行",
+                    (
+                        f"D {where}未放行（停在 {s['segments'][-1][2]} "
+                        f"{s['open_ms']:.0f} ms，{final_text(s)}）"
+                        if s["open_ms"] and s["segments"]
+                        else f"D {where}未放行"
+                    ),
                     s["last"]["n"],
                     fmt(run.ms(s["last"]["w"]) / 1000, 3),
                 ]
@@ -1212,8 +1245,22 @@ def outcome_text(s):
         return "已放行"
     if s["outcome"] == "aborted":
         return "abort"
-    tail = f"，最后状态已持续 {s['open_ms']:.0f}（仍在进行）" if s["open_ms"] else ""
-    return f"未放行，最后事件 {s['last']['n']}{tail}"
+    tail = (
+        f"，最后状态已持续 {s['open_ms']:.0f}（{final_text(s)}）"
+        if s["open_ms"]
+        else ""
+    )
+    where = "窗口结束时" if s.get("window_cut") else ""
+    return f"{where}未放行，最后事件 {s['last']['n']}{tail}"
+
+
+def final_text(s):
+    if not s.get("window_cut"):
+        return "仍在进行"
+    return {
+        "pd.transferred": "全程采集中随后放行",
+        "req.abort": "全程采集中随后 abort",
+    }.get(s.get("final"), "全程采集结束仍未放行")
 
 
 def dist_cells(values):
