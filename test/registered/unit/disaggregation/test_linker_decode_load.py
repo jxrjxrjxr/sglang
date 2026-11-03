@@ -309,33 +309,45 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.backend.lookup.assert_not_called()
         self.assertEqual(LinkerLoadGatedKVReceiver(dr).poll(), KVPoll.Success)
 
-    def test_windows_batch_and_preallocated_destinations(self):
+    def test_ready_prefix_loads_all_layers_in_one_get_and_caps_batches(self):
+        # Every layer group READY over the whole prefix: one GET per request
+        # covers all pages and layers instead of window x group pieces. A
+        # batch holds about one longest prefix, so b waits one round.
         a, b = self.request(), self.request("b", slot=1)
         self.process(a, b)
-        self.assertEqual(self.batches, [(0, ["r@1:0", "b@1:0"])])
+        self.assertEqual(self.batches, [(0, ["r@1:0"])])
         tag, transfers = self.backend.load.call_args_list[0].args
         self.assertEqual(tag, "r@1:0")
-        self.assertEqual(transfers[0].device_indices.tolist(), list(range(4, 12)))
+        self.assertEqual(transfers[0].device_indices.tolist(), list(range(4, 24)))
         full = self.linker.handoff_transfers["r"][0]
-        self.assertEqual(transfers[0].keys, full.keys[1:3])
+        self.assertEqual(transfers[0].keys, full.keys[1:6])
         self.assertIsNone(full.device_indices)
+        self.assertEqual(len(self.counter.futures[0]), 3)
+        self.assertEqual((a.linker_inflight_end, b.linker_inflight_end), (24, 0))
         self.process(a, b)
-        self.assertEqual(len(self.batches), 1)
+        self.assertEqual(self.batches[1][1], ["b@1:0"])
         self.complete_batch()
+        self.complete_batch(1)
         self.assertFalse(self.counter.futures)
         self.process(a, b)
-        self.assertEqual((a.linker_loaded_len, a.linker_inflight_end), (12, 20))
-        self.assertEqual(self.batches[-1][1], ["r@3:0", "b@3:0"])
-        self.complete_batch(1)
-        self.process(a, b)
-        self.assertEqual(a.linker_inflight_end, 24)
-        self.complete_batch(2)
-        self.process(a, b)
-        self.assertEqual(a.linker_loaded_len, 24)
+        self.assertEqual((a.linker_loaded_len, b.linker_loaded_len), (24, 24))
+        self.assertEqual(a.linker_loaded_layers, 0)
+        self.assertEqual(len(self.batches), 2)
         self.assertFalse(self.linker.completed_handoff_loads)
         self.assertFalse(self.linker.pending_handoff_loads)
         self.assertFalse(self.linker.handoff_transfers)
         self.assertEqual(LinkerLoadGatedKVReceiver(a).poll(), KVPoll.Success)
+
+    def test_all_layer_range_takes_rank_minimum(self):
+        # Another rank is READY only up to page 3: the merged end is the MIN.
+        self.cache._all_reduce_attn_groups.side_effect = lambda states, op: (
+            states[:, 0].clamp_(max=3)
+        )
+        dr = self.request()
+        self.process(dr)
+        self.assertEqual(self.batches, [(0, ["r@1:0"])])
+        self.assertEqual(dr.linker_inflight_end, 12)
+        self.assertEqual(dr.linker_inflight_layers, 3)
 
     def test_decode_loop_drains_linker_even_when_retractions_block_polling(self):
         events = []
@@ -398,17 +410,19 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         dr.linker_inflight_end = 0
         self.assertEqual(LinkerLoadGatedKVReceiver(dr).poll(), KVPoll.Failed)
 
-    def test_partial_ready_range_does_not_issue_get(self):
+    def test_unready_range_waits_and_ready_part_loads_without_full_window(self):
         dr = self.request()
-        dr.kv_receiver.linker_ready_until.return_value = 2
+        dr.kv_receiver.linker_ready_until.return_value = 1  # == start: nothing
         self.process(dr)
         self.process(dr)
         self.backend.lookup.assert_not_called()
         self.backend.load.assert_not_called()
         self.assertEqual(self.cache._all_reduce_attn_groups.call_count, 2)
-        dr.kv_receiver.linker_ready_until.return_value = 3
+        # One READY page (less than the 2-page window) loads right away.
+        dr.kv_receiver.linker_ready_until.return_value = 2
         self.process(dr)
         self.backend.load.assert_called_once()
+        self.assertEqual(dr.linker_inflight_end, 8)
 
     def test_tp_peer_not_ready_prevents_load(self):
         self.cache._all_reduce_attn_groups.side_effect = (
@@ -420,20 +434,34 @@ class TestLinkerDecodeLoad(unittest.TestCase):
 
     def test_layers_finish_before_advancing_token_window(self):
         dr = self.request()
+        ready = {(0, 2): 100, (2, 3): None}  # None: not READY past start
+        dr.kv_receiver.linker_ready_until.side_effect = lambda layer, end, start: (
+            ready[(layer, end)] or start
+        )
         with envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.override(2):
+            # Only group 0 is READY: fixed window x one group.
             self.process(dr)
+            self.assertEqual(self.batches[0][1], ["r@1:0"])
             self.assertEqual(len(self.counter.futures[0]), 2)
             self.complete_batch()
             self.process(dr)
             self.assertEqual(dr.linker_loaded_len, 4)
             self.assertEqual(dr.linker_loaded_layers, 2)
+            self.assertEqual(len(self.batches), 1)
+            # Group 1 arrives: the same window, never a wider one.
+            ready[(2, 3)] = 100
+            self.process(dr)
             self.assertEqual(self.batches[1][1], ["r@1:2"])
+            self.assertEqual(dr.linker_inflight_end, 12)
             self.assertEqual(len(self.counter.futures[1]), 1)
             self.complete_batch(1)
             self.process(dr)
             self.assertEqual(dr.linker_loaded_len, 12)
             self.assertEqual(dr.linker_loaded_layers, 0)
+            # Both groups READY for the rest: one all-layer GET.
             self.assertEqual(self.batches[2][1], ["r@3:0"])
+            self.assertEqual(dr.linker_inflight_end, 24)
+            self.assertEqual(len(self.counter.futures[2]), 3)
         self.backend.lookup.assert_not_called()
         self.backend.offload.assert_not_called()
 
@@ -449,13 +477,14 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertIn("prefix transfer failed", dr.kv_receiver.kv_mgr.failure_records[7])
 
     def test_shared_counter_failure_and_normal_load_unlock(self):
-        a, b = self.request(), self.request("b", slot=1)
+        # Two 2-page ranges fit one batch (cap: the 6-page longest prefix).
+        a, b = self.request(l1=16), self.request("b", l1=16, slot=1)
         self.process(a, b)
         self.linker.pending_loads["tree"] = (7, "lock")
         self.batches[0][1].append("tree")
         self.complete_batch(success=False)
         self.assertEqual(
-            self.linker.completed_handoff_loads, {"r@1:0": False, "b@1:0": False}
+            self.linker.completed_handoff_loads, {"r@4:0": False, "b@4:0": False}
         )
         self.cache.dec_lock_ref.assert_called_once_with(7, "lock")
         self.assertFalse(self.counter.futures)
@@ -463,7 +492,7 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertTrue(a.linker_failed and b.linker_failed)
         for dr in (a, b):
             self.assertIn("OceanDisk GET failed", dr.kv_receiver.kv_mgr.failure_records[7])
-        self.assertEqual(a.linker_loaded_len, 4)
+        self.assertEqual(a.linker_loaded_len, 16)
         self.assertEqual(len(self.batches), 1)
 
     def test_bypass_clears_stale_storage_hit(self):
@@ -608,9 +637,12 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         peer.process(c)
         self.assertEqual(len(self.batches), 1)
         self.assertEqual(len(peer.batches), 0)
-        self.assertEqual(self.cache._all_reduce_attn_groups.call_args.args[0].numel(), 2)
-        self.assertEqual(peer.cache._all_reduce_attn_groups.call_args.args[0].numel(), 1)
+        # Two columns per request: all-layer end page and window due.
+        self.assertEqual(self.cache._all_reduce_attn_groups.call_args.args[0].numel(), 4)
+        self.assertEqual(peer.cache._all_reduce_attn_groups.call_args.args[0].numel(), 2)
+        self.process(a, b)  # b exceeded the batch cap and goes one round later
         self.complete_batch()
+        self.complete_batch(1)
         self.process(a, b)
         self.assertEqual((a.linker_loaded_len, b.linker_loaded_len), (8, 12))
         self.assertEqual(LinkerLoadGatedKVReceiver(a).poll(), KVPoll.Success)

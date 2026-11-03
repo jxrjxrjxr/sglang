@@ -142,6 +142,11 @@ class DecodeLinkerTransferMixin:
 
         # Only CPU bookkeeping and rank consensus run here; EXISTS is never
         # issued on decode, including while another request has GET in flight.
+        # Per request: [all-layer end page, fixed-window due]. When every layer
+        # group is READY over [start, end), one GET loads all layers of that
+        # whole range (e.g. history READY at prefill admission). Otherwise the
+        # fixed window x one layer group keeps a stable window across groups.
+        # Failure is -1 in both columns; MIN makes all three rank-consistent.
         states = []
         for dr in active:
             failed = (
@@ -150,18 +155,27 @@ class DecodeLinkerTransferMixin:
                 or dr.kv_receiver.abort_notified
                 or _check_linker_load_timeout(dr, now)
             )
-            due = False
+            full_end = due = 0
             if not failed and not dr.linker_inflight_end:
                 start = dr.linker_loaded_len // page
-                end = min(start + window, dr.linker_prefix_len // page)
+                last = dr.linker_prefix_len // page
                 layer = dr.linker_loaded_layers
-                due = (
+                ready = dr.kv_receiver.linker_ready_until
+                if layer == 0:
+                    full_end = min(
+                        [last]
+                        + [
+                            ready(g, min(g + group, num_layers), start)
+                            for g in range(0, num_layers, group)
+                        ]
+                    )
+                    full_end = full_end if full_end > start else 0
+                end = min(start + window, last)
+                due = int(
                     start < end
-                    and dr.kv_receiver.linker_ready_until(
-                        layer, min(layer + group, num_layers), start
-                    ) >= end
+                    and ready(layer, min(layer + group, num_layers), start) >= end
                 )
-            states.append(-1 if failed else int(due))
+            states.append([-1, -1] if failed else [full_end, due])
         local_states = states
         states = torch.tensor(states, dtype=torch.int, device="cpu")
         consensus_start = ucl_trace.now() if ucl_trace.ON else 0
@@ -170,15 +184,27 @@ class DecodeLinkerTransferMixin:
             ucl_trace.stat("linker.consensus", consensus_start, reqs=len(active))
             _trace_linker_decisions(active, local_states, states.tolist(), page, window)
 
-        batches = {}
-        for dr, state in zip(active, states.tolist()):
-            if state < 0:
+        # Bound one GET batch to about the longest request's prefix, the size a
+        # prefill restore already issues in a single GET. The first request of
+        # a batch always goes; later ones wait a round. The order and the
+        # consensus are identical on every rank, so the deferral is too.
+        cap = max(window, *(dr.linker_prefix_len // page for dr in active))
+        batches, batch_pages = {}, {}
+        for dr, (full_end, due) in zip(active, states.tolist()):
+            if full_end < 0 or due < 0:
                 dr.linker_failed = True
-            elif state == 1:
+            elif full_end > 0 or due == 1:
                 start = dr.linker_loaded_len // page
-                end = min(start + window, dr.linker_prefix_len // page)
-                layer = dr.linker_loaded_layers
-                layer_end = min(layer + group, num_layers)
+                if full_end > 0:
+                    end, layer, layer_end = full_end, 0, num_layers
+                else:
+                    end = min(start + window, dr.linker_prefix_len // page)
+                    layer = dr.linker_loaded_layers
+                    layer_end = min(layer + group, num_layers)
+                pages = batch_pages.get((layer, layer_end), 0)
+                if pages and pages + end - start > cap:
+                    continue
+                batch_pages[(layer, layer_end)] = pages + end - start
                 linker.build_handoff_transfers(dr.req, dr.linker_prefix_len // page)
                 indices = self.tree_cache.req_to_token_pool.req_to_token[
                     dr.req.kv.req_pool_idx, start * page : end * page
@@ -207,14 +233,20 @@ class DecodeLinkerTransferMixin:
 def _trace_linker_decisions(active, local_states, global_states, page, window):
     """Emit one event per request whenever its local/consensus decision changes.
 
-    local/global: -1 failed, 0 cannot advance, 1 next window/layer group due.
-    local=1 with global=0 means another rank is not ready yet.
+    local/merged: -1 failed, 0 cannot advance, 1 a load is due (all-layer
+    range or next window/layer group). local=1 with merged=0 means another
+    rank is not ready yet. ends: [local, merged] all-layer end page (0: none).
     """
-    for dr, local, merged in zip(active, local_states, global_states):
+    for dr, local_row, merged_row in zip(active, local_states, global_states):
+        local, merged = (
+            -1 if min(row) < 0 else int(any(row)) for row in (local_row, merged_row)
+        )
         start = dr.linker_loaded_len // page
         key = (
             local,
             merged,
+            local_row[0],
+            merged_row[0],
             dr.linker_loaded_len,
             dr.linker_loaded_layers,
             dr.linker_inflight_end,
@@ -227,6 +259,7 @@ def _trace_linker_decisions(active, local_states, global_states, page, window):
             dr.req.rid,
             local=local,
             merged=merged,
+            ends=[local_row[0], merged_row[0]],
             loaded_len=dr.linker_loaded_len,
             loaded_layers=dr.linker_loaded_layers,
             inflight=bool(dr.linker_inflight_end),
