@@ -67,6 +67,8 @@ def write_trace(directory, name, role, events, host="h1", ended=True, extra=""):
 
 RID = "r1-0-abcd"
 ROOM = 7
+GROUP_READY = "层组READY：P 层组完成被观察→notify.ready（同线程）"
+RECEIPT_READY = "receipt READY：PUT session完成→notify.ready（同线程回调）"
 
 
 def notify_run(directory, *, merged_wait=False):
@@ -168,7 +170,14 @@ def notify_run(directory, *, merged_wait=False):
         ),
         (8.5, "od.put.session_done", None, dict(session=1, ok=True), None, 3),
         (9, "uc.save.consumed", None, dict(session=1, ok=True)),
-        (9, "notify.ready", None, dict(room=ROOM, pages=[0, 32], layers=g0)),
+        (
+            9,
+            "notify.ready",
+            None,
+            dict(room=ROOM, pages=[0, 32], layers=g0, origin="group"),
+            None,
+            3,
+        ),
         (9.5, "notify.send", None, dict(room=ROOM, pages=[0, 32], layers=g0)),
         (19, "notify.send", None, dict(room=ROOM, pages=[0, 32], layers=g1)),
     ]
@@ -332,9 +341,9 @@ class TestReport(unittest.TestCase):
             self.assertEqual(put["层组最后native返回→worker观察完成"], [1.0])
             self.assertEqual(put["session开始→worker观察完成"], [8.0])
             self.assertEqual(put["session完成→scheduler回收"], [0.5])
-            delays, group_to_ready, ambiguous, unmatched = tool.notify_section(run)
+            delays, ready, ambiguous, unmatched = tool.notify_section(run)
             self.assertEqual(delays, [0.5, 1.0])
-            self.assertEqual(group_to_ready, [1.0])
+            self.assertEqual(ready[GROUP_READY], [1.0])
             self.assertEqual((ambiguous, unmatched), (0, 0))
             self.assertEqual(states[RID]["outcome"], "released")
             self.assertEqual(states[RID]["open_ms"], 0)
@@ -519,6 +528,142 @@ class TestReport(unittest.TestCase):
             self.assertTrue(run.cross_host)
             self.assertEqual(tool.notify_section(run)[0], [])
             self.assertIn("跨机未校准", tool.build_report(run)[0])
+
+    def test_get_batches_pair_within_reset_generation(self):
+        def batch(t0, n):
+            return [
+                (t0, "od.get.enqueue", None, dict(batch=n, tags=[], pages=[1])),
+                (t0 + 1, "od.get.dequeue", None, dict(batch=n), None, 2),
+                (t0 + 2, "od.get.done", None, dict(batch=n, ok=True), None, 2),
+                (t0 + 3, "uc.load.consumed", "x", dict(batch=n, ok=True)),
+            ]
+
+        for marker in ([(50, "od.reset", None, {})], []):  # explicit / fallback
+            with tempfile.TemporaryDirectory() as tmp:
+                events = batch(0, 0) + batch(10, 1) + marker + batch(100, 0)
+                write_trace(tmp, "decode", "decode", events)
+                run = tool.Run(tmp)
+                get = tool.storage_section(run)[0]
+                self.assertEqual(get["入队→worker取出"], [1.0, 1.0, 1.0])
+                self.assertEqual(get["入队→worker观察完成"], [2.0, 2.0, 2.0])
+                self.assertEqual(get["worker观察完成→scheduler消费"], [1.0] * 3)
+                self.assertEqual(tool.completeness(run)[2], [])
+
+    def test_ready_origins_and_receipt_latency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rng = dict(room=1, pages=[0, 8], layers=[0, 61])
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (1, "od.put.session_done", None, dict(session=1, receipt=11), None, 3),
+                    (2, "notify.ready", None, dict(rng, origin="receipt", receipt=11), None, 3),
+                    # Registered after completion: fires in the scheduler thread.
+                    (9, "notify.ready", None, dict(rng, origin="receipt", receipt=11)),
+                    (10, "notify.ready", None, dict(rng, origin="exists")),
+                    (11, "od.put.group_done", None, dict(layer_start=0, layer_end=50)),
+                    (12, "notify.ready", None, dict(rng, layers=[50, 61])),
+                ],
+            )
+            ready = tool.notify_section(tool.Run(tmp))[1]
+            self.assertEqual(ready[RECEIPT_READY], [1.0])
+            self.assertEqual(ready[GROUP_READY], [])
+            self.assertEqual(ready["receipt READY（注册时已完成，不计延迟）"], 1)
+            self.assertEqual(ready["存储查询命中即发 READY"], 1)
+            self.assertEqual(ready["来源未知 READY（旧 trace，不计延迟）"], 1)
+
+    def test_client_joins_server_by_sse_id_and_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trace(
+                tmp,
+                "client",
+                "client",
+                [
+                    (10, "client.send", "r1-0-x", dict(tag="r1-0", sent_rid=True)),
+                    (20, "client.sse", "r1-0-x", dict(content=True, id="chatcmpl-srv")),
+                    (30, "client.end", "r1-0-x", dict(ok=True)),
+                ],
+            )
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (1, "sched.recv_requests", None, {}, 9),  # warm-up, outside
+                    (11, "req.arrive", "srv", dict(room=1)),
+                    (12, "sched.run_batch", None, dict(mode="EXTEND", rids=["srv"]), 5),
+                ],
+            )
+            run = tool.Run(tmp)
+            rows, _, _, _, server_round, via_sse = tool.client_section(run)
+            self.assertEqual(rows[0][-1], "1/1")
+            self.assertEqual((server_round, via_sse), ({"srv": "r1"}, 1))
+            text = tool.build_report(run)[0]
+            self.assertIn("按 SSE 帧的 id（服务端 rid）关联", text)
+            section6, section9 = text.split("## 9.")[0], text.split("## 9.")[1]
+            self.assertNotIn("sched.recv_requests", section6.split("## 6.")[1])
+            self.assertIn("sched.recv_requests", section9)
+            self.assertIn("| r1 | P排队 | 1 | 1.00 |", text)
+
+    def test_prefill_supply_and_exists_ratio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (0, "req.arrive", "a", dict(room=1)),
+                    (1, "req.arrive", "b", dict(room=2)),
+                    (2, "od.put.enqueue", None, dict(session=1, layer=0)),
+                    (2, "sched.run_batch", None, dict(mode="EXTEND", rids=["a"]), 10),
+                    (13, "od.exists", None, dict(keys=4), 2),
+                    (15, "od.exists", None, dict(keys=4), 1),
+                    (17, "sched.run_batch", None, dict(mode="EXTEND", rids=["b"]), 10),
+                    (30, "notify.rdma_done", None, dict(room=2)),
+                ],
+            )
+            p = tool.prefill_section(tool.Run(tmp), {})
+            b = p["per_round"]["全部"]
+            self.assertEqual(sorted(b["P排队"]), [2.0, 16.0])
+            self.assertEqual(b["P执行跨度"], [10.0, 10.0])
+            self.assertEqual(b["末次EXTEND结束→RDMA完成"], [3.0])
+            self.assertEqual(p["gaps"]["有请求在等"], [5.0])
+            self.assertEqual(p["gap_exists"]["有请求在等"], [3.0])
+            self.assertEqual((p["exists_count"], p["admitted"]), (2, 2))
+
+    def test_decode_intervals_split_by_explicit_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dec = lambda t, rids: (  # noqa: E731
+                t,
+                "sched.run_batch",
+                None,
+                dict(mode="DECODE", rids=rids),
+                1,
+            )
+            write_trace(
+                tmp,
+                "d",
+                "decode",
+                [
+                    dec(0, ["a"]),
+                    (5, "od.get.enqueue", None, dict(batch=0, tags=[], pages=[1])),
+                    (8, "od.get.done", None, dict(batch=0, ok=True), None, 2),
+                    dec(30, ["a"]),  # GET overlapped
+                    (40, "linker.consensus", None, {}, 3),
+                    dec(60, ["a", "b"]),  # slow consensus, new request
+                    (70, "sched.run_batch", None, dict(mode="IDLE"), 1),
+                    dec(500, ["a"]),  # idle in between
+                    dec(530, ["c"]),  # no shared rid: undecidable, kept
+                ],
+            )
+            kinds, groups = tool.decode_step_section(tool.Run(tmp))
+            self.assertEqual(kinds["持续decode"], [30.0, 30.0])
+            self.assertEqual(kinds["含空闲"], [440.0])
+            self.assertEqual(kinds["无法判定"], [30.0])
+            self.assertEqual(groups["GET在途"], [30.0])
+            self.assertEqual(groups["有≥2ms consensus"], [30.0])
+            self.assertEqual(groups["有新请求加入"], [30.0])
 
 
 if __name__ == "__main__":
