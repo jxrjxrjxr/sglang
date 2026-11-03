@@ -466,6 +466,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
+        if not self.offload_owner:
+            # Non-owners share the owner's namespace (replicated caches); the
+            # caller's MIN intersection across ranks yields the owner's prefix.
+            # Skipping avoids a redundant native EXISTS and its device sync.
+            return list(range(1, len(kv.keys) + 1))
         keys = [self._object_key(key) for key in kv.keys]
         debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
         perf_trace = (

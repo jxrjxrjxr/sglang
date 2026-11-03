@@ -1114,6 +1114,14 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             [linker._object_key(key) for key in ("p0", "p1", "p2")]
         )
 
+    def test_non_owner_lookup_defers_to_owner_without_exists(self):
+        linker = self.make_linker()
+        linker.offload_owner = False
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2"])]
+        # Every length is a candidate; the cross-rank MIN keeps the owner's.
+        self.assertEqual(linker.lookup("req", transfers), [1, 2, 3])
+        linker.storage.exists_many.assert_not_called()
+
     def test_lookup_uses_remote_prefix_even_with_pending_local_save(self):
         linker = self.make_linker()
         linker._layerwise_pending_keys.add(linker._object_key("p1"))
