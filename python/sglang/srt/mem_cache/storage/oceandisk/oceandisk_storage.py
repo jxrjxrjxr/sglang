@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.oceandisk.connection_router import ConnectionRouter
+from sglang.srt.observability import ucl_trace
 
 if TYPE_CHECKING:
     import torch
@@ -338,13 +339,26 @@ class OceanDiskStorage(HiCacheStorage):
         # Scheduler layer waits finish GET before the next lookup. Only
         # background PUT needs exclusion against synchronous EXISTS.
         io_lock = self._put_io_lock if stream is self._put_stream else nullcontext()
+        entered = ucl_trace.now() if ucl_trace.ON else 0
         with (
             io_lock,
             self._torch.cuda.device(self.device),
             self._torch.cuda.stream(stream),
         ):
             self._ensure_open()
-            return operation()
+            if not ucl_trace.ON:
+                return operation()
+            # Span covers the native call only; lock/context entry is "wait".
+            start = ucl_trace.now()
+            try:
+                return operation()
+            finally:
+                ucl_trace.span(
+                    "od.native",
+                    start,
+                    op="put" if stream is self._put_stream else "get",
+                    wait_us=(start - entered) // 1000,
+                )
 
     @staticmethod
     def _check_status(status, operation: str) -> None:
@@ -352,6 +366,15 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
+        if ucl_trace.ON:
+            start = ucl_trace.now()
+            try:
+                return self._exists_many_locked(keys, timings=timings)
+            finally:
+                ucl_trace.span("od.exists", start, keys=len(keys))
+        return self._exists_many_locked(keys, timings=timings)
+
+    def _exists_many_locked(self, keys: list[int], *, timings=None) -> list[bool]:
         # Exclude new PUT submissions until the synchronous query returns.
         with self._torch.cuda.device(self.device):
             started = time.perf_counter() if timings is not None else 0.0
@@ -627,6 +650,8 @@ class OceanDiskStorage(HiCacheStorage):
                     step = time.perf_counter()
                     for _, _, events in submitted:
                         events[layer].synchronize()
+                    if ucl_trace.ON:
+                        ucl_trace.emit("od.get.layer_ready", layer=layer)
                     layer_wait_ms = (time.perf_counter() - step) * 1000
                     event_wait_ms += layer_wait_ms
                     if layer in (0, len(layers) - 1):
@@ -791,6 +816,8 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             # Wait before taking the PUT lock; do not hold up EXISTS for compute.
             ready_event.synchronize()
+            if ucl_trace.ON:
+                ucl_trace.emit("od.put.dep_ready", layer=layer)
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
                 self._run_io(

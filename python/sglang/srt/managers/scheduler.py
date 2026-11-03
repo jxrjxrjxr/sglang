@@ -291,6 +291,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability import ucl_trace
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -3191,6 +3192,14 @@ class Scheduler(
         return True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "req.arrive",
+                req.rid,
+                room=req.bootstrap_room,
+                input_len=len(req.origin_input_ids),
+                retracted=is_retracted,
+            )
         if not self._set_or_validate_priority(req):
             return
         if is_retracted:
@@ -5834,6 +5843,10 @@ def run_scheduler_process(
         elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
+    if ucl_trace.ON:
+        ucl_trace.set_identity(
+            get_disagg().disaggregation_mode, tp_rank=tp_rank, dp_rank=dp_rank
+        )
 
     # Create a scheduler and run the event loop
     scheduler = None

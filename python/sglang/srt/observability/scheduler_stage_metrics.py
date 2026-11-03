@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import TypeVar, cast
 
+from sglang.srt.observability import ucl_trace
 from sglang.srt.utils.nvtx_utils import (
     NVTX_SCHEDULER_ENABLED,
     profile_range,
@@ -142,6 +143,15 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
 
         @wraps(func)
         def wrapper(self, *args, **kwargs):
+            if ucl_trace.ON:
+                start = ucl_trace.now()
+                try:
+                    return run(self, *args, **kwargs)
+                finally:
+                    _ucl_trace_stage(stage, start, args)
+            return run(self, *args, **kwargs)
+
+        def run(self, *args, **kwargs):
             recorder = self.scheduler_stage_metrics
             if recorder is None:
                 return profiled_func(self, *args, **kwargs)
@@ -161,3 +171,24 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
         return cast(_F, wrapper)
 
     return decorator
+
+
+def _ucl_trace_stage(stage: str, start: int, args: tuple) -> None:
+    """Executed batches become spans; other stages are aggregated."""
+    if stage == SCHEDULER_STAGE_RUN_BATCH and args:
+        batch = args[0]
+        mode = getattr(getattr(batch, "forward_mode", None), "name", None)
+        reqs = getattr(batch, "reqs", None) or ()
+        fields = dict(mode=mode, bs=len(reqs))
+        tokens = getattr(batch, "extend_num_tokens", None)
+        if tokens:
+            fields["tokens"] = tokens
+        if mode not in ("DECODE", "IDLE"):
+            fields["rids"] = [req.rid for req in reqs]
+        ucl_trace.span("sched.run_batch", start, **fields)
+    else:
+        ucl_trace.stat(
+            f"sched.{stage}",
+            start,
+            slow_ns=None if stage == SCHEDULER_STAGE_IDLE else ucl_trace.SLOW_NS,
+        )

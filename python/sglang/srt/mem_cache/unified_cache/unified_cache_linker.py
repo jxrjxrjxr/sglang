@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.observability import ucl_trace
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -438,6 +439,14 @@ class UnifiedCacheLinkerWrapper:
             return None
         plan_done = time.perf_counter()
         session = self.cache_linker.begin_layerwise_save(transfers, phase=phase)
+        if ucl_trace.ON and session is not None:
+            ucl_trace.emit(
+                "uc.save.begin",
+                session=id(session),
+                phase=phase,
+                rids=[req.rid for req, _ in completed],
+                pages=[len(transfer.keys) for transfer in transfers],
+            )
         self._bind_handoff_saves(transfers, completed, session)
         for transfer, (req, _) in zip(transfers, completed, strict=True):
             receipts = getattr(req, "_uc_layerwise_receipts", None)
@@ -508,7 +517,10 @@ class UnifiedCacheLinkerWrapper:
 
     def commit_completed_layerwise_saves(self, successes):
         for success in successes:
-            self.pending_layerwise_saves.pop(0).finish(success)
+            session = self.pending_layerwise_saves.pop(0)
+            if ucl_trace.ON:
+                ucl_trace.emit("uc.save.consumed", session=id(session), ok=success)
+            session.finish(success)
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -985,6 +997,10 @@ class UnifiedCacheLinkerWrapper:
                         for future in futures
                     )
                 self.completed_handoff_loads[rid] = results[index]
+                if ucl_trace.ON:
+                    ucl_trace.emit(
+                        "uc.load.consumed", rid, batch=index, ok=results[index]
+                    )
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)

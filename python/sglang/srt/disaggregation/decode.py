@@ -100,6 +100,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.observability import ucl_trace
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -1603,6 +1604,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 **metadata_kwargs,
             )
+            if ucl_trace.ON:
+                ucl_trace.emit(
+                    "pd.prealloc",
+                    decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                    local_prefix=len(decode_req.req.prefix_indices),
+                    decode_prefix_len=metadata_kwargs["decode_prefix_len"],
+                )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
@@ -2464,6 +2473,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin, DecodeLinkerTransferMixin)
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                if ucl_trace.ON:
+                    ucl_trace.emit(
+                        "pd.transferred",
+                        decode_req.req.rid,
+                        room=decode_req.req.bootstrap_room,
+                    )
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(

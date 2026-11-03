@@ -14,6 +14,7 @@ from weakref import WeakValueDictionary
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
+from sglang.srt.observability import ucl_trace
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
@@ -76,6 +77,8 @@ class LayerwiseSaveSession:
             event = self.linker._ready_event()
             self.ready_events.append(event)
             self.linker.offload_queue.put((self, layer, event))
+            if ucl_trace.ON:
+                ucl_trace.emit("od.put.enqueue", session=id(self), layer=layer)
             self.hook_cpu_ms += (time.perf_counter() - hook_start) * 1000
         self.next_layer += 1
 
@@ -554,6 +557,14 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         index = self.layer_done_counter.update_producer(count)
         pending, self.pending_loads = self.pending_loads, {}
         self.load_queue.put((index, pending, event, layer_range))
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "od.get.enqueue",
+                batch=index,
+                tags=list(pending),
+                pages=[len(transfers[0].keys) for transfers in pending.values()],
+                layers=list(layer_range or (0, self.num_layers)),
+            )
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
@@ -726,8 +737,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     if task is None:
                         return
                     index, pending, event, layer_range = task
+                    if ucl_trace.ON:
+                        ucl_trace.emit("od.get.dequeue", batch=index)
                     try:
                         event.synchronize()
+                        if ucl_trace.ON:
+                            ucl_trace.emit("od.get.dep_ready", batch=index)
                         self._run_transfers(
                             [t for transfers in pending.values() for t in transfers],
                             write=False,
@@ -735,9 +750,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                             layer_range=layer_range,
                         )
                         trace_event("LOAD_DONE", counter=index, rids=list(pending))
+                        if ucl_trace.ON:
+                            ucl_trace.emit("od.get.done", batch=index, ok=True)
                     except BaseException as error:
                         self.layer_done_counter.fail(index, error)
                         logger.exception("OceanDisk load batch failed")
+                        if ucl_trace.ON:
+                            ucl_trace.emit("od.get.done", batch=index, ok=False)
                     finally:
                         self.completed_loads.put(list(pending))
                 finally:
@@ -822,6 +841,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         except BaseException:
                             logger.exception("OceanDisk layerwise offload failed")
                         finally:
+                            if ucl_trace.ON:
+                                ucl_trace.emit(
+                                    "od.put.session_done",
+                                    session=id(task),
+                                    pages=len(task.keys),
+                                    ok=success,
+                                )
                             if self.offload_owner:
                                 cache_debug(
                                     "PUT_RESULT",
@@ -837,6 +863,10 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         continue
                     if len(task) == 3:
                         session, layer, ready_event = task
+                        if ucl_trace.ON:
+                            ucl_trace.emit(
+                                "od.put.dequeue", session=id(session), layer=layer
+                            )
                         if not session.put_failed:
                             try:
                                 calls = self.storage.submit_put_layer(
@@ -853,6 +883,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                     event = self.storage.record_save_event()
                                     event.synchronize()
                                     start = layer // group * group
+                                    if ucl_trace.ON:
+                                        ucl_trace.emit(
+                                            "od.put.group_done",
+                                            session=id(session),
+                                            layer_start=start,
+                                            layer_end=layer + 1,
+                                        )
                                     trace_event(
                                         "PUT_DONE",
                                         task=id(session),
