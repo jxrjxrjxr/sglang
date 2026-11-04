@@ -179,7 +179,17 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
 
 def _ucl_trace_stage(stage: str, start: int, args: tuple) -> None:
     """Executed batches become spans; other stages are aggregated."""
-    if stage == SCHEDULER_STAGE_RUN_BATCH and args:
+    if stage == SCHEDULER_STAGE_PROCESS_BATCH_RESULT and args:
+        # Overlap processes the previous batch here, so name it on slow calls.
+        batch = args[0]
+        ucl_trace.stat(
+            f"sched.{stage}",
+            start,
+            mode=getattr(getattr(batch, "forward_mode", None), "name", None),
+            forward_iter=getattr(batch, "forward_iter", None),
+            rids=[req.rid for req in getattr(batch, "reqs", None) or ()],
+        )
+    elif stage == SCHEDULER_STAGE_RUN_BATCH and args:
         batch = args[0]
         mode = getattr(getattr(batch, "forward_mode", None), "name", None)
         reqs = getattr(batch, "reqs", None) or ()

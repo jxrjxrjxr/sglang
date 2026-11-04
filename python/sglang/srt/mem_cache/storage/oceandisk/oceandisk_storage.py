@@ -359,10 +359,18 @@ class OceanDiskStorage(HiCacheStorage):
 
         def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
             start = ucl_trace.now()
+            parts = {} if timings is None else timings
             try:
-                return self._exists_many_untraced(keys, timings=timings)
+                return self._exists_many_untraced(keys, timings=parts)
             finally:
-                ucl_trace.span("od.exists", start, keys=len(keys))
+                ucl_trace.span(
+                    "od.exists",
+                    start,
+                    keys=len(keys),
+                    put_lock_ms=parts.get("put_lock_ms"),
+                    put_sync_ms=parts.get("put_sync_ms"),
+                    native_ms=parts.get("exists_native_ms"),
+                )
 
     def _exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.

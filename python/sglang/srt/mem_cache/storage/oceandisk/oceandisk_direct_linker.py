@@ -715,9 +715,17 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
     ) -> None:
         # Descriptors retain the original layer storage offsets. The native
         # dispatch and counter index only the selected rows, starting at zero.
-        layers = self._transfer_layers(transfers, layer_range=layer_range)
+        timings = {}
+        layers = self._transfer_layers(
+            transfers, layer_range=layer_range, timings=timings
+        )
         if ucl_trace.ON and not write:
-            ucl_trace.emit("od.get.ranges", batch=counter_index)
+            ucl_trace.emit(
+                "od.get.ranges",
+                batch=counter_index,
+                ranges=layers.shape[1],
+                copy_ms=timings["address_copy"],
+            )
         if write:
             if layers.size:
                 self.storage.put_layers(layers)

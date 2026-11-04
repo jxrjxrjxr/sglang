@@ -471,7 +471,10 @@ class TestLinkerNotifyIO(unittest.TestCase):
             linker._run_transfers(
                 [], write=False, counter_index=index, layer_range=(2, 4)
             )
-        linker._transfer_layers.assert_called_once_with([], layer_range=(2, 4))
+        linker._transfer_layers.assert_called_once()
+        self.assertEqual(
+            linker._transfer_layers.call_args.kwargs["layer_range"], (2, 4)
+        )
         self.assertIs(linker.storage.get_layers.call_args.args[0], selected)
         self.assertTrue(
             all(
