@@ -916,6 +916,10 @@ class SchedulerBatchResultProcessor:
         start = ucl_trace.now()
         result.copy_done.synchronize()
         ucl_trace.stat("sched.copy_done", start, mode=batch.forward_mode.name)
+        if result.ucl_gpu_marks is not None:
+            ucl_trace.gpu_span(
+                "gpu.forward", *result.ucl_gpu_marks, mode=batch.forward_mode.name
+            )
 
     def process_batch_result_idle(
         self,

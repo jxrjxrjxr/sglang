@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -271,6 +272,37 @@ class TestRecorder(unittest.TestCase):
             self.assertIn("UCL trace disabled", err.getvalue())
             module.emit("after.disable")  # no-op
             self.assertEqual(len(module._events), 0)
+
+    def test_gpu_span_maps_device_time_onto_the_trace_clock(self):
+        class Event:
+            def __init__(self, at):
+                self.at = at
+
+            def synchronize(self):
+                pass
+
+            def elapsed_time(self, end):
+                return end.at - self.at
+
+        fake = SimpleNamespace(cuda=SimpleNamespace(Stream=lambda: None, Event=None))
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load(
+                RECORDER,
+                "ucl_gpu",
+                {
+                    "SGLANG_UCL_TRACE": "1",
+                    "SGLANG_UCL_TRACE_DIR": tmp,
+                    "SGLANG_UCL_TRACE_GPU": "1",
+                },
+            )
+            self.assertTrue(module.GPU)
+            records = []
+            module.gpu_mark = lambda stream: Event(100.0)
+            module.now = lambda: 5_000_000
+            module._push = records.append
+            with patch.dict("sys.modules", {"torch": fake}):
+                module.gpu_span("gpu.get", Event(102.0), Event(110.0), pages=1)
+            self.assertEqual(records[0][:3], (7_000_000, 8_000_000, "gpu.get"))
 
     def test_no_file_without_events(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -931,6 +963,90 @@ class TestReport(unittest.TestCase):
             spike = tool.decode_spike_section(run, steps)[0]
             self.assertEqual(spike["cells"][("本进程GET", "等完成")], 80)
             self.assertEqual(spike["cells"][("本进程GET", "排队·截尾")], 80)
+
+    def test_spike_shows_gpu_time_and_keeps_p_get_out_of_the_ranking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dec = lambda t: (  # noqa: E731
+                t,
+                "sched.run_batch",
+                None,
+                dict(mode="DECODE", rids=["a"]),
+                1,
+            )
+            write_trace(
+                tmp,
+                "scheduler_DP0_TP0",
+                "decode",
+                [
+                    dec(0),
+                    dec(700),
+                    (0, "gpu.forward", None, dict(mode="DECODE"), 25),
+                    (10, "gpu.get", None, None, 600),
+                ],
+            )
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (0, "od.get.dequeue", None, dict(batch=0), None, 2),
+                    (1, "od.get.dep_ready", None, dict(batch=0), None, 2),
+                    (2, "od.native", None, dict(op="get"), 1, 2),
+                    (700, "od.get.done", None, dict(batch=0, ok=True), None, 2),
+                ],
+            )
+            run = tool.Run(tmp)
+            spike = tool.decode_spike_section(run, tool.decode_step_section(run)[2])[0]
+            self.assertEqual(spike["top"], "无")
+            self.assertEqual(spike["cells"][("GPU forward", "")], 25)
+            self.assertEqual(spike["cells"][("GPU GET", "本进程")], 600)
+            self.assertEqual(spike["cells"][("P", "等完成")], 697)
+
+    def test_decode_groups_split_p_get_when_d_has_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dec = lambda t: (  # noqa: E731
+                t,
+                "sched.run_batch",
+                None,
+                dict(mode="DECODE", rids=["a"]),
+                1,
+            )
+            write_trace(tmp, "d", "decode", [dec(0), dec(25), dec(50)])
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (0, "od.get.enqueue", None, dict(batch=0, tags=[], pages=[1])),
+                    (20, "od.get.done", None, dict(batch=0, ok=True)),
+                ],
+            )
+            run = tool.Run(tmp)
+            groups = tool.decode_step_section(run)[1]
+            self.assertEqual(groups["D无GET·P有GET在途"], [25])
+            self.assertEqual(groups["D无GET·P无GET"], [25])
+
+    def test_room_zero_is_not_a_shared_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (0, "req.arrive", "HEALTH_CHECK_a", dict(room=0)),
+                    (1, "req.arrive", "HEALTH_CHECK_b", dict(room=0)),
+                    (
+                        2,
+                        "sched.run_batch",
+                        None,
+                        dict(mode="EXTEND", rids=["HEALTH_CHECK_a"]),
+                        5,
+                    ),
+                ],
+            )
+            p = tool.prefill_section(tool.Run(tmp), {"client": "r1"})
+            self.assertFalse(p["conflicts"])
+            self.assertEqual([u["rid"] for u in p["unmatched"]], ["HEALTH_CHECK_a"])
 
     def test_get_spans_mark_missing_boundaries_unknown(self):
         batch = dict(src=0, queue=0, wait=1, end=9)

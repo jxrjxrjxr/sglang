@@ -96,7 +96,9 @@ class TestOceanDiskStorage(CustomTestCase):
         query_stream = Mock()
         storage = OceanDiskStorage.__new__(OceanDiskStorage)
         storage._torch = SimpleNamespace(
-            tensor=lambda values, **kwargs: values,
+            tensor=lambda values, **kwargs: SimpleNamespace(
+                to=lambda device: values
+            ),
             int64="int64",
             cuda=SimpleNamespace(
                 device=lambda device: nullcontext(),

@@ -13,7 +13,12 @@ control flow; if the directory cannot be written the recorder turns itself
 off. Timestamps are ``time.perf_counter_ns()``; on Linux this is
 CLOCK_MONOTONIC and therefore comparable across processes on one host only.
 
-This module is stdlib-only so the benchmark client can load it by path.
+``SGLANG_UCL_TRACE_GPU=1`` adds timing events on the GPU streams, the one
+exception to "never touches CUDA": they show when work really ran on the
+device, and they sit in the stream, so keep it off for overhead comparisons.
+
+This module is stdlib-only so the benchmark client can load it by path; torch
+is imported only by the GPU functions.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from collections import deque
 _LEVEL = os.environ.get("SGLANG_UCL_TRACE", "0").strip()
 _DIR = os.environ.get("SGLANG_UCL_TRACE_DIR", "").strip()
 ON = _LEVEL not in ("", "0") and bool(_DIR)
+GPU = ON and os.environ.get("SGLANG_UCL_TRACE_GPU", "0").strip() not in ("", "0")
 
 FORMAT_VERSION = 1
 FLUSH_INTERVAL_S = float(os.environ.get("SGLANG_UCL_TRACE_FLUSH_S", "1.0"))
@@ -47,6 +53,7 @@ _file = None
 _identity = None
 _closed = True  # until _start()
 _init_lock = threading.Lock()
+_gpu_anchor = None
 
 
 def emit(name, rid=None, **fields):
@@ -75,6 +82,36 @@ def stat(name, start_ns, slow_ns=SLOW_NS, **fields):
                 entry[2] = duration
     if slow_ns is not None and duration >= slow_ns:
         _push((start_ns, duration, name, None, threading.get_ident(), fields or None))
+
+
+def gpu_mark(stream):
+    """A timing event that fires when ``stream`` reaches this point."""
+    import torch
+
+    event = torch.cuda.Event(enable_timing=True)
+    event.record(stream)
+    return event
+
+
+def gpu_span(name, start, end, **fields):
+    """Record the device interval between two finished marks on this clock.
+    One anchor per process maps GPU event time onto ``now()``."""
+    global _gpu_anchor
+    import torch
+
+    try:
+        with _init_lock:
+            if _gpu_anchor is None:
+                anchor = gpu_mark(torch.cuda.Stream())
+                anchor.synchronize()
+                _gpu_anchor = (anchor, now())
+        anchor, anchor_ns = _gpu_anchor
+        start_ns = anchor_ns + int(anchor.elapsed_time(start) * 1e6)
+        duration = int(start.elapsed_time(end) * 1e6)
+    except Exception as error:  # a diagnostic must not fail a forward or GET
+        emit("gpu.error", name=name, error=repr(error)[:200])
+        return
+    _push((start_ns, duration, name, None, threading.get_ident(), fields or None))
 
 
 def set_identity(role, label=None, **fields):

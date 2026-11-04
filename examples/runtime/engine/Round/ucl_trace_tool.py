@@ -119,8 +119,9 @@ class Run:
         self.rid_room = {}
         for e in self.events:
             room = (e.get("f") or {}).get("room")
+            # Room 0 means no handoff (health checks), not a shared identity.
             if (
-                room is not None
+                room
                 and e.get("r")
                 and e["n"]
                 in (
@@ -902,6 +903,8 @@ def prefill_section(run, server_round):
         for field, label in (
             ("put_lock_ms", "等PUT锁"),
             ("put_sync_ms", "等PUT流同步"),
+            ("route_ms", "路由与建metadata"),
+            ("upload_ms", "metadata上传（含等当前流）"),
             ("native_ms", "native查询"),
         ):
             if f_(e, field) is not None:
@@ -941,9 +944,13 @@ def decode_step_section(run, full=None):
             by_src[e["src"]].append(e)
         elif n == "linker.consensus" and "d" in e:
             consensus[e["src"]].append(e["w"])
+    prefill_gets = []
     for batch in get_phases(full or run):
+        span = (batch["queue"], batch.get("end", float("inf")))
         if run.files[batch["src"]].role == "decode":
-            gets[batch["src"]].append((batch["queue"], batch.get("end", float("inf"))))
+            gets[batch["src"]].append(span)
+        else:
+            prefill_gets.append(span)
     kinds = defaultdict(list)
     groups = defaultdict(list)
     steps = []
@@ -969,6 +976,11 @@ def decode_step_section(run, full=None):
                         if peer != src
                         for s, t in spans
                     )
+                    if not get and not other:
+                        busy = any(s < hi and t > lo for s, t in prefill_gets)
+                        groups["D无GET·P有GET在途" if busy else "D无GET·P无GET"].append(
+                            interval
+                        )
                     slow = any(lo <= w < hi for w in consensus[src])
                     groups["本进程GET在途" if get else "本进程无GET在途"].append(
                         interval
@@ -1002,7 +1014,14 @@ def covered(spans, lo, hi):
     return total
 
 
-SPIKE_UNRANKED = ("copy_done", "其他copy_done", "P保存session")
+SPIKE_UNRANKED = (
+    "copy_done",
+    "其他copy_done",
+    "P",
+    "P保存session",
+    "GPU forward",
+    "GPU GET",
+)
 
 
 def decode_spike_section(run, steps, top=20):
@@ -1014,8 +1033,11 @@ def decode_spike_section(run, steps, top=20):
     coverage. Only the representative rank's DECODE wait is copy_done; waits
     elsewhere are listed apart, and release/output/evict are limited to the
     spike's ranks. A P save session is a lifetime spanning forward and queues,
-    not PUT execution. Overlap is correlation only, so ``top`` is the largest
-    overlapping activity and not a cause."""
+    not PUT execution. P GETs are shown but not ranked, so they cannot hide a D
+    GET. With SGLANG_UCL_TRACE_GPU the GPU columns show device time: forward
+    coverage near the interval means a forward was running through the stall;
+    near one frame means it had not started. Overlap is correlation only, so
+    ``top`` is the largest overlapping D activity and not a cause."""
     if run.cross_host or not steps:
         return None
     spikes = []
@@ -1035,6 +1057,8 @@ def decode_spike_section(run, steps, top=20):
         "sched.finish_release": "释放",
         "sched.stream_output": "输出",
         "pd.evict": "驱逐",
+        "gpu.forward": "GPU forward",
+        "gpu.get": "GPU GET",
     }
     sessions = {}
     for e in run.events:
@@ -1062,6 +1086,8 @@ def decode_spike_section(run, steps, top=20):
             return "其他copy_done", scope + label
         if column == "P保存session":
             return column, label
+        if column == "GPU GET":
+            return column, "本进程" if src == spike["src"] else "其他D"
         if column is not None:
             return (column, label) if src in spike["ranks"] else None
         if run.files[src].role != "decode":
@@ -1536,7 +1562,9 @@ def build_report(run):
             "copy_done 只算“进程”列这个代表进程的 DECODE 等待，包含等待 forward 及其依赖；"
             "其他 rank 或 IDLE 的等待列在“其他copy_done”；释放、输出、驱逐只看参与尖峰的 rank。"
             "P保存session 是 uc.save.begin→session 完成的存续时间，含 forward 和排队，不是 PUT 执行。"
-            "这三列不参与最大重叠活动的排名。"
+            "P、P保存session、两个 copy_done 列和两个 GPU 列不参与最大重叠活动的排名。"
+            "GPU 列需要 SGLANG_UCL_TRACE_GPU=1：GPU forward 接近间隔表示 forward 在 GPU 上跑满了停顿，"
+            "接近一帧表示停顿期间 forward 尚未开始；GPU GET 是 GET 在其 GPU 流上的时间。"
             "构建含打包和元数据上传；提交是 native 调用；等完成是调用返回后 I/O 仍在途的时间；"
             "“·截尾”表示采集结束时仍未完成，“未知”表示中间事件缺失。",
             "",
@@ -1565,6 +1593,8 @@ def build_report(run):
                     "其他组GET",
                     "P",
                     "P保存session",
+                    "GPU forward",
+                    "GPU GET",
                     "copy_done",
                     "其他copy_done",
                     "释放",
@@ -1585,6 +1615,8 @@ def build_report(run):
                                 "其他组GET",
                                 "P",
                                 "P保存session",
+                                "GPU forward",
+                                "GPU GET",
                                 "copy_done",
                                 "其他copy_done",
                                 "释放",

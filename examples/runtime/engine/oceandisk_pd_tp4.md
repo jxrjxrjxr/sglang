@@ -280,6 +280,8 @@ export OD_STORAGE_CONFIG="{\"namespace\":\"${OD_NAMESPACE}\",\"layerwise_save\":
 
 恢复全部连接用 `unset OD_STORAGE_CONFIG`。跨机 `[0]` 必须对应同一个逻辑 DPU。override JSON 会整体替代默认配置，改 namespace 后要重新生成它。tail 对照在两端都设 `SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS=0`；其他对照固定 8192，不随 chunk 改动。
 
+D 单次 GET 默认最多 256 页（`SGLANG_DISAGGREGATION_LINKER_LOAD_PAGES`），大范围分片读回，片间让 forward 推进；设为 0 恢复一次读完，用于 A/B。
+
 默认旧超时均为 600，watchdog3600。长队列实验在两端启动前覆盖：
 
 ```bash
@@ -394,6 +396,8 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
    python3 ucl_trace_tool.py report  "$SGLANG_UCL_TRACE_DIR"
    python3 ucl_trace_tool.py compare 目录A 目录B
    ```
+
+   短时抓 GPU 时间线时，在 P、D 启动前另设 `SGLANG_UCL_TRACE_GPU=1`，报告第 8.1 节会多出 GPU forward 和 GPU GET 两列。这些事件进入 GPU 流，做开销对照时保持关闭。
 
    `trace.json` 用 Chrome 的 `chrome://tracing` 或 Perfetto 打开：每个进程一组原始线程轨道；另有“请求并行轨道”，每个请求一组泳道（客户端、P 调度、P PUT、P READY、D READY、D 状态、D 提示、D load、D 传输/放行、D 调度），按 rid、room、load tag、GET batch 和 PUT session 关联，可以直接对比并发请求的进度；“D 调度”含该请求参与的每个 decode batch，可与客户端帧间隔对照；卡住的 load／GET batch 画到最后一次刷盘并标“进行中”。
 

@@ -12,6 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import nullcontext
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -112,6 +113,8 @@ def read_connection_count(path: Path) -> int:
     return count
 
 
+# One page is encoded by every lookup and transfer of a request.
+@lru_cache(maxsize=1 << 18)
 def encode_key(identity: tuple) -> int:
     """Encode an object identity as a positive int64."""
     data = json.dumps(identity, separators=(",", ":"), ensure_ascii=True).encode()
@@ -369,6 +372,8 @@ class OceanDiskStorage(HiCacheStorage):
                     keys=len(keys),
                     put_lock_ms=parts.get("put_lock_ms"),
                     put_sync_ms=parts.get("put_sync_ms"),
+                    route_ms=parts.get("exists_route_ms"),
+                    upload_ms=parts.get("exists_upload_ms"),
                     native_ms=parts.get("exists_native_ms"),
                 )
 
@@ -402,11 +407,17 @@ class OceanDiskStorage(HiCacheStorage):
                     },
                 )
             metadata = torch.tensor(
-                [next(self._task_ids), *keys, *connections],
-                dtype=torch.int64,
-                device=self.device,
+                [next(self._task_ids), *keys, *connections], dtype=torch.int64
             )
             if timings is not None:
+                upload_start = time.perf_counter()
+                timings["exists_route_ms"] = (upload_start - prepare_start) * 1000
+            # A blocking upload also waits for this thread's current stream.
+            metadata = metadata.to(self.device)
+            if timings is not None:
+                timings["exists_upload_ms"] = (
+                    time.perf_counter() - upload_start
+                ) * 1000
                 timings["exists_prepare_ms"] = (
                     time.perf_counter() - prepare_start
                 ) * 1000
@@ -567,6 +578,9 @@ class OceanDiskStorage(HiCacheStorage):
                     task, pending_puts = perf_context
                     submit_pending_start = pending_puts()
                 dispatch_started = time.perf_counter()
+                gpu_start = (
+                    ucl_trace.gpu_mark(self._get_stream) if ucl_trace.GPU else None
+                )
                 for cpu, gpu, events in submitted:
                     step = time.perf_counter()
                     self._run_io(
@@ -586,6 +600,9 @@ class OceanDiskStorage(HiCacheStorage):
                         self._get_stream,
                     )
                     native_times.append((time.perf_counter() - step) * 1000)
+                gpu_end = (
+                    ucl_trace.gpu_mark(self._get_stream) if ucl_trace.GPU else None
+                )
                 if perf_context is not None:
                     logger.info(
                         "[OceanDisk PERF GET SUBMIT] task=%s layers=%d calls=%d "
@@ -622,6 +639,9 @@ class OceanDiskStorage(HiCacheStorage):
                         )
                     if layer == 0:
                         first_layer_ms = (time.perf_counter() - started) * 1000
+                if gpu_end is not None:
+                    gpu_end.synchronize()
+                    ucl_trace.gpu_span("gpu.get", gpu_start, gpu_end)
                 if timings is not None:
                     timings.update(
                         pack_ms=(packed - started) * 1000,
