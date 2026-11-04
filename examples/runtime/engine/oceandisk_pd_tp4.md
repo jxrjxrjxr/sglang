@@ -1,6 +1,6 @@
 # OceanDisk notify 运行指南（单机 4P4D／双机 8P8D）
 
-更新：2026-11-02。分支 `dev_oceandisk_linker_pd_notify`，参数对齐实现基于 `9dc1fcf964`，本版包含独立 P／D／router 入口及 D DP 支持。两机按第 2 节拉取 notify 分支最新提交，并记录实际提交和工作区 diff。**GPU、RDMA、GIDS 及双机实测仍待验证。**两台机器继续使用 `/home/j00977581/sglang-pd`，复用已准备的环境、模型和 GIDS 库。
+更新：2026-11-04（namespace 单列，Round 不再等待 flush）。分支 `dev_oceandisk_linker_pd_notify`，参数对齐实现基于 `9dc1fcf964`，本版包含独立 P／D／router 入口及 D DP 支持。两机按第 2 节拉取 notify 分支最新提交，并记录实际提交和工作区 diff。**GPU、RDMA、GIDS 及双机实测仍待验证。**两台机器继续使用 `/home/j00977581/sglang-pd`，复用已准备的环境、模型和 GIDS 库。
 
 ## 1. 五个入口与固定行为
 
@@ -9,7 +9,7 @@
 | `run_oceandisk_prefill.sh` | 必要赋值＋一条 `python -m sglang.launch_server`；前台运行 P |
 | `run_oceandisk_decode.sh` | 同上；独立配置 D 的 TP、DP、物理 GPU 起点和 IP |
 | `run_oceandisk_router.sh` | 一条 router 命令；P/D 地址独立 |
-| `Round/run_rounds.py` | 基于 `D:\CodeSpace\LLMTest\Round`，保留人工清缓存、回车及原 TTFT／缓存统计口径；增加 TPOT |
+| `Round/run_rounds.py` | 基于 `D:\CodeSpace\LLMTest\Round`，保留原 TTFT／缓存统计口径；增加 TPOT；轮间不暂停、不清缓存，直接跑完 |
 | `Round/run_rounds.sh` | 只有 `python3 run_rounds.py` 与参数；16000 起步、每轮 +16000、输出上限 16、10 会话 × 10 轮（约 16K→160K） |
 
 服务脚本不启动其他服务、不等待健康检查、不清理进程、不运行压测。先在三个终端启动 P、D、router，再用第四个终端跑 Round。前台服务用 Ctrl+C 停止；需要后台日志时使用第 5 节的外部命令。
@@ -29,7 +29,7 @@ D radix cache 用于本方案的前缀匹配、锁定、回收及装载槽位复
 
 在已有 pd 容器、已准备好的 SGLang Python 环境中操作。132／134 的 `/home` **不共享**；代码、模型、动态库、本机 GIDS 配置各自准备，客户端机器另备 Round 语料和 bench 数据集。不要把 132 的本地网卡/IP 配置直接复制给 134。
 
-每个服务终端先执行本节公共块，再选一个机器块。一次实验所有终端、双机两端使用**同一个手工填写的 namespace**；下一组独立实验改新值。不要让两个脚本分别生成时间戳。下面的示例值应换为本次唯一标识，字符使用字母、数字、`-`、`_`。
+每个服务终端先执行本节公共块，再选一个机器块，连续实验时保留。namespace 及依赖它的变量单独放在第 2.1 节，一次实验所有终端、双机两端使用**同一个手工填写的值**。
 
 ```bash
 export W=/home/j00977581
@@ -40,10 +40,8 @@ export DATASET_PATH=/home/z00591349/dataset/multifieldqa_zh.jsonl
 export OPEXTENSION=$W/gids/lib/libop_extension.so
 export LIBGIDS=$W/gids/lib/libgids_kv_host.so
 export GIDS_DIR=$W/gids/cfg_$(hostname)/
-export OD_NAMESPACE=notify-20261101-run01
-export LOGS=$W/pd_logs/$(hostname)/$OD_NAMESPACE
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-mkdir -p "$LOGS" /home/cache/deep_gemm /home/cache/triton /home/cache/inductor
+mkdir -p /home/cache/deep_gemm /home/cache/triton /home/cache/inductor
 cd "$REPO"
 ```
 
@@ -79,7 +77,23 @@ git -C "$REPO" diff --stat
 
 没有本地分支时，用 `git switch --track -c dev_oceandisk_linker_pd_notify mine/dev_oceandisk_linker_pd_notify` 替换 switch 行。若分支被旧 worktree 占用，先检查 `git worktree list`，保存旧目录的工作，再在旧目录 detach；目录仍保留。
 
-两机应为同一提交，若部署未提交改动则额外对比 patch／文件哈希。保存配置来源：
+### 2.1 每次实验只改这一块
+
+连续跑任务时保留 P、D、Router、Client 终端和上面的环境，只处理这里。先停 P、D，再把下面这块粘贴到 **P、D、客户端终端**，只改第一行；双机两端填相同的值。字符使用字母、数字、`-`、`_`。
+
+```bash
+export OD_NAMESPACE=notify-20261104-run01
+export LOGS=/home/j00977581/pd_logs/$(hostname)/$OD_NAMESPACE
+export SGLANG_UCL_TRACE_DIR=/home/j00977581/ucl_trace/$OD_NAMESPACE
+mkdir -p "$LOGS"
+```
+
+- `run_oceandisk_prefill.sh`、`run_oceandisk_decode.sh` 启动时读取这些变量，改完必须重启 P、D。
+- trace 目录跟随 namespace，不用时间戳，避免 P、D 的目录不一致。同一 namespace 重跑时新旧 trace 会混在一个目录，下一组实验要换值。
+- 用过第 7 节的 `OD_STORAGE_CONFIG` 时，改 namespace 后要重新生成它。
+- Router 不读取 namespace，启动命令不变；只有后台运行时的日志路径用到 `$LOGS`。
+
+两机应为同一提交，若部署未提交改动则额外对比 patch／文件哈希。下面的命令写入 `$LOGS`，每次实验在每台服务机器上执行一次：
 
 ```bash
 git -C "$REPO" rev-parse HEAD > "$LOGS/commit.txt"
@@ -94,7 +108,7 @@ printf '%s\n' "$OD_NAMESPACE" > "$LOGS/namespace.txt"
 
 ## 3. 单机：132 或 134 的 4P4D
 
-选择目标机器，在三个终端都完成第 2 节公共块和该机器块。P31002、D31001、router31345、P bootstrap31145 保持固定。
+选择目标机器，在三个终端都完成第 2 节公共块和该机器块，P、D 终端再完成第 2.1 节。P31002、D31001、router31345、P bootstrap31145 保持固定。
 
 P 终端：
 
@@ -118,7 +132,7 @@ P、D 的 dist-init 分别为本机 `:31500`、`:31501`。等待日志完成加�
 
 ## 4. 双机：132 P＋134 D/router
 
-两边各完成第 2 节，namespace 完全相同。先确认两机同版本代码、模型和 GIDS 动态库；本地 RDMA 地址、GID、物理 GPU 编号各自正确。
+两边各完成第 2 节和第 2.1 节，namespace 完全相同。先确认两机同版本代码、模型和 GIDS 动态库；本地 RDMA 地址、GID、物理 GPU 编号各自正确。
 
 132 P 终端：
 
@@ -188,7 +202,7 @@ kill -TERM -- -12345
 
 前台启动用各终端 Ctrl+C。停止后复核监听和 GPU worker 已退出，再启动下一组。客户端 Ctrl+C 只结束 Round，不会停止服务。日志查看：`tail -f "$LOGS/decode.log"`。短请求诊断在 P/D 启动前设置 `SGLANG_OCEANDISK_TRACE=1`，保存 `PUT_DONE/READY_SEND` 和 `READY_RECV/LOAD_STARTED/LOAD_DONE`；正式计时回到默认 0。load tag 为 `rid@start_page:layer_start`。结构化的流程与耗时记录见第11节 UCL trace。
 
-## 6. Round 与三种清缓存流程
+## 6. Round 与缓存条件
 
 在 router 所在机器准备语料。仓库不存语料副本；已有文件或链接时跳过 ln：
 
@@ -206,13 +220,9 @@ sh run_rounds.sh
 
 Round 的 `--model`、`--base-url` 是显式参数，**不会读取服务脚本的 MODEL_PATH**；改模型或从远端跑客户端时相应修改 sh 参数。默认输出为 `rounds.json` 和 `conversations/`，重跑前移走旧结果或改输出路径。
 
-每轮出现 `等待清洗hbm` 后，在另一个终端选择以下一种流程；最后一轮也要回车，之后才保存最终 JSON。默认延续最新 notify 测试：**只清 D**。
+`run_rounds.py` 轮间不再暂停，也不清缓存，启动后直接跑完全部轮次并保存最终 JSON。默认协议是 **P、D 均不 flush**，模拟真实场景；D 命中率仍取决于 DP round-robin 的分组路由。
 
-| 实验条件 | 轮间操作 |
-|---|---|
-| 只清 D（默认） | 只调用 D flush；保留 P HBM 及存储，下一轮验证 D 恢复 |
-| 清 P+D | 两端都 flush；存储数据保留，不等于存储冷启动 |
-| 不清缓存 | 不调用 flush，直接回车；记录 DP round-robin 导致的组间命中差异 |
+需要专项诊断时，可在请求全部结束后手动 flush。Round 不再提供轮间等待，因此这些命令不用于多轮连续负载：
 
 ```bash
 # 使用第 5 节的实际 P_IP/D_IP。只清 D：
@@ -221,7 +231,7 @@ curl --noproxy '*' -i --max-time 60 -X POST "http://$D_IP:31001/flush_cache?time
 curl --noproxy '*' -i --max-time 60 -X POST "http://$P_IP:31002/flush_cache?timeout=30"
 ```
 
-请求全部结束后操作，确认每次均为 HTTP200／`Cache flushed.` 再回车；400 是清理失败。D 的服务端 flush 面向该实例全部 DP 组，仍需从各 scheduler 日志确认无在途请求。flush 释放缓存状态，模型和预分配 KV 池仍在，`nvidia-smi` 不会归零。独立实验重启服务并换 namespace；仅清 P+D 不清 OceanDisk。
+确认每次均为 HTTP200／`Cache flushed.`；400 是清理失败。D 的服务端 flush 面向该实例全部 DP 组，仍需从各 scheduler 日志确认无在途请求。flush 释放缓存状态，模型和预分配 KV 池仍在，`nvidia-smi` 不会归零。独立实验重启服务并换 namespace；仅清 P+D 不清 OceanDisk。
 
 先用相同负载的 batch=1 分离单请求成本，再跑默认 batch=10；完整 batch=1 参数：
 
@@ -300,7 +310,7 @@ python "$ENGINE/oceandisk_pd_tp4.py" check \
   --decode-log "$LOGS/decode.log"
 ```
 
-DP 小请求示例：P/D 两端先设置 tail=0 和 trace=1 后启动，随后在 Round 目录执行；两轮之间按默认流程只清 D。batch4 可覆盖单机两组或双机四组，但是否实际分发到每组仍以日志为准。
+DP 小请求示例：P/D 两端先设置 tail=0 和 trace=1 后启动，随后在 Round 目录执行；两轮之间不清 D，覆盖的是不 flush 时的路径。D 恢复路径用上面的 bench reload 对照验证。batch4 可覆盖单机两组或双机四组，但是否实际分发到每组仍以日志为准。
 
 ```bash
 python3 run_rounds.py \
@@ -349,7 +359,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 
 源码定位：`arg_groups/pd_disaggregation_hook.py`（支持范围）、`mem_cache/storage/oceandisk/oceandisk_direct_linker.py`（key）、`connection_router.py`／`oceandisk_storage.py`（连接及 native ABI）、`disaggregation/decode_linker_mixin.py`／`unified_radix_cache.py`（attention 组同步）、`srt/layers/deep_gemm_wrapper/compile_utils.py`（NVRTC）。
 
-仍有意保留的差异：0.5.13 使用 GLM-5-FP8，现用 GLM-5.2-W4AFP8；单机4P4D资源少于旧双机8P8D；notify 50层通知、存储前缀＋RDMA tail8192、P持有缓存而轮间只清D，均不等同于张圆 NULL 混部。Q8KV8、FP8 KV、layer split、NVLS 和 speculative decoding 不进入本轮对齐基线，单列后续实验，不承诺耗时下降比例。notify 当前拒绝非复制 DSA、PP>1、DCP>1、P DP>1、无 DP attention 的 D DP，以及 speculative／D offload／staging／HiCache 组合。
+仍有意保留的差异：0.5.13 使用 GLM-5-FP8，现用 GLM-5.2-W4AFP8；单机4P4D资源少于旧双机8P8D；notify 50层通知、存储前缀＋RDMA tail8192、P、D 全程不 flush，均不等同于张圆 NULL 混部。Q8KV8、FP8 KV、layer split、NVLS 和 speculative decoding 不进入本轮对齐基线，单列后续实验，不承诺耗时下降比例。notify 当前拒绝非复制 DSA、PP>1、DCP>1、P DP>1、无 DP attention 的 D DP，以及 speculative／D offload／staging／HiCache 组合。
 
 ## 10. 验证状态与旧入口
 
@@ -367,11 +377,10 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
 
 默认关闭；关闭时每个埋点只多一次布尔判断，调度阶段装饰器和 `exists_many` 不加任何包装层。打开后各进程把事件写入同一目录（`<host>_<pid>.jsonl`，由后台线程建文件并每秒刷盘；目录不可写时只在 stderr 提示一次并自动关闭打点，不影响服务），跑完生成报告和时间线。与上面的 `SGLANG_OCEANDISK_*` 日志相互独立，做开销对照时两组保持相同设置，建议都关闭。
 
-1. P、D、客户端三个终端设置相同的两个变量，然后**重启 P/D**（启动时读取，不能热切换）。每次实验用新目录：
+1. P、D、客户端终端各设置一次开关，连续实验时保留；目录由第 2.1 节的 `SGLANG_UCL_TRACE_DIR` 按 namespace 设置。两者都在启动时读取，不能热切换，改后要**重启 P/D**：
 
    ```bash
    export SGLANG_UCL_TRACE=1
-   export SGLANG_UCL_TRACE_DIR=/home/j00977581/ucl_trace/$(date +%m%d_%H%M)_notify_16k
    ```
 
    双机时每台机器写本地同名目录，结束后把 132 的目录拷到 134 再合并；报告会标注“跨机未校准”，不计算跨机差值。

@@ -120,6 +120,20 @@ class TestOceanDiskRounds(unittest.TestCase):
             self.assertEqual(result.max_tpot_ms, 0)
             self.assertEqual(result.min_tpot_ms, 0)
 
+    def test_rounds_run_through_without_waiting_for_input(self):
+        bench = rounds.SGLangBatchBenchmark.__new__(rounds.SGLangBatchBenchmark)
+        bench.record_response = False
+        bench._init_dummy_pool = Mock()
+        bench._generate_dummy_text = Mock(return_value="text")
+        bench.count_tokens = Mock(return_value=1)
+        bench._print_batch_result = Mock()
+        answer = rounds.SingleRequestResult(success=True, response="ok", output_tokens=1)
+        bench.run_batch_round = Mock(side_effect=lambda **_: (Mock(), [(0, answer)]))
+        with patch.object(rounds.time, "sleep"), \
+                patch("builtins.input", side_effect=AssertionError("waited for input")):
+            results, _ = bench.run_conversation(16, 16, rounds=3)
+        self.assertEqual(len(results), 3)
+
     def test_summary_table_and_json(self):
         results = [self.batch([rounds.SingleRequestResult(success=True, tpot_ms=12.5)]),
                    self.batch([rounds.SingleRequestResult(success=True)])]

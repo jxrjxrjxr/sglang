@@ -583,10 +583,6 @@ class SGLangBatchBenchmark:
                 _shutdown_messages = [list(msgs) for msgs in recorded_messages]
                 save_conversations(recorded_messages, _shutdown_conversation_dir)
 
-            time.sleep(0.5)
-
-            pause = input("等待清洗hbm")
-
         # 返回 recorded_messages 以便 main 中保存完整对话
         return results, recorded_messages
 
