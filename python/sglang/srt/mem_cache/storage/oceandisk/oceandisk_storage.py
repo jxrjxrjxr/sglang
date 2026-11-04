@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from bisect import bisect_right
 import hashlib
 import itertools
 import json
@@ -13,10 +12,10 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import nullcontext
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.oceandisk.connection_router import ConnectionRouter
 from sglang.srt.observability import ucl_trace
@@ -42,7 +41,7 @@ def trace_event(event, **details):
 def trace_batch(event, batch, index, total, native_module):
     if os.environ.get("SGLANG_OCEANDISK_TRACE") != "1":
         return
-    row = batch[0]
+    row = batch[0].tolist()
     count = (len(row) - 1) // 6
     samples = {}
     for name, position in (("kv", 0), ("indexer", count // 2)):
@@ -113,14 +112,6 @@ def read_connection_count(path: Path) -> int:
     return count
 
 
-@dataclass(frozen=True)
-class OceanDiskRange:
-    key: int
-    ptr: int
-    size: int
-    storage_offset: int = 0
-
-
 def encode_key(identity: tuple) -> int:
     """Encode an object identity as a positive int64."""
     data = json.dumps(identity, separators=(",", ":"), ensure_ascii=True).encode()
@@ -129,56 +120,31 @@ def encode_key(identity: tuple) -> int:
     ) or 1
 
 
-def resolve_mr(regions: list[tuple[int, int]], ptr: int, size: int) -> tuple[int, int]:
-    if size <= 0:
+def resolve_mrs(
+    regions: list[tuple[int, int]], ptrs: np.ndarray, sizes: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Registration index and offset inside it for every range.
+
+    The first registered region that fully contains a range wins, also when
+    regions overlap.
+    """
+    if (sizes <= 0).any():
         raise ValueError("OceanDisk ranges must have positive length.")
-    for mr_id, (base, length) in enumerate(regions):
-        if base <= ptr and ptr + size <= base + length:
-            return mr_id, ptr - base
-    raise ValueError(f"OceanDisk range ptr={ptr:#x}, size={size} is not registered.")
-
-
-def pack_io(
-    task_id: int,
-    ranges: list[OceanDiskRange],
-    regions: list[tuple[int, int]],
-    connection_indices: tuple[int, ...],
-    *,
-    resolve=None,
-    select_connection=None,
-) -> list[int]:
-    """Column-major ABI used by od/cache_controller.py, with remote offsets."""
-    half = len(ranges) // 2
-    if (
-        not ranges
-        or len(ranges) % 2
-        or [r.key for r in ranges[:half]] != [r.key for r in ranges[half:]]
-    ):
-        raise ValueError("OceanDisk requires matching KV and Indexer halves.")
-    mr_offsets = [
-        resolve(item.ptr, item.size)
-        if resolve is not None
-        else resolve_mr(regions, item.ptr, item.size)
-        for item in ranges
-    ]
-    if any(item.storage_offset < 0 for item in ranges):
-        raise ValueError("OceanDisk storage offsets must be nonnegative.")
-    paired_connections = [
-        select_connection(item.key)
-        if select_connection is not None
-        else connection_indices[item.key % len(connection_indices)]
-        for item in ranges[:half]
-    ]
-    return [
-        task_id,
-        *[mr for mr, _ in mr_offsets],
-        *[item.key for item in ranges],
-        *[offset for _, offset in mr_offsets],
-        *[item.storage_offset for item in ranges],
-        *[item.size for item in ranges],
-        *paired_connections,
-        *paired_connections,
-    ]
+    bases, lengths = np.array(regions, dtype=np.int64).T
+    order = np.argsort(bases, kind="stable")
+    if (bases[order][:-1] + lengths[order][:-1] <= bases[order][1:]).all():
+        mrs = order[np.searchsorted(bases[order], ptrs, side="right") - 1]
+    else:
+        mrs = np.zeros_like(ptrs)
+        for mr, (base, length) in reversed(list(enumerate(regions))):
+            mrs[(base <= ptrs) & (ptrs + sizes <= base + length)] = mr
+    inside = (bases[mrs] <= ptrs) & (ptrs + sizes <= bases[mrs] + lengths[mrs])
+    if not inside.all():
+        ptr, size = ptrs[~inside][0], sizes[~inside][0]
+        raise ValueError(
+            f"OceanDisk range ptr={int(ptr):#x}, size={size} is not registered."
+        )
+    return mrs, ptrs - bases[mrs]
 
 
 class OceanDiskStorage(HiCacheStorage):
@@ -485,7 +451,7 @@ class OceanDiskStorage(HiCacheStorage):
         if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") != "1":
             return
         for batch in descriptors:
-            row = batch[0]
+            row = batch[0].tolist()
             count = (len(row) - 1) // 6
             for i in range(count // 2):
                 key = row[1 + count + i]
@@ -502,63 +468,40 @@ class OceanDiskStorage(HiCacheStorage):
                     self._debug_put_history.popitem(last=False)
 
     def _pack_layer_batches(self, layers):
-        if not layers:
+        """Pack (layers, ranges, 4) int64 ranges (object key, local pointer,
+        size, storage offset) into the column-major ABI of od/cache_controller.py:
+        task, MR, key, local offset, storage offset, wire size, connection."""
+        if not len(layers) or not layers.shape[1]:
             return []
-        count = len(layers[0])
-        if count == 0:
-            return []
+        count = layers.shape[1]
         if count > MAX_GIDS_RANGES:
             raise ValueError(
                 f"OceanDisk IO count {count} exceeds native capacity {MAX_GIDS_RANGES}."
             )
-        if count % 2 or any(len(layer) != count for layer in layers):
+        if count % 2:
             raise ValueError("OceanDisk layers require equal, even IO counts.")
-        # Index registrations once per batch instead of scanning all layer MRs
-        # for every KV/Indexer range. Preserve first-match behavior for overlaps.
-        ordered = sorted(
-            (base, length, mr) for mr, (base, length) in enumerate(self.regions)
-        )
-        starts = [base for base, _, _ in ordered]
-        disjoint = all(a + n <= b for (a, n, _), (b, _, _) in zip(ordered, ordered[1:]))
-
-        def resolve(ptr, size):
-            if disjoint and size > 0:
-                index = bisect_right(starts, ptr) - 1
-                if index >= 0:
-                    base, length, mr = ordered[index]
-                    if ptr + size <= base + length:
-                        return mr, ptr - base
-            return resolve_mr(self.regions, ptr, size)
-
         half = count // 2
+        keys, ptrs, sizes, storage_offsets = np.moveaxis(layers, -1, 0)
+        if (keys[:, :half] != keys[:, half:]).any() or (keys != keys[0]).any():
+            raise ValueError("OceanDisk requires matching KV and Indexer halves.")
+        if (storage_offsets < 0).any():
+            raise ValueError("OceanDisk storage offsets must be nonnegative.")
+        mrs, local_offsets = resolve_mrs(self.regions, ptrs, sizes)
         # Fix one connection per page for the whole operation, including both
         # KV/Indexer halves and every layer.
-        selected_connections = {
-            item.key: self.connection_router.select(item.key)
-            for item in layers[0][:half]
-        }
-        batches = [
-            [
-                pack_io(
-                    next(self._task_ids),
-                    ranges,
-                    self.regions,
-                    self.connection_indices,
-                    resolve=resolve,
-                    select_connection=selected_connections.__getitem__,
-                )
-                for ranges in layers
-            ]
-        ]
-        # Resolve original ranges against actual allocations before rounding lengths.
-        # Legacy behavior deliberately includes bytes beyond each logical page.
-        for batch in batches:
-            for row in batch:
-                count = (len(row) - 1) // 6
-                for index in range(count):
-                    position = 1 + 4 * count + index
-                    row[position] = (row[position] + 511) & ~511
-        return batches
+        page_keys = keys[0, :half].tolist()
+        selected = {key: self.connection_router.select(key) for key in page_keys}
+        paired = np.fromiter(map(selected.__getitem__, page_keys), np.int64, half)
+        connections = np.broadcast_to(np.tile(paired, 2), keys.shape)
+        batch = np.empty((len(layers), 1 + 6 * count), dtype=np.int64)
+        batch[:, 0] = [next(self._task_ids) for _ in range(len(layers))]
+        # Resolved against actual allocations before rounding lengths: legacy
+        # behavior deliberately includes bytes beyond each logical page.
+        wire_sizes = (sizes + 511) & ~511
+        batch[:, 1:] = np.hstack(
+            (mrs, keys, local_offsets, storage_offsets, wire_sizes, connections)
+        )
+        return [batch]
 
     def get_layers(
         self,
@@ -596,7 +539,7 @@ class OceanDiskStorage(HiCacheStorage):
             try:
                 for batch_index, batch in enumerate(descriptors):
                     step = time.perf_counter()
-                    cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                    cpu = torch.from_numpy(batch)
                     cpu_tensor_ms += (time.perf_counter() - step) * 1000
                     step = time.perf_counter()
                     gpu = cpu.to(self.device)
@@ -711,10 +654,10 @@ class OceanDiskStorage(HiCacheStorage):
             )
             try:
                 for batch_index, batch in enumerate(descriptors):
-                    cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                    cpu = torch.from_numpy(batch)
                     gpu = cpu.to(self.device)
                     lengths = torch.tensor(
-                        [len(row) for row in batch], dtype=torch.int64, device="cpu"
+                        [batch.shape[1]] * len(batch), dtype=torch.int64, device="cpu"
                     )
                     indices = torch.tensor(
                         list(range(len(batch))), dtype=torch.int64, device="cpu"
@@ -782,7 +725,7 @@ class OceanDiskStorage(HiCacheStorage):
             prepared = [[] for _ in layers]
             for batch in batches:
                 step = time.perf_counter()
-                cpu = torch.tensor(batch, dtype=torch.int64, device="cpu")
+                cpu = torch.from_numpy(batch)
                 cpu_ms += (time.perf_counter() - step) * 1000
                 step = time.perf_counter()
                 gpu = cpu.to(self.device)

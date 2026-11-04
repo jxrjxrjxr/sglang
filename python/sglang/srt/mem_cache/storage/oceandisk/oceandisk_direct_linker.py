@@ -11,6 +11,7 @@ from concurrent.futures import Future
 from queue import Empty, Queue
 from weakref import WeakValueDictionary
 
+import numpy as np
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
@@ -20,7 +21,6 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
-    OceanDiskRange,
     OceanDiskStorage,
     encode_key,
     trace_event,
@@ -360,7 +360,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 "The GIDS DSA operator requires KV and Indexer pools only."
             )
         counts = []
-        self._storage_offsets = {}
+        tables = {}
         for name, entry in self.pools.items():
             if not entry.packed:
                 raise ValueError("OceanDisk requires packed=True for page objects.")
@@ -371,47 +371,53 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     offsets[raw_offset] = padded_offset
                     raw_offset += size
                     padded_offset += (size + 511) & ~511
-            self._storage_offsets[name] = offsets
+            tables[name] = []
             layer_counts = []
             for layer in range(self.num_layers):
-                meta = entry.get_prepared_layer_range_meta([0], layer)
+                # Two rows give each fragment's base address and row stride.
+                meta = entry.get_prepared_layer_range_meta([0, 1], layer)
                 if meta is None or not meta[1][0]:
                     raise ValueError("Each DSA layer needs KV and Indexer fragments.")
-                layer_counts.append(len(meta[1][0]))
+                (first, second), sizes, positions = meta[0], meta[1][0], meta[2][0]
+                layer_counts.append(len(sizes))
+                tables[name].append(
+                    [
+                        (base, row - base, size, offsets[position])
+                        for base, row, size, position in zip(
+                            first, second, sizes, positions, strict=True
+                        )
+                    ]
+                )
             counts.extend(layer_counts)
         if len(set(counts)) != 1:
             raise ValueError(
                 "GIDS requires paired KV/Indexer IOs and equal IO counts across layers."
             )
+        # (layers, fragments, 4): base, row stride, size, storage offset.
+        self._layer_tables = {
+            name: np.array(table, dtype=np.int64) for name, table in tables.items()
+        }
 
     def _object_key(self, page_key) -> int:
         return encode_key((self._namespace, page_key))
 
-    def _page_fragments(
-        self, name, page_keys, locations, layer, *, object_keys=None
-    ) -> list[OceanDiskRange]:
-        """Map a pool/page object's layer to local ranges and remote offsets."""
-        if not page_keys:
-            return []
-        if object_keys is None:
-            object_keys = [self._object_key(key) for key in page_keys]
-        ptrs, sizes, offsets = self.pools[name].get_prepared_layer_range_meta(
-            locations, layer
+    def _pool_ranges(self, name, keys, rows, layers) -> np.ndarray:
+        """(layers, pages * fragments, 4) int64 ranges of one pool: object key,
+        local pointer, size, storage offset. Pages stay in input order with each
+        page's fragments together. Arrays keep large batches out of per-range
+        Python work, which would compete with the scheduler thread."""
+        base, stride, size, offset = np.moveaxis(
+            self._layer_tables[name][layers[0] : layers[1]], -1, 0
         )
-        ranges = []
-        storage_offsets = self._storage_offsets[name]
-        for key, pointers, lengths, positions in zip(
-            object_keys, ptrs, sizes, offsets, strict=True
-        ):
-            for ptr, size, storage_offset in zip(
-                pointers, lengths, positions, strict=True
-            ):
-                ranges.append(
-                    OceanDiskRange(
-                        key, int(ptr), int(size), storage_offsets[storage_offset]
-                    )
-                )
-        return ranges
+        rows = np.asarray(rows, dtype=np.int64)[None, :, None]
+        keys = np.asarray(keys, dtype=np.int64)[None, :, None]
+        columns = np.broadcast_arrays(
+            keys,
+            base[:, None, :] + rows * stride[:, None, :],
+            size[:, None, :],
+            offset[:, None, :],
+        )
+        return np.stack(columns, axis=-1).reshape(len(base), -1, 4)
 
     def _init_put_progress(self):
         self._put_progress_lock = threading.Lock()
@@ -576,7 +582,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         return index
 
     def _transfer_layers(
-        self, transfers, *, skip_scheduled=False, object_keys=None, timings=None
+        self,
+        transfers,
+        *,
+        skip_scheduled=False,
+        object_keys=None,
+        timings=None,
+        layer_range=None,
     ):
         # A page uses the same object key across layers and physical pools.
         if object_keys is None:
@@ -584,7 +596,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         address_start = time.perf_counter()
         copy_ms = 0.0
         cpu_indices = {}
-        prepared = []
+        layers = layer_range or (0, self.num_layers)
+        pools = {PoolName.KV: [], PoolName.INDEXER: []}
         for transfer in transfers:
             source = id(transfer.host_indices)
             if source not in cpu_indices:
@@ -596,37 +609,32 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             # KV and Indexer share slots, but use token rows and page rows
             # respectively. Convert the slots once, then map each pool on CPU.
             locations = self.pools[transfer.name].prepare_locations(cpu_indices[source])
-            page_keys, encoded_keys, page_locations = [], [], []
+            encoded_keys, page_locations = [], []
             for page_key, location in zip(transfer.keys, locations, strict=True):
                 if page_key not in object_keys:
                     object_keys[page_key] = self._object_key(page_key)
                 key = object_keys[page_key]
                 if skip_scheduled and key in self._layerwise_pending_keys:
                     continue
-                page_keys.append(page_key)
                 encoded_keys.append(key)
                 page_locations.append(location)
-            prepared.append((transfer.name, page_keys, encoded_keys, page_locations))
-        layers = []
-        for layer in range(self.num_layers):
-            pools = {PoolName.KV: [], PoolName.INDEXER: []}
-            for name, page_keys, encoded_keys, locations in prepared:
-                pools[name].extend(
-                    self._page_fragments(
-                        name,
-                        page_keys,
-                        locations,
-                        layer,
-                        object_keys=encoded_keys,
-                    )
-                )
-            layers.append(pools[PoolName.KV] + pools[PoolName.INDEXER])
+            pools[transfer.name].append(
+                self._pool_ranges(transfer.name, encoded_keys, page_locations, layers)
+            )
+        ranges = np.concatenate(
+            [
+                np.empty((layers[1] - layers[0], 0, 4), dtype=np.int64),
+                *pools[PoolName.KV],
+                *pools[PoolName.INDEXER],
+            ],
+            axis=1,
+        )
         if timings is not None:
             timings.update(
                 address_copy=copy_ms,
                 address_build=(time.perf_counter() - address_start) * 1000 - copy_ms,
             )
-        return layers
+        return ranges
 
     def begin_layerwise_save(self, transfers, *, phase="prefill"):
         begin_start = time.perf_counter()
@@ -705,16 +713,13 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
     def _run_transfers(
         self, transfers, *, write: bool, counter_index=None, layer_range=None
     ) -> None:
-        layers = self._transfer_layers(transfers)
+        # Descriptors retain the original layer storage offsets. The native
+        # dispatch and counter index only the selected rows, starting at zero.
+        layers = self._transfer_layers(transfers, layer_range=layer_range)
         if ucl_trace.ON and not write:
             ucl_trace.emit("od.get.ranges", batch=counter_index)
-        if layer_range is not None:
-            # Descriptors retain the original layer storage offsets. The native
-            # dispatch and counter index only the selected rows, starting at zero.
-            start, end = layer_range
-            layers = layers[start:end]
         if write:
-            if layers and layers[0]:
+            if layers.size:
                 self.storage.put_layers(layers)
         else:
             perf_kwargs = {}

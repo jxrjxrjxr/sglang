@@ -456,14 +456,14 @@ class TestLinkerNotifyPrefix(unittest.TestCase):
 class TestLinkerNotifyIO(unittest.TestCase):
     def test_scoped_get_retains_original_storage_offsets(self):
         linker = object.__new__(OceanDiskDirectLinker)
-        layers = [[("layer", i, i * 4096)] for i in range(4)]
-        linker._transfer_layers = Mock(return_value=layers)
+        selected = object()
+        linker._transfer_layers = Mock(return_value=selected)
         linker.layer_done_counter = LayerWiseLoadCounter(4)
         index = linker.layer_done_counter.update_producer(2)
         linker.storage = SimpleNamespace(get_layers=Mock())
 
         def get_layers(selected, on_layer_ready, **kwargs):
-            for local_layer in range(len(selected)):
+            for local_layer in range(2):
                 on_layer_ready(local_layer)
 
         linker.storage.get_layers.side_effect = get_layers
@@ -471,7 +471,8 @@ class TestLinkerNotifyIO(unittest.TestCase):
             linker._run_transfers(
                 [], write=False, counter_index=index, layer_range=(2, 4)
             )
-        self.assertEqual(linker.storage.get_layers.call_args.args[0], layers[2:4])
+        linker._transfer_layers.assert_called_once_with([], layer_range=(2, 4))
+        self.assertIs(linker.storage.get_layers.call_args.args[0], selected)
         self.assertTrue(
             all(
                 f.done() and f.exception() is None
