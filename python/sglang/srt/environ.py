@@ -692,6 +692,8 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS = EnvInt(50)
+    # Pages in one decode GET, so forwards run between pieces; 0 disables.
+    SGLANG_DISAGGREGATION_LINKER_LOAD_PAGES = EnvInt(256)
     # -1 uses decode's chunked_prefill_size; 0 leaves only the uncacheable tail.
     SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS = EnvInt(-1)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.

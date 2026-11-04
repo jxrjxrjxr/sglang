@@ -338,6 +338,20 @@ class TestLinkerDecodeLoad(unittest.TestCase):
         self.assertFalse(self.linker.handoff_transfers)
         self.assertEqual(LinkerLoadGatedKVReceiver(a).poll(), KVPoll.Success)
 
+    def test_load_pages_splits_a_ready_range_into_consecutive_gets(self):
+        dr = self.request()
+        with envs.SGLANG_DISAGGREGATION_LINKER_LOAD_PAGES.override(2):
+            self.process(dr)
+            self.assertEqual(self.batches, [(0, ["r@1:0"])])
+            self.assertEqual(dr.linker_inflight_end, 12)
+            self.process(dr)  # one GET in flight per request
+            self.assertEqual(len(self.batches), 1)
+            self.complete_batch()
+            self.process(dr)
+            self.assertEqual(dr.linker_loaded_len, 12)
+            self.assertEqual(self.batches[1], (1, ["r@3:0"]))
+            self.assertEqual(dr.linker_inflight_end, 20)
+
     def test_all_layer_range_takes_rank_minimum(self):
         # Another rank is READY only up to page 3: the merged end is the MIN.
         self.cache._all_reduce_attn_groups.side_effect = lambda states, op: (

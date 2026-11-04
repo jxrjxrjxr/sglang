@@ -106,6 +106,9 @@ class DecodeLinkerTransferMixin:
         linker = self.tree_cache.linker
         page = self.tree_cache.page_size
         window = self.scheduler.chunked_prefill_size // page
+        load_pages = envs.SGLANG_DISAGGREGATION_LINKER_LOAD_PAGES.get()
+        if load_pages:
+            window = min(window, load_pages)
         num_layers = linker.cache_linker.num_layers
         group = envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get()
         now = time.perf_counter()
@@ -188,7 +191,12 @@ class DecodeLinkerTransferMixin:
         # prefill restore already issues in a single GET. The first request of
         # a batch always goes; later ones wait a round. The order and the
         # consensus are identical on every rank, so the deferral is too.
+        # load_pages tightens this: a long GET stalls every forward on the
+        # instance, so a large range goes in pieces, each after the forward
+        # recorded when it is queued. The rest stays READY for the next round.
         cap = max(window, *(dr.linker_prefix_len // page for dr in active))
+        if load_pages:
+            cap = min(cap, load_pages)
         batches, batch_pages = {}, {}
         for dr, (full_end, due) in zip(active, states.tolist()):
             if full_end < 0 or due < 0:
@@ -197,6 +205,8 @@ class DecodeLinkerTransferMixin:
                 start = dr.linker_loaded_len // page
                 if full_end > 0:
                     end, layer, layer_end = full_end, 0, num_layers
+                    if load_pages:
+                        end = min(end, start + load_pages)
                 else:
                     end = min(start + window, dr.linker_prefix_len // page)
                     layer = dr.linker_loaded_layers
