@@ -861,6 +861,113 @@ class TestReport(unittest.TestCase):
             self.assertEqual(spikes[0]["top"], "其他组GET·构建")
             self.assertEqual(spikes[0]["copy"], 600)
 
+    def test_spike_scopes_session_lifetime_and_other_rank_waits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dec = lambda t: (  # noqa: E731
+                t,
+                "sched.run_batch",
+                None,
+                dict(mode="DECODE", rids=["a"]),
+                1,
+            )
+            write_trace(tmp, "scheduler_DP0_TP0", "decode", [dec(0), dec(700)])
+            write_trace(
+                tmp,
+                "scheduler_DP1_TP1",
+                "decode",
+                [
+                    (0, "sched.copy_done", None, dict(mode="IDLE"), 700),
+                    (0, "pd.evict", None, dict(wanted=1, freed=1), 700),
+                ],
+            )
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (0, "uc.save.begin", None, dict(session=1)),
+                    (0, "uc.save.begin", None, dict(session=2)),
+                    (700, "od.put.session_done", None, dict(session=1)),
+                    (700, "od.put.session_done", None, dict(session=2)),
+                ],
+            )
+            run = tool.Run(tmp)
+            spike = tool.decode_spike_section(run, tool.decode_step_section(run)[2])[0]
+            self.assertEqual(spike["cells"][("P保存session", "")], 700)
+            self.assertEqual(spike["cells"][("其他copy_done", "其他IDLE")], 700)
+            self.assertEqual(spike["top"], "无")
+            self.assertEqual(spike["copy"], 0)
+            self.assertEqual(tool.spike_cell(spike, "驱逐"), "-")
+
+    def test_spike_keeps_get_running_across_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dec = lambda t: (  # noqa: E731
+                t,
+                "sched.run_batch",
+                None,
+                dict(mode="DECODE", rids=["a"]),
+                1,
+            )
+            enqueue = dict(batch=0, tags=[], pages=[1])
+            write_trace(
+                tmp,
+                "scheduler_DP0_TP0",
+                "decode",
+                [
+                    (0, "od.get.enqueue", None, enqueue),
+                    (1, "od.get.dequeue", None, dict(batch=0), None, 2),
+                    (2, "od.get.dep_ready", None, dict(batch=0), None, 2),
+                    (3, "od.native", None, dict(op="get"), 1, 2),
+                    (5, "od.get.enqueue", None, dict(batch=1, tags=[], pages=[2])),
+                    dec(10),
+                    dec(90),
+                    (100, "od.get.done", None, dict(batch=0, ok=True), None, 2),
+                ],
+            )
+            run = tool.Run(tmp)
+            view = run.windowed(10 * MS, 90 * MS)
+            _, groups, steps = tool.decode_step_section(view, run)
+            self.assertEqual(groups["本进程GET在途"], [80])
+            spike = tool.decode_spike_section(run, steps)[0]
+            self.assertEqual(spike["cells"][("本进程GET", "等完成")], 80)
+            self.assertEqual(spike["cells"][("本进程GET", "排队·截尾")], 80)
+
+    def test_get_spans_mark_missing_boundaries_unknown(self):
+        batch = dict(src=0, queue=0, wait=1, end=9)
+        self.assertEqual(tool.get_spans(batch), [("排队", 0, 1), ("未知", 1, 9)])
+
+    def test_room_with_two_identities_is_listed_apart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trace(
+                tmp,
+                "p",
+                "prefill",
+                [
+                    (0, "req.arrive", "p-rid", dict(room=1)),
+                    (
+                        1,
+                        "sched.run_batch",
+                        None,
+                        dict(mode="EXTEND", rids=["p-rid"]),
+                        5,
+                    ),
+                ],
+            )
+            write_trace(
+                tmp,
+                "d",
+                "decode",
+                [
+                    (2, "req.arrive", "d1", dict(room=1)),
+                    (3, "req.arrive", "d2", dict(room=1)),
+                ],
+            )
+            p = tool.prefill_section(tool.Run(tmp), {"d1": "r1", "d2": "r2"})
+            self.assertFalse(p["per_round"])
+            self.assertEqual(p["admitted"], 0)
+            self.assertEqual(p["conflicts"][0]["decode"], ["d1", "d2"])
+            self.assertEqual(p["conflicts"][0]["rounds"], ["r1", "r2"])
+
     def test_decode_cache_keeps_logical_pages_apart_from_get_work(self):
         with tempfile.TemporaryDirectory() as tmp:
             events = [

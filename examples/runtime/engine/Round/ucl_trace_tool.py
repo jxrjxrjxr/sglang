@@ -651,33 +651,50 @@ GET_PHASES = (
 
 
 def get_phases(run):
-    """Boundaries of every GET batch. 构建 covers ranges, packing and metadata
+    """Boundaries of every GET batch, from its enqueue, so a batch still queued
+    or in flight is kept. Pass the full capture: a batch that started before
+    the window is otherwise lost. 构建 covers ranges, packing and metadata
     upload; 提交 is the native dispatch call; 等完成 is the I/O still running
     after that call returned, until the worker sees the last layer event."""
-    enqueued = {
-        run.batch_key(e): e["w"] for e in run.events if e["n"] == "od.get.enqueue"
-    }
-    batches, current = [], {}
+    batches, current = {}, {}
     for e in run.events:
         n, thread = e["n"], (e["src"], e["th"])
-        if n == "od.get.dequeue":
-            batch = dict(
-                src=e["src"], queue=enqueued.get(run.batch_key(e), e["w"]), wait=e["w"]
+        if n in ("od.get.enqueue", "od.get.dequeue", "od.get.dep_ready", "od.get.done"):
+            batch = batches.setdefault(
+                run.batch_key(e), dict(src=e["src"], queue=e["w"])
             )
-            current[thread] = batch
-            batches.append(batch)
-        batch = current.get(thread)
-        if batch is None:
-            continue
-        if n == "od.get.dep_ready":
-            batch["build"] = e["w"]
-        elif n == "od.native" and f_(e, "op") == "get":
-            batch.setdefault("submit", e["w"])
-            batch["io"] = e["w"] + e["d"]
-        elif n == "od.get.done":
-            batch["end"] = e["w"]
-            del current[thread]
-    return batches
+            if n == "od.get.dequeue":
+                batch["wait"] = e["w"]
+                current[thread] = batch
+            elif n == "od.get.dep_ready":
+                batch["build"] = e["w"]
+            elif n == "od.get.done":
+                batch["end"] = e["w"]
+                current.pop(thread, None)
+        elif n == "od.native" and f_(e, "op") == "get" and thread in current:
+            current[thread].setdefault("submit", e["w"])
+            current[thread]["io"] = e["w"] + e["d"]
+    return list(batches.values())
+
+
+def get_spans(batch):
+    """(label, start, end) of one batch. A gap between boundaries that are not
+    adjacent is 未知 (events missing); the last phase of a batch that never
+    finished is ·截尾 and stays open."""
+    order = [start for _, start, _ in GET_PHASES] + ["end"]
+    labels = {start: label for label, start, _ in GET_PHASES}
+    present = [key for key in order if key in batch]
+    spans = [
+        (
+            labels[a] if order.index(b) == order.index(a) + 1 else "未知",
+            batch[a],
+            batch[b],
+        )
+        for a, b in zip(present, present[1:])
+    ]
+    if present[-1] != "end":
+        spans.append((f"{labels[present[-1]]}·截尾", batch[present[-1]], float("inf")))
+    return spans
 
 
 # ----------------------------------------------------------------- notify
@@ -830,22 +847,37 @@ def prefill_section(run, server_round):
         elif n == "od.exists":
             exists.append(e)
     per_round = defaultdict(lambda: defaultdict(list))
-    unmatched = []
+    unmatched, conflicts = [], []
     for rid, evs in extends.items():
         start, end = evs[0]["w"], evs[-1]["w"] + evs[-1].get("d", 0)
-        rounds = [server_round[r] for r in run.peer_rids(rid) if r in server_round]
-        if server_round and not rounds:
+        room = run.rid_room.get(rid)
+        p_rids, d_rids = run.role_rids(room, "prefill"), run.role_rids(room, "decode")
+        # server_round holds one rid per client request, so two here are two
+        # clients in one room: neither round can be trusted.
+        clients = {r for r in run.peer_rids(rid) if r in server_round}
+        if len(clients) > 1 or len(p_rids) > 1 or len(d_rids) > 1:
+            conflicts.append(
+                dict(
+                    rid=rid,
+                    room=room,
+                    prefill=p_rids,
+                    decode=d_rids,
+                    rounds=sorted(server_round[r] for r in clients),
+                )
+            )
+            continue
+        if server_round and not clients:
             unmatched.append(
                 dict(
                     rid=rid,
-                    room=run.rid_room.get(rid),
+                    room=room,
                     extends=len(evs),
                     tokens=sum(f_(e, "tokens", 0) for e in evs),
                     start=start,
                 )
             )
             continue
-        bucket = per_round[rounds[0] if rounds else "全部"]
+        bucket = per_round[server_round[clients.pop()] if clients else "全部"]
         if rid in arrive:
             bucket["P排队"].append((start - arrive[rid]) / 1e6)
         bucket["P执行跨度"].append((end - start) / 1e6)
@@ -864,7 +896,7 @@ def prefill_section(run, server_round):
         gap_exists[label].append(
             sum(x.get("d", 0) for x in exists if lo <= x["w"] < hi) / 1e6
         )
-    admitted = len(extends) - len(unmatched)
+    admitted = len(extends) - len(unmatched) - len(conflicts)
     exists_parts = defaultdict(list)
     for e in exists:
         for field, label in (
@@ -884,36 +916,34 @@ def prefill_section(run, server_round):
         admitted=admitted,
         tail=tail,
         unmatched=unmatched,
+        conflicts=conflicts,
     )
 
 
 # --------------------------------------------------- decode step intervals
 
 
-def decode_step_section(run):
+def decode_step_section(run, full=None):
     """Start-to-start intervals between consecutive DECODE batches of one D
     process. Classified by explicit state, never by a length threshold:
     an IDLE batch in between -> 含空闲; else shared rids -> 持续decode;
     else 无法判定 (kept). This is a scheduling interval, not per-request
-    TPOT, and the groups show correlation only."""
+    TPOT, and the groups show correlation only. GET lifetimes come from
+    ``full`` so one started before the window still counts as in flight."""
     by_src = defaultdict(list)
     gets = defaultdict(list)
     consensus = defaultdict(list)
-    opened = {}
     for e in run.events:
         if run.files[e["src"]].role != "decode":
             continue
         n = e["n"]
         if n == "sched.run_batch" and f_(e, "mode") in ("DECODE", "IDLE"):
             by_src[e["src"]].append(e)
-        elif n == "od.get.enqueue":
-            opened[run.batch_key(e)] = e["w"]
-        elif n == "od.get.done" and run.batch_key(e) in opened:
-            gets[e["src"]].append((opened.pop(run.batch_key(e)), e["w"]))
         elif n == "linker.consensus" and "d" in e:
             consensus[e["src"]].append(e["w"])
-    for key, start in opened.items():  # still in flight at the capture end
-        gets[key[0]].append((start, float("inf")))
+    for batch in get_phases(full or run):
+        if run.files[batch["src"]].role == "decode":
+            gets[batch["src"]].append((batch["queue"], batch.get("end", float("inf"))))
     kinds = defaultdict(list)
     groups = defaultdict(list)
     steps = []
@@ -961,12 +991,31 @@ def dp_group(run, src):
     return match.group(1) if match else None
 
 
+def covered(spans, lo, hi):
+    """Time in [lo, hi] covered by the union of ``spans``."""
+    total, reach = 0, lo
+    for start, stop in sorted(spans):
+        start, stop = max(start, reach), min(stop, hi)
+        if stop > start:
+            total += stop - start
+            reach = stop
+    return total
+
+
+SPIKE_UNRANKED = ("copy_done", "其他copy_done", "P保存session")
+
+
 def decode_spike_section(run, steps, top=20):
     """The longest DECODE intervals with what overlapped them on this host.
-    One stall appears on every rank, so intervals of comparable length that
-    overlap are one spike. Each cell is the largest per-process overlap.
-    Overlap is correlation only: a GET on another rank may or may not be why
-    this rank waited."""
+    ``run`` is the full capture, so activity that began before the window is
+    kept; ``steps`` carries the window. One stall appears on every rank, so
+    intervals of comparable length that overlap are one spike. Same-kind
+    spans of one process are merged, and each cell is the largest such
+    coverage. Only the representative rank's DECODE wait is copy_done; waits
+    elsewhere are listed apart, and release/output/evict are limited to the
+    spike's ranks. A P save session is a lifetime spanning forward and queues,
+    not PUT execution. Overlap is correlation only, so ``top`` is the largest
+    overlapping activity and not a cause."""
     if run.cross_host or not steps:
         return None
     spikes = []
@@ -979,10 +1028,8 @@ def decode_spike_section(run, steps, top=20):
             same["ranks"].add(src)
     activities = []  # (src, column or None for GET scope, label, start, end)
     for batch in get_phases(run):
-        for label, start, end in GET_PHASES:
-            if start in batch:
-                stop = batch.get(end, batch.get("end", float("inf")))
-                activities.append((batch["src"], None, label, batch[start], stop))
+        for label, start, stop in get_spans(batch):
+            activities.append((batch["src"], None, label, start, stop))
     columns = {
         "sched.copy_done": "copy_done",
         "sched.finish_release": "释放",
@@ -993,38 +1040,52 @@ def decode_spike_section(run, steps, top=20):
     for e in run.events:
         role = run.files[e["src"]].role
         if e["n"] in columns and role == "decode" and "d" in e:
-            activities.append((e["src"], columns[e["n"]], "", e["w"], e["w"] + e["d"]))
+            label = f_(e, "mode", "") if e["n"] == "sched.copy_done" else ""
+            activities.append(
+                (e["src"], columns[e["n"]], label, e["w"], e["w"] + e["d"])
+            )
         elif e["n"] == "uc.save.begin":
             sessions[(e["src"], f_(e, "session"))] = e["w"]
         elif e["n"] == "od.put.session_done":
-            begin = sessions.get((e["src"], f_(e, "session")))
+            begin = sessions.pop((e["src"], f_(e, "session")), None)
             if begin is not None:
-                activities.append((e["src"], "P", "PUT", begin, e["w"]))
+                activities.append((e["src"], "P保存session", "", begin, e["w"]))
+    for (src, _), begin in sessions.items():
+        activities.append((src, "P保存session", "截尾", begin, float("inf")))
 
-    def column_of(spike, src, column):
+    def cell_of(spike, src, column, label):
+        """The (column, label) of one activity, None when out of scope."""
+        if column == "copy_done":
+            if src == spike["src"] and label == "DECODE":
+                return column, ""
+            scope = "参与" if src in spike["ranks"] else "其他"
+            return "其他copy_done", scope + label
+        if column == "P保存session":
+            return column, label
         if column is not None:
-            return column
+            return (column, label) if src in spike["ranks"] else None
         if run.files[src].role != "decode":
-            return "P"
+            return "P", label
         if src == spike["src"]:
-            return "本进程GET"
+            return "本进程GET", label
         group = dp_group(run, src)
         same = group is not None and group == dp_group(run, spike["src"])
-        return "同组GET" if same else "其他组GET"
+        return ("同组GET" if same else "其他组GET"), label
 
     for spike in spikes:
-        per_process = defaultdict(float)
+        spans = defaultdict(list)
         for src, column, label, start, stop in activities:
-            overlap = min(stop, spike["hi"]) - max(start, spike["lo"])
-            if overlap > 0:
-                key = (column_of(spike, src, column), label, src)
-                per_process[key] += overlap / 1e6
+            if start < spike["hi"] and stop > spike["lo"]:
+                cell = cell_of(spike, src, column, label)
+                if cell is not None:
+                    spans[(*cell, src)].append((start, stop))
         cells = defaultdict(float)
-        for (name, label, _), value in per_process.items():
-            cells[(name, label)] = max(cells[(name, label)], value)
+        for (name, label, _), value in spans.items():
+            ms = covered(value, spike["lo"], spike["hi"]) / 1e6
+            cells[(name, label)] = max(cells[(name, label)], ms)
         spike["cells"] = cells
-        causes = {k: v for k, v in cells.items() if k[0] != "copy_done"}
-        name, label = max(causes, key=causes.get) if causes else ("未归因", "")
+        ranked = {k: v for k, v in cells.items() if k[0] not in SPIKE_UNRANKED}
+        name, label = max(ranked, key=ranked.get) if ranked else ("无", "")
         spike["top"] = f"{name}·{label}" if label else name
         spike["ms"] = (spike["hi"] - spike["lo"]) / 1e6
         spike["copy"] = cells.get(("copy_done", ""), 0.0)
@@ -1365,7 +1426,7 @@ def build_report(run):
         ]
         if p["unmatched"]:
             lines += [
-                "未匹配到本次客户端的 P 请求（不计入上表和比值）：",
+                "未匹配到本次客户端的 P 请求（不计入上表和比值的分母）：",
                 "",
                 table(
                     ["rid", "room", "EXTEND次数", "tokens", "开始 s"],
@@ -1378,6 +1439,26 @@ def build_report(run):
                             fmt(run.ms(u["start"]) / 1000, 3),
                         ]
                         for u in p["unmatched"]
+                    ],
+                ),
+                "",
+            ]
+        if p["conflicts"]:
+            lines += [
+                "身份冲突的 P 请求（同一 room 对应多个 P/D 身份或多个客户端请求，"
+                "无法确定归属，不计入上表和比值的分母）：",
+                "",
+                table(
+                    ["rid", "room", "P 身份", "D 身份", "客户端轮次"],
+                    [
+                        [
+                            c["rid"],
+                            c["room"],
+                            ",".join(c["prefill"]),
+                            ",".join(c["decode"]),
+                            ",".join(c["rounds"]) or "-",
+                        ]
+                        for c in p["conflicts"]
                     ],
                 ),
                 "",
@@ -1412,7 +1493,8 @@ def build_report(run):
             ]
         ratio = p["exists_count"] / p["admitted"] if p["admitted"] else 0
         lines += [
-            f"- owner 的 od.exists 次数 {p['exists_count']}，被执行的请求 {p['admitted']}，"
+            f"- owner 全窗口 od.exists 查询数 {p['exists_count']}（无请求身份，"
+            f"含未匹配请求的查询，无法逐请求过滤），匹配客户端的请求数 {p['admitted']}，"
             f"比值 {ratio:.2f}。只作排查信号：一个请求正常就会查询两次"
             "（handoff 前缀页、match 剩余前缀），比值大于 1 不等于重复查询；"
             "实施 C2 前须确认重复的是同一请求、同一查询区间。",
@@ -1423,7 +1505,7 @@ def build_report(run):
         }
         summary["prefill_exists_ratio"] = ratio
 
-    kinds, groups, steps = decode_step_section(run)
+    kinds, groups, steps = decode_step_section(run, full)
     lines += ["## 8. D 连续 decode 调度间隔（毫秒）", ""]
     if kinds:
         lines += [
@@ -1442,16 +1524,21 @@ def build_report(run):
     else:
         lines += ["没有 DECODE batch 记录。", ""]
 
-    spikes = decode_spike_section(run, steps)
+    spikes = decode_spike_section(full, steps)
     lines += ["## 8.1 D 尖峰与同时段活动（毫秒）", ""]
     if spikes is None:
         lines += ["跨机时钟未校准或没有持续 decode 样本，不计算。", ""]
     else:
         lines += [
             "最长的持续 decode 间隔；多个 rank 上时长相近且重叠的间隔算一个尖峰。"
-            "单元格是该列中单个进程的最大重叠时长，只表示同时发生，不证明因果。"
-            "copy_done 包含等待 forward 及其依赖，不计入主导项，单独看占比。"
-            "构建含打包和元数据上传；提交是 native 调用；等完成是调用返回后 I/O 仍在途的时间。",
+            "同进程同类区间先求并集，单元格取单个进程的最大覆盖时长；"
+            "只表示同时发生，“最大重叠活动”也不是根因。活动取自完整采集，不受窗口裁剪。"
+            "copy_done 只算“进程”列这个代表进程的 DECODE 等待，包含等待 forward 及其依赖；"
+            "其他 rank 或 IDLE 的等待列在“其他copy_done”；释放、输出、驱逐只看参与尖峰的 rank。"
+            "P保存session 是 uc.save.begin→session 完成的存续时间，含 forward 和排队，不是 PUT 执行。"
+            "这三列不参与最大重叠活动的排名。"
+            "构建含打包和元数据上传；提交是 native 调用；等完成是调用返回后 I/O 仍在途的时间；"
+            "“·截尾”表示采集结束时仍未完成，“未知”表示中间事件缺失。",
             "",
         ]
         tally = defaultdict(lambda: [0, 0])
@@ -1460,7 +1547,7 @@ def build_report(run):
             tally[spike["top"]][1] += int(spike["copy"] * 2 >= spike["ms"])
         lines += [
             table(
-                ["主导项", "尖峰数", "其中 copy_done ≥ 间隔一半"],
+                ["最大重叠活动", "尖峰数", "其中代表进程 copy_done ≥ 间隔一半"],
                 [
                     [k, a, b]
                     for k, (a, b) in sorted(tally.items(), key=lambda x: -x[1][0])
@@ -1477,7 +1564,9 @@ def build_report(run):
                     "同组GET",
                     "其他组GET",
                     "P",
+                    "P保存session",
                     "copy_done",
+                    "其他copy_done",
                     "释放",
                     "输出",
                     "驱逐",
@@ -1495,7 +1584,9 @@ def build_report(run):
                                 "同组GET",
                                 "其他组GET",
                                 "P",
+                                "P保存session",
                                 "copy_done",
+                                "其他copy_done",
                                 "释放",
                                 "输出",
                                 "驱逐",
@@ -1505,6 +1596,20 @@ def build_report(run):
                     for x in spikes
                 ],
             ),
+            "",
+        ]
+        stop = run.window[1] if run.window else float("inf")
+        pending = [
+            b
+            for b in get_phases(full)
+            if run.files[b["src"]].role == "decode"
+            and b["queue"] <= stop
+            and b.get("end", float("inf")) > stop
+        ]
+        queued = sum(b.get("wait", float("inf")) > stop for b in pending)
+        lines += [
+            f"- 统计结束时 D 侧 GET：仍在排队 {queued} 批，"
+            f"已取出未完成 {len(pending) - queued} 批。",
             "",
         ]
         summary["decode_spikes"] = {k: v[0] for k, v in tally.items()}
