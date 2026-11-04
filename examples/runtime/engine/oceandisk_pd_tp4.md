@@ -56,10 +56,10 @@ export MOONCAKE_IB_DEVICES=mlx5_1,mlx5_3,mlx5_5,mlx5_7,mlx5_9,mlx5_11,mlx5_13,ml
 
 ```bash
 export LOCAL_IP=141.111.65.134
-export MOONCAKE_IB_DEVICES=mlx5_3,mlx5_5,mlx5_7,mlx5_9,mlx5_11,mlx5_13,mlx5_15
+export MOONCAKE_IB_DEVICES=mlx5_2,mlx5_4,mlx5_6,mlx5_8,mlx5_10,mlx5_12,mlx5_14
 ```
 
-上述设备来自已有环境记录：132 有全部 16 个 mlx5 设备；134 未发现 mlx5_0／1，因此不沿用旧 decode 脚本的偶数列表。运行前用 `ibv_devices` 和 `nvidia-smi topo -m` 复核本机当前设备。GIDS 使用自己配置中的地址；Mooncake IB 列表不能替代 GIDS 配置。132 的 `gids_config_4.txt` 应已修正为 GID index 3，134 本地 `.200` 应已修正为 `.201`，以当前机器文件为准。
+上述设备来自已有环境记录：132 有全部 16 个 mlx5 设备；134 未发现 mlx5_0／1，偶数列表去掉 mlx5_0 后为 7 个。Mooncake 与 GIDS 分开网口：132 的 GIDS 用 port0（偶数），Mooncake 用奇数；134 的 GIDS 用 port1（奇数），Mooncake 用偶数。2026-11-04 前手册给 134 的是奇数列表，与 GIDS 共用 port1，按旧手册跑出的 134 结果可能受此影响。132 奇数到 134 偶数的跨机连通性尚未实测，双机前先用小流量验证。运行前用 `ibv_devices` 和 `nvidia-smi topo -m` 复核本机当前设备。GIDS 使用自己配置中的地址；Mooncake IB 列表不能替代 GIDS 配置。132 的 `gids_config_4.txt` 应已修正为 GID index 3，134 本地 `.200` 应已修正为 `.201`，以当前机器文件为准。
 
 脚本保留全部 8 卡可见，通过 `--base-gpu-id` 选卡；不要在外层改成 `CUDA_VISIBLE_DEVICES=4,5,6,7`，否则 native 选择 `gids_config_<GPU编号>.txt` 的编号会改变。
 
