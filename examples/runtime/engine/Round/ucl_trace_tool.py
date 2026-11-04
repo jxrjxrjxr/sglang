@@ -17,6 +17,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -113,6 +114,9 @@ class Run:
 
     def _index_requests(self):
         self.room_rid = {}
+        # P and D can hold different rids for one room; keep them per role.
+        self.room_role_rids = defaultdict(lambda: defaultdict(list))
+        self.rid_room = {}
         for e in self.events:
             room = (e.get("f") or {}).get("room")
             if (
@@ -126,6 +130,10 @@ class Run:
                 )
             ):
                 self.room_rid.setdefault(room, e["r"])
+                rids = self.room_role_rids[room][self.files[e["src"]].role]
+                if e["r"] not in rids:
+                    rids.append(e["r"])
+                self.rid_room.setdefault(e["r"], room)
 
     def _index_get_generations(self):
         """GET batch numbers restart after a linker reset (flush). Tag every
@@ -163,6 +171,16 @@ class Run:
             return r.split("@", 1)[0]
         room = (e.get("f") or {}).get("room")
         return self.room_rid.get(room)
+
+    def role_rids(self, room, role):
+        return self.room_role_rids[room][role] if room in self.room_role_rids else []
+
+    def peer_rids(self, rid):
+        """Every rid that shares this rid's room, itself included."""
+        room = self.rid_room.get(rid)
+        if room is None:
+            return [rid]
+        return [r for rids in self.room_role_rids[room].values() for r in rids]
 
     def ms(self, w):
         return (w - self.t0) / 1e6
@@ -512,10 +530,10 @@ def state_section(states):
 # ------------------------------------------------------------ storage ops
 
 
-def storage_section(run):
+def storage_section(run, role=None):
     by_thread = defaultdict(list)
     for e in run.events:
-        if e["n"].startswith("od."):
+        if e["n"].startswith("od.") and role in (None, run.files[e["src"]].role):
             by_thread[(e["src"], e["th"])].append(e)
     consumed = {}
     for e in run.events:
@@ -621,6 +639,45 @@ def storage_section(run):
                 )
     slow_batches.sort(key=lambda x: x[0], reverse=True)
     return get, put, native, native_wait, slow_batches[:10]
+
+
+GET_PHASES = (
+    ("排队", "queue", "wait"),
+    ("依赖等待", "wait", "build"),
+    ("构建", "build", "submit"),
+    ("提交", "submit", "io"),
+    ("等完成", "io", "end"),
+)
+
+
+def get_phases(run):
+    """Boundaries of every GET batch. 构建 covers ranges, packing and metadata
+    upload; 提交 is the native dispatch call; 等完成 is the I/O still running
+    after that call returned, until the worker sees the last layer event."""
+    enqueued = {
+        run.batch_key(e): e["w"] for e in run.events if e["n"] == "od.get.enqueue"
+    }
+    batches, current = [], {}
+    for e in run.events:
+        n, thread = e["n"], (e["src"], e["th"])
+        if n == "od.get.dequeue":
+            batch = dict(
+                src=e["src"], queue=enqueued.get(run.batch_key(e), e["w"]), wait=e["w"]
+            )
+            current[thread] = batch
+            batches.append(batch)
+        batch = current.get(thread)
+        if batch is None:
+            continue
+        if n == "od.get.dep_ready":
+            batch["build"] = e["w"]
+        elif n == "od.native" and f_(e, "op") == "get":
+            batch.setdefault("submit", e["w"])
+            batch["io"] = e["w"] + e["d"]
+        elif n == "od.get.done":
+            batch["end"] = e["w"]
+            del current[thread]
+    return batches
 
 
 # ----------------------------------------------------------------- notify
@@ -752,6 +809,7 @@ def prefill_section(run, server_round):
     owner = max(prefill, key=lambda s: (puts[s], -s))
     arrive, extends, rdma = {}, defaultdict(list), {}
     batches, exists = [], []
+    tail = defaultdict(int)
     for e in run.events:
         if e["src"] != owner:
             continue
@@ -763,21 +821,39 @@ def prefill_section(run, server_round):
             for r in f_(e, "rids") or ():
                 extends[r].append(e)
         elif n == "notify.rdma_done":
-            rid = run.rid_of(e)
-            if rid:
-                rdma.setdefault(rid, e["w"])
+            tail["完成事件"] += 1
+            rids = run.role_rids(f_(e, "room"), "prefill")
+            if len(rids) == 1:
+                rdma.setdefault(rids[0], e["w"])
+            else:
+                tail["身份冲突" if rids else "无P请求身份"] += 1
         elif n == "od.exists":
             exists.append(e)
     per_round = defaultdict(lambda: defaultdict(list))
+    unmatched = []
     for rid, evs in extends.items():
-        bucket = per_round[server_round.get(rid, "全部")]
         start, end = evs[0]["w"], evs[-1]["w"] + evs[-1].get("d", 0)
+        rounds = [server_round[r] for r in run.peer_rids(rid) if r in server_round]
+        if server_round and not rounds:
+            unmatched.append(
+                dict(
+                    rid=rid,
+                    room=run.rid_room.get(rid),
+                    extends=len(evs),
+                    tokens=sum(f_(e, "tokens", 0) for e in evs),
+                    start=start,
+                )
+            )
+            continue
+        bucket = per_round[rounds[0] if rounds else "全部"]
         if rid in arrive:
             bucket["P排队"].append((start - arrive[rid]) / 1e6)
         bucket["P执行跨度"].append((end - start) / 1e6)
         if rid in rdma:
+            tail["可算延迟"] += 1
             bucket["末次EXTEND结束→RDMA完成"].append((rdma[rid] - end) / 1e6)
         bucket["EXTEND次数"].append(len(evs))
+    tail["关联到请求"] = sum(rid in rdma for rid in extends)
     gaps = defaultdict(list)
     gap_exists = defaultdict(list)
     for prev, nxt in zip(batches, batches[1:]):
@@ -788,14 +864,26 @@ def prefill_section(run, server_round):
         gap_exists[label].append(
             sum(x.get("d", 0) for x in exists if lo <= x["w"] < hi) / 1e6
         )
-    admitted = len(extends)
+    admitted = len(extends) - len(unmatched)
+    exists_parts = defaultdict(list)
+    for e in exists:
+        for field, label in (
+            ("put_lock_ms", "等PUT锁"),
+            ("put_sync_ms", "等PUT流同步"),
+            ("native_ms", "native查询"),
+        ):
+            if f_(e, field) is not None:
+                exists_parts[label].append(f_(e, field))
     return dict(
         owner=run.files[owner].label,
         per_round=per_round,
         gaps=gaps,
         gap_exists=gap_exists,
         exists_count=len(exists),
+        exists_parts=exists_parts,
         admitted=admitted,
+        tail=tail,
+        unmatched=unmatched,
     )
 
 
@@ -828,6 +916,7 @@ def decode_step_section(run):
         gets[key[0]].append((start, float("inf")))
     kinds = defaultdict(list)
     groups = defaultdict(list)
+    steps = []
     for src, evs in by_src.items():
         prev, idle = None, False
         for e in evs:
@@ -842,9 +931,21 @@ def decode_step_section(run):
                 elif a & b:
                     kinds["持续decode"].append(interval)
                     lo, hi = prev["w"], e["w"]
+                    steps.append((src, lo, hi))
                     get = any(s < hi and t > lo for s, t in gets[src])
+                    other = any(
+                        s < hi and t > lo
+                        for peer, spans in gets.items()
+                        if peer != src
+                        for s, t in spans
+                    )
                     slow = any(lo <= w < hi for w in consensus[src])
-                    groups["GET在途" if get else "无GET在途"].append(interval)
+                    groups["本进程GET在途" if get else "本进程无GET在途"].append(
+                        interval
+                    )
+                    groups["其他D有GET在途" if other else "其他D无GET在途"].append(
+                        interval
+                    )
                     groups["有≥2ms consensus" if slow else "无≥2ms consensus"].append(
                         interval
                     )
@@ -852,7 +953,151 @@ def decode_step_section(run):
                 else:
                     kinds["无法判定"].append(interval)
             prev, idle = e, False
-    return kinds, groups
+    return kinds, groups, steps
+
+
+def dp_group(run, src):
+    match = re.search(r"DP(\d+)", run.files[src].label)
+    return match.group(1) if match else None
+
+
+def decode_spike_section(run, steps, top=20):
+    """The longest DECODE intervals with what overlapped them on this host.
+    One stall appears on every rank, so intervals of comparable length that
+    overlap are one spike. Each cell is the largest per-process overlap.
+    Overlap is correlation only: a GET on another rank may or may not be why
+    this rank waited."""
+    if run.cross_host or not steps:
+        return None
+    spikes = []
+    for src, lo, hi in sorted(steps, key=lambda s: s[1] - s[2]):
+        same = next((x for x in spikes if lo < x["hi"] and hi > x["lo"]), None)
+        if same is None:
+            if len(spikes) < top:
+                spikes.append(dict(src=src, lo=lo, hi=hi, ranks={src}))
+        elif (hi - lo) * 2 >= same["hi"] - same["lo"]:
+            same["ranks"].add(src)
+    activities = []  # (src, column or None for GET scope, label, start, end)
+    for batch in get_phases(run):
+        for label, start, end in GET_PHASES:
+            if start in batch:
+                stop = batch.get(end, batch.get("end", float("inf")))
+                activities.append((batch["src"], None, label, batch[start], stop))
+    columns = {
+        "sched.copy_done": "copy_done",
+        "sched.finish_release": "释放",
+        "sched.stream_output": "输出",
+        "pd.evict": "驱逐",
+    }
+    sessions = {}
+    for e in run.events:
+        role = run.files[e["src"]].role
+        if e["n"] in columns and role == "decode" and "d" in e:
+            activities.append((e["src"], columns[e["n"]], "", e["w"], e["w"] + e["d"]))
+        elif e["n"] == "uc.save.begin":
+            sessions[(e["src"], f_(e, "session"))] = e["w"]
+        elif e["n"] == "od.put.session_done":
+            begin = sessions.get((e["src"], f_(e, "session")))
+            if begin is not None:
+                activities.append((e["src"], "P", "PUT", begin, e["w"]))
+
+    def column_of(spike, src, column):
+        if column is not None:
+            return column
+        if run.files[src].role != "decode":
+            return "P"
+        if src == spike["src"]:
+            return "本进程GET"
+        group = dp_group(run, src)
+        same = group is not None and group == dp_group(run, spike["src"])
+        return "同组GET" if same else "其他组GET"
+
+    for spike in spikes:
+        per_process = defaultdict(float)
+        for src, column, label, start, stop in activities:
+            overlap = min(stop, spike["hi"]) - max(start, spike["lo"])
+            if overlap > 0:
+                key = (column_of(spike, src, column), label, src)
+                per_process[key] += overlap / 1e6
+        cells = defaultdict(float)
+        for (name, label, _), value in per_process.items():
+            cells[(name, label)] = max(cells[(name, label)], value)
+        spike["cells"] = cells
+        causes = {k: v for k, v in cells.items() if k[0] != "copy_done"}
+        name, label = max(causes, key=causes.get) if causes else ("未归因", "")
+        spike["top"] = f"{name}·{label}" if label else name
+        spike["ms"] = (spike["hi"] - spike["lo"]) / 1e6
+        spike["copy"] = cells.get(("copy_done", ""), 0.0)
+    return spikes
+
+
+def spike_cell(spike, column):
+    parts = [
+        f"{label + ' ' if label else ''}{value:.0f}"
+        for (name, label), value in sorted(
+            spike["cells"].items(), key=lambda item: -item[1]
+        )
+        if name == column
+    ]
+    return "；".join(parts) or "-"
+
+
+def decode_cache_section(run, server_round):
+    """Per round: D prefix hit at admission and logical pages to restore,
+    from one representative rank per request (page ranges merged across layer
+    groups), and GET work over all ranks in page-layers, which is not a miss
+    count. Evictions per DP group, from its lowest rank, by round window; a
+    time inside two windows is listed apart instead of being counted twice."""
+    first, need, work, evicts = {}, defaultdict(list), defaultdict(int), []
+    tags, windows = {}, {}
+    for e in run.events:
+        n, src = e["n"], e["src"]
+        if n == "client.send":
+            tags[e["r"]] = str(f_(e, "tag", e["r"])).split("-", 1)[0]
+            lo, hi = windows.get(tags[e["r"]], (e["w"], e["w"]))
+            windows[tags[e["r"]]] = (min(lo, e["w"]), hi)
+        elif n == "client.end" and e.get("r") in tags:
+            lo, hi = windows[tags[e["r"]]]
+            windows[tags[e["r"]]] = (lo, max(hi, e["w"]))
+        elif run.files[src].role != "decode":
+            continue
+        elif n == "pd.prealloc" and e.get("r") not in first:
+            first[e["r"]] = (
+                src,
+                f_(e, "local_prefix", 0),
+                f_(e, "decode_prefix_len", 0),
+            )
+        elif n == "linker.load_submit":
+            rid = run.rid_of(e)
+            pages, layers = f_(e, "pages"), f_(e, "layers")
+            work[rid] += (pages[1] - pages[0]) * (layers[1] - layers[0])
+            if rid in first and first[rid][0] == src:
+                need[rid] = merge_range(need[rid], *pages)
+        elif n == "pd.evict":
+            evicts.append(e)
+    rounds = defaultdict(lambda: defaultdict(list))
+    for rid, (_, hit, prefix) in first.items():
+        bucket = rounds[server_round.get(rid, "未匹配")]
+        bucket["hit"].append(hit)
+        bucket["prefix"].append(prefix)
+        bucket["need"].append(sum(b - a for a, b in need[rid]))
+        bucket["work"].append(work[rid])
+    leaders = {}
+    for e in evicts:
+        group = dp_group(run, e["src"])
+        leaders[group] = min(leaders.get(group, e["src"]), e["src"])
+    evicted = defaultdict(lambda: [0, 0, 0.0])
+    for e in evicts:
+        group = dp_group(run, e["src"])
+        if e["src"] != leaders[group]:
+            continue
+        inside = [r for r, (lo, hi) in windows.items() if lo <= e["w"] <= hi]
+        where = inside[0] if len(inside) == 1 else ("交叠" if inside else "轮次外")
+        row = evicted[(where, group)]
+        row[0] += 1
+        row[1] += f_(e, "freed", 0)
+        row[2] += e.get("d", 0) / 1e6
+    return rounds, evicted
 
 
 # ----------------------------------------------------------------- report
@@ -992,7 +1237,11 @@ def build_report(run):
         "“worker观察完成”是 worker 线程等到 CUDA event 后的时间，不等于设备完成时间。",
         "",
     ]
-    rows = [["GET " + k, *dist_cells(v)] for k, v in get.items()]
+    rows = [
+        [f"GET {name} {k}", *dist_cells(v)]
+        for role, name in (("prefill", "P"), ("decode", "D"))
+        for k, v in storage_section(run, role)[0].items()
+    ] or [["GET " + k, *dist_cells(v)] for k, v in get.items()]
     rows += [["PUT " + k, *dist_cells(v)] for k, v in put.items()]
     rows += [[f"native {op} 调用", *dist_cells(v)] for op, v in native.items()]
     rows += [
@@ -1107,6 +1356,32 @@ def build_report(run):
                 if b.get(name):
                     rows.append([rnd, name, *dist_cells(b[name])])
         lines += [table(["轮", "阶段", "次数", "p50", "p99", "max"], rows), ""]
+        tail = p["tail"]
+        lines += [
+            f"- RDMA 完成事件 {tail['完成事件']}，关联到 P 请求 {tail['关联到请求']}，"
+            f"其中可算 tail 延迟 {tail['可算延迟']}；身份冲突 {tail['身份冲突']}，"
+            f"无 P 请求身份 {tail['无P请求身份']}。",
+            "",
+        ]
+        if p["unmatched"]:
+            lines += [
+                "未匹配到本次客户端的 P 请求（不计入上表和比值）：",
+                "",
+                table(
+                    ["rid", "room", "EXTEND次数", "tokens", "开始 s"],
+                    [
+                        [
+                            u["rid"],
+                            u["room"],
+                            u["extends"],
+                            u["tokens"],
+                            fmt(run.ms(u["start"]) / 1000, 3),
+                        ]
+                        for u in p["unmatched"]
+                    ],
+                ),
+                "",
+            ]
         rows = []
         for label in ("有请求在等", "无请求在等"):
             if p["gaps"].get(label):
@@ -1125,6 +1400,16 @@ def build_report(run):
                 table(["间隙", "次数", "p50", "p99", "max"], rows),
                 "",
             ]
+        if p["exists_parts"]:
+            lines += [
+                "od.exists 分段：",
+                "",
+                table(
+                    ["分段", "次数", "p50", "p99", "max"],
+                    [[k, *dist_cells(v)] for k, v in p["exists_parts"].items()],
+                ),
+                "",
+            ]
         ratio = p["exists_count"] / p["admitted"] if p["admitted"] else 0
         lines += [
             f"- owner 的 od.exists 次数 {p['exists_count']}，被执行的请求 {p['admitted']}，"
@@ -1138,7 +1423,7 @@ def build_report(run):
         }
         summary["prefill_exists_ratio"] = ratio
 
-    kinds, groups = decode_step_section(run)
+    kinds, groups, steps = decode_step_section(run)
     lines += ["## 8. D 连续 decode 调度间隔（毫秒）", ""]
     if kinds:
         lines += [
@@ -1156,6 +1441,123 @@ def build_report(run):
         summary["decode_steps"] = {k: dist(v) for k, v in {**kinds, **groups}.items()}
     else:
         lines += ["没有 DECODE batch 记录。", ""]
+
+    spikes = decode_spike_section(run, steps)
+    lines += ["## 8.1 D 尖峰与同时段活动（毫秒）", ""]
+    if spikes is None:
+        lines += ["跨机时钟未校准或没有持续 decode 样本，不计算。", ""]
+    else:
+        lines += [
+            "最长的持续 decode 间隔；多个 rank 上时长相近且重叠的间隔算一个尖峰。"
+            "单元格是该列中单个进程的最大重叠时长，只表示同时发生，不证明因果。"
+            "copy_done 包含等待 forward 及其依赖，不计入主导项，单独看占比。"
+            "构建含打包和元数据上传；提交是 native 调用；等完成是调用返回后 I/O 仍在途的时间。",
+            "",
+        ]
+        tally = defaultdict(lambda: [0, 0])
+        for spike in spikes:
+            tally[spike["top"]][0] += 1
+            tally[spike["top"]][1] += int(spike["copy"] * 2 >= spike["ms"])
+        lines += [
+            table(
+                ["主导项", "尖峰数", "其中 copy_done ≥ 间隔一半"],
+                [
+                    [k, a, b]
+                    for k, (a, b) in sorted(tally.items(), key=lambda x: -x[1][0])
+                ],
+            ),
+            "",
+            table(
+                [
+                    "时间 s",
+                    "间隔",
+                    "rank数",
+                    "进程",
+                    "本进程GET",
+                    "同组GET",
+                    "其他组GET",
+                    "P",
+                    "copy_done",
+                    "释放",
+                    "输出",
+                    "驱逐",
+                ],
+                [
+                    [
+                        fmt(run.ms(x["lo"]) / 1000, 3),
+                        fmt(x["ms"]),
+                        len(x["ranks"]),
+                        run.files[x["src"]].label,
+                        *(
+                            spike_cell(x, column)
+                            for column in (
+                                "本进程GET",
+                                "同组GET",
+                                "其他组GET",
+                                "P",
+                                "copy_done",
+                                "释放",
+                                "输出",
+                                "驱逐",
+                            )
+                        ),
+                    ]
+                    for x in spikes
+                ],
+            ),
+            "",
+        ]
+        summary["decode_spikes"] = {k: v[0] for k, v in tally.items()}
+
+    rounds, evicted = decode_cache_section(run, server_round)
+    lines += ["## 8.2 D 命中与恢复量", ""]
+    if rounds:
+        lines += [
+            "命中和需恢复页取每个请求的一个代表 rank，需恢复页跨层组去重；"
+            "GET 工作量是全部 rank 的“页×层”之和，含层组重复和 rank 重复，不是未命中数。",
+            "",
+            table(
+                [
+                    "轮",
+                    "请求数",
+                    "准入命中 token p50",
+                    "前缀 token p50",
+                    "需恢复逻辑页 p50",
+                    "GET 页×层 合计",
+                ],
+                [
+                    [
+                        rnd,
+                        len(b["hit"]),
+                        fmt(pct(b["hit"], 50), 0),
+                        fmt(pct(b["prefix"], 50), 0),
+                        fmt(pct(b["need"], 50), 0),
+                        sum(b["work"]),
+                    ]
+                    for rnd, b in sorted(
+                        rounds.items(), key=lambda x: (len(x[0]), x[0])
+                    )
+                ],
+            ),
+            "",
+        ]
+    else:
+        lines += ["没有 pd.prealloc 事件。", ""]
+    if evicted:
+        lines += [
+            "驱逐（每个 DP 组取一个 rank，按轮次时间窗统计，不归给单个请求）：",
+            "",
+            table(
+                ["轮", "DP组", "次数", "实际释放 token", "耗时合计 ms"],
+                [
+                    [where, group, a, b, fmt(c)]
+                    for (where, group), (a, b, c) in sorted(
+                        evicted.items(), key=lambda x: (len(x[0][0]), str(x[0]))
+                    )
+                ],
+            ),
+            "",
+        ]
 
     if full.window is None and run.window is not None:
         lo, hi = run.window

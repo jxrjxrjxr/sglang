@@ -743,13 +743,150 @@ class TestReport(unittest.TestCase):
                     dec(530, ["c"]),  # no shared rid: undecidable, kept
                 ],
             )
-            kinds, groups = tool.decode_step_section(tool.Run(tmp))
+            kinds, groups, steps = tool.decode_step_section(tool.Run(tmp))
+            self.assertEqual(len(steps), 2)
             self.assertEqual(kinds["持续decode"], [30.0, 30.0])
             self.assertEqual(kinds["含空闲"], [440.0])
             self.assertEqual(kinds["无法判定"], [30.0])
-            self.assertEqual(groups["GET在途"], [30.0])
+            self.assertEqual(groups["本进程GET在途"], [30.0])
+            self.assertEqual(groups["其他D无GET在途"], [30.0, 30.0])
             self.assertEqual(groups["有≥2ms consensus"], [30.0])
             self.assertEqual(groups["有新请求加入"], [30.0])
+
+    def test_p_and_d_rids_join_by_room_regardless_of_event_order(self):
+        for decode_first in (False, True):
+            with self.subTest(
+                decode_first=decode_first
+            ), tempfile.TemporaryDirectory() as tmp:
+                offset = 10 if decode_first else 0
+                write_trace(
+                    tmp,
+                    "p",
+                    "prefill",
+                    [
+                        (offset, "req.arrive", "p-rid", dict(room=1)),
+                        (
+                            offset + 1,
+                            "sched.run_batch",
+                            None,
+                            dict(mode="EXTEND", rids=["p-rid"]),
+                            5,
+                        ),
+                        (
+                            offset + 2,
+                            "sched.run_batch",
+                            None,
+                            dict(mode="EXTEND", rids=["health"], tokens=4),
+                            1,
+                        ),
+                        (offset + 9, "notify.rdma_done", None, dict(room=1)),
+                    ],
+                )
+                write_trace(
+                    tmp, "d", "decode", [(5, "req.arrive", "d-rid", dict(room=1))]
+                )
+                p = tool.prefill_section(tool.Run(tmp), {"d-rid": "r1"})
+                self.assertEqual(p["per_round"]["r1"]["末次EXTEND结束→RDMA完成"], [3.0])
+                self.assertNotIn("全部", p["per_round"])
+                self.assertEqual(p["admitted"], 1)
+                self.assertEqual([u["rid"] for u in p["unmatched"]], ["health"])
+                self.assertEqual(
+                    (
+                        p["tail"]["完成事件"],
+                        p["tail"]["关联到请求"],
+                        p["tail"]["可算延迟"],
+                    ),
+                    (1, 1, 1),
+                )
+
+    def test_get_phases_keep_submit_apart_from_io_after_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trace(
+                tmp,
+                "d",
+                "decode",
+                [
+                    (0, "od.get.enqueue", None, dict(batch=0, tags=[], pages=[1])),
+                    (1, "od.get.dequeue", None, dict(batch=0), None, 2),
+                    (2, "od.get.dep_ready", None, dict(batch=0), None, 2),
+                    (10, "od.native", None, dict(op="get"), 1, 2),
+                    (50, "od.get.done", None, dict(batch=0, ok=True), None, 2),
+                ],
+            )
+            batch = tool.get_phases(tool.Run(tmp))[0]
+            ms = {
+                label: (batch[end] - batch[start]) / 1e6
+                for label, start, end in tool.GET_PHASES
+            }
+            self.assertEqual(
+                ms, {"排队": 1, "依赖等待": 1, "构建": 8, "提交": 1, "等完成": 39}
+            )
+
+    def test_spike_merges_ranks_and_attributes_other_group_get(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dec = lambda t: (  # noqa: E731
+                t,
+                "sched.run_batch",
+                None,
+                dict(mode="DECODE", rids=["a"]),
+                1,
+            )
+            stalled = [dec(0), dec(25), dec(725), dec(750)]
+            write_trace(
+                tmp,
+                "scheduler_DP0_TP0",
+                "decode",
+                [*stalled, (100, "sched.copy_done", None, dict(mode="DECODE"), 600)],
+            )
+            write_trace(tmp, "scheduler_DP0_TP1", "decode", stalled)
+            write_trace(
+                tmp,
+                "scheduler_DP1_TP2",
+                "decode",
+                [
+                    *stalled,
+                    (30, "od.get.dequeue", None, dict(batch=0), None, 2),
+                    (31, "od.get.dep_ready", None, dict(batch=0), None, 2),
+                    (531, "od.native", None, dict(op="get"), 1, 2),
+                    (600, "od.get.done", None, dict(batch=0, ok=True), None, 2),
+                ],
+            )
+            run = tool.Run(tmp)
+            spikes = tool.decode_spike_section(
+                run, tool.decode_step_section(run)[2], top=1
+            )
+            self.assertEqual(len(spikes), 1)
+            self.assertEqual(len(spikes[0]["ranks"]), 3)
+            self.assertEqual(spikes[0]["ms"], 700)
+            self.assertEqual(spikes[0]["top"], "其他组GET·构建")
+            self.assertEqual(spikes[0]["copy"], 600)
+
+    def test_decode_cache_keeps_logical_pages_apart_from_get_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = [
+                (
+                    1,
+                    "pd.prealloc",
+                    "a",
+                    dict(room=1, local_prefix=64, decode_prefix_len=640),
+                ),
+                (2, "linker.load_submit", "a@1:0", dict(pages=[1, 5], layers=[0, 50])),
+                (
+                    3,
+                    "linker.load_submit",
+                    "a@1:50",
+                    dict(pages=[1, 5], layers=[50, 61]),
+                ),
+                (4, "pd.evict", "a", dict(wanted=8, freed=16), 2),
+            ]
+            write_trace(tmp, "scheduler_DP0_TP0", "decode", events)
+            write_trace(tmp, "scheduler_DP0_TP1", "decode", events)
+            run = tool.Run(tmp)
+            rounds, evicted = tool.decode_cache_section(run, {"a": "r1"})
+            self.assertEqual(rounds["r1"]["hit"], [64])
+            self.assertEqual(rounds["r1"]["need"], [4])
+            self.assertEqual(rounds["r1"]["work"], [2 * 4 * 61])
+            self.assertEqual(evicted[("轮次外", "0")], [1, 16, 2.0])
 
 
 if __name__ == "__main__":
