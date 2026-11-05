@@ -1889,6 +1889,13 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        if ucl_trace.ON and is_cuda():
+            ucl_trace.gpu_streams(
+                "scheduler",
+                forward=self.forward_stream,
+                schedule=self.schedule_stream,
+                copy=getattr(self, "copy_stream", None),
+            )
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)

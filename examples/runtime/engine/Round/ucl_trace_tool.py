@@ -1129,6 +1129,37 @@ def spike_cell(spike, column):
     return "；".join(parts) or "-"
 
 
+STREAM_NAMES = ("forward", "schedule", "copy", "get", "put")
+
+
+def stream_section(run):
+    """CUDA streams per process from the startup record. Two names on one
+    handle are the same stream, so the second serializes behind the first.
+    Different handles can still share a hardware queue, which no event shows."""
+    streams, limits = defaultdict(dict), {}
+    for e in run.events:
+        if e["n"] == "gpu.streams":
+            streams[e["src"]].update(f_(e, "streams") or {})
+            limits[e["src"]] = f_(e, "max_connections")
+    rows, aliased = [], []
+    for src in sorted(streams):
+        by_handle = defaultdict(list)
+        for name in STREAM_NAMES:
+            if name in streams[src]:
+                by_handle[streams[src][name][1]].append(name)
+        same = [names for names in by_handle.values() if len(names) > 1]
+        aliased += [(src, names) for names in same]
+        rows.append(
+            [
+                run.files[src].label,
+                limits[src],
+                *(streams[src].get(name, ["-", "-"])[0] for name in STREAM_NAMES),
+                "；".join("=".join(names) for names in same) or "无",
+            ]
+        )
+    return rows, aliased
+
+
 def decode_cache_section(run, server_round):
     """Per round: D prefix hit at admission and logical pages to restore,
     from one representative rank per request (page ranges merged across layer
@@ -1645,6 +1676,20 @@ def build_report(run):
             "",
         ]
         summary["decode_spikes"] = {k: v[0] for k, v in tally.items()}
+
+    rows, aliased = stream_section(full)
+    lines += ["## 8.3 GPU 流身份", ""]
+    if rows:
+        lines += [
+            "启动时记录的 stream_id。重合列为同一条流，后者必然排在前者之后；"
+            "不重合也可能共用硬件队列，这需要对比不同 CUDA_DEVICE_MAX_CONNECTIONS 的结果。",
+            "",
+            table(["进程", "连接上限", *STREAM_NAMES, "重合"], rows),
+            "",
+        ]
+        summary["stream_aliases"] = len(aliased)
+    else:
+        lines += ["没有 gpu.streams 记录。", ""]
 
     rounds, evicted = decode_cache_section(run, server_round)
     lines += ["## 8.2 D 命中与恢复量", ""]

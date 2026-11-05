@@ -282,6 +282,8 @@ export OD_STORAGE_CONFIG="{\"namespace\":\"${OD_NAMESPACE}\",\"layerwise_save\":
 
 D 单次 GET 默认最多 256 页（`SGLANG_DISAGGREGATION_LINKER_LOAD_PAGES`），大范围分片读回，片间让 forward 推进；设为 0 恢复一次读完，用于 A/B。
 
+验证 D 的 GET 是否与 forward 共用硬件队列：P、D 启动前 `export CUDA_DEVICE_MAX_CONNECTIONS=32`（默认 8），其他条件不变，对比持续 decode 间隔 p99；报告第 8.3 节列出各条 GPU 流。
+
 默认旧超时均为 600，watchdog3600。长队列实验在两端启动前覆盖：
 
 ```bash

@@ -304,6 +304,22 @@ class TestRecorder(unittest.TestCase):
                 module.gpu_span("gpu.get", Event(102.0), Event(110.0), pages=1)
             self.assertEqual(records[0][:3], (7_000_000, 8_000_000, "gpu.get"))
 
+    def test_gpu_streams_records_ids_and_skips_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load(
+                RECORDER,
+                "ucl_streams",
+                {"SGLANG_UCL_TRACE": "1", "SGLANG_UCL_TRACE_DIR": tmp},
+            )
+            records = []
+            module._push = records.append
+            stream = SimpleNamespace(stream_id=3, cuda_stream=255)
+            with patch.dict(os.environ, {"CUDA_DEVICE_MAX_CONNECTIONS": "32"}):
+                module.gpu_streams("test", get=stream, copy=None)
+            fields = records[0][5]
+            self.assertEqual(fields["streams"], {"get": [3, "0xff"]})
+            self.assertEqual(fields["max_connections"], "32")
+
     def test_no_file_without_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {"SGLANG_UCL_TRACE": "1", "SGLANG_UCL_TRACE_DIR": tmp}
@@ -1047,6 +1063,31 @@ class TestReport(unittest.TestCase):
             p = tool.prefill_section(tool.Run(tmp), {"client": "r1"})
             self.assertFalse(p["conflicts"])
             self.assertEqual([u["rid"] for u in p["unmatched"]], ["HEALTH_CHECK_a"])
+
+    def test_stream_section_reports_aliased_streams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = dict(
+                owner="scheduler",
+                max_connections="8",
+                streams={"forward": [1, "0xa"], "copy": [2, "0xb"]},
+            )
+            storage = dict(
+                owner="oceandisk",
+                max_connections="8",
+                streams={"get": [1, "0xa"], "put": [3, "0xc"]},
+            )
+            write_trace(
+                tmp,
+                "d",
+                "decode",
+                [
+                    (0, "gpu.streams", None, storage),
+                    (1, "gpu.streams", None, scheduler),
+                ],
+            )
+            rows, aliased = tool.stream_section(tool.Run(tmp))
+            self.assertEqual(rows, [["d", "8", 1, "-", 2, 1, 3, "forward=get"]])
+            self.assertEqual(len(aliased), 1)
 
     def test_get_spans_mark_missing_boundaries_unknown(self):
         batch = dict(src=0, queue=0, wait=1, end=9)

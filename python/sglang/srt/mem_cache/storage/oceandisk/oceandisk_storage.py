@@ -250,6 +250,10 @@ class OceanDiskStorage(HiCacheStorage):
             self._ops = torch.ops.my_ops
             self._get_stream = torch.cuda.Stream(device=self.device)
             self._put_stream = torch.cuda.Stream(device=self.device)
+            if ucl_trace.ON:
+                ucl_trace.gpu_streams(
+                    "oceandisk", get=self._get_stream, put=self._put_stream
+                )
             self._output = torch.zeros(2, dtype=torch.int64, device=self.device)
             addresses, lengths = zip(*self.regions)
             # Match the old controller's MR extension for direct padded I/O.

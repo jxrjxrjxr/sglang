@@ -114,6 +114,20 @@ def gpu_span(name, start, end, **fields):
     _push((start_ns, duration, name, None, threading.get_ident(), fields or None))
 
 
+def gpu_streams(owner, **streams):
+    """Record which CUDA streams this process uses, so aliased ones show up."""
+    emit(
+        "gpu.streams",
+        owner=owner,
+        max_connections=os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"),
+        streams={
+            name: [stream.stream_id, hex(stream.cuda_stream)]
+            for name, stream in streams.items()
+            if stream is not None
+        },
+    )
+
+
 def set_identity(role, label=None, **fields):
     """Name this process (e.g. role=prefill, label=scheduler_DP0_TP0)."""
     global _identity
