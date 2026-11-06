@@ -1,6 +1,6 @@
 # OceanDisk notify 运行指南（单机 4P4D／双机 8P8D）
 
-更新：2026-11-04（namespace 单列，Round 不再等待 flush）。分支 `dev_oceandisk_linker_pd_notify`，参数对齐实现基于 `9dc1fcf964`，本版包含独立 P／D／router 入口及 D DP 支持。两机按第 2 节拉取 notify 分支最新提交，并记录实际提交和工作区 diff。**GPU、RDMA、GIDS 及双机实测仍待验证。**两台机器继续使用 `/home/j00977581/sglang-pd`，复用已准备的环境、模型和 GIDS 库。
+更新：2026-11-06（双机改用 `dual_node_pd/` 固定脚本，直接运行，不用 export 和 `OD_NAMESPACE`，见第 4 节；第 2、3 节及其余单机内容不变）。分支 `dev_oceandisk_linker_pd_notify`，参数对齐实现基于 `9dc1fcf964`，本版包含独立 P／D／router 入口及 D DP 支持。两机按第 2 节拉取 notify 分支最新提交，并记录实际提交和工作区 diff。**GPU、RDMA、GIDS 及双机实测仍待验证。**两台机器继续使用 `/home/j00977581/sglang-pd`，复用已准备的环境、模型和 GIDS 库。
 
 ## 1. 五个入口与固定行为
 
@@ -11,6 +11,8 @@
 | `run_oceandisk_router.sh` | 一条 router 命令；P/D 地址独立 |
 | `Round/run_rounds.py` | 基于 `D:\CodeSpace\LLMTest\Round`，保留原 TTFT／缓存统计口径；增加 TPOT；轮间不暂停、不清缓存，直接跑完 |
 | `Round/run_rounds.sh` | 只有 `python3 run_rounds.py` 与参数；16000 起步、每轮 +16000、输出上限 16、10 会话 × 10 轮（约 16K→160K） |
+
+以上五个入口用于单机和单项对照。132 P＋134 D 双机用 `dual_node_pd/` 下的固定脚本，见第 4 节。
 
 服务脚本不启动其他服务、不等待健康检查、不清理进程、不运行压测。先在三个终端启动 P、D、router，再用第四个终端跑 Round。前台服务用 Ctrl+C 停止；需要后台日志时使用第 5 节的外部命令。
 
@@ -132,25 +134,66 @@ P、D 的 dist-init 分别为本机 `:31500`、`:31501`。等待日志完成加�
 
 ## 4. 双机：132 P＋134 D/router
 
-两边各完成第 2 节和第 2.1 节，namespace 完全相同。先确认两机同版本代码、模型和 GIDS 动态库；本地 RDMA 地址、GID、物理 GPU 编号各自正确。
+双机用 `dual_node_pd/` 下的四个 sh，所有取值都写在脚本里，**不用 export、不用第 2、2.1 节的变量，也不再用 `OD_NAMESPACE`**。需要改参数时直接改脚本里的那一行。
 
-132 P 终端：
+容器不限于 `j00977581_pd`，任何人起的 0.5.20 容器都可以，只要满足：`--gpus all --network host --ipc host --privileged --ulimit memlock=-1`，并挂载 `/home:/home`。代码固定在 `/home/j00977581/sglang-pd`，它在 `PYTHONPATH` 里优先于镜像自带的 sglang。
 
-```bash
-TP_SIZE=8 BASE_GPU_ID=0 sh "$ENGINE/run_oceandisk_prefill.sh"
-```
-
-134 D 终端：
+132，一个终端：
 
 ```bash
-TP_SIZE=8 DP_SIZE=4 BASE_GPU_ID=0 sh "$ENGINE/run_oceandisk_decode.sh"
+cd /home/j00977581/sglang-pd
+git pull --ff-only mine dev_oceandisk_linker_pd_notify
+sh examples/runtime/engine/dual_node_pd/run_prefill.sh
 ```
 
-134 Router 终端：
+134，D 终端：
 
 ```bash
-PREFILL_IP=141.111.65.132 DECODE_IP=141.111.65.134 sh "$ENGINE/run_oceandisk_router.sh"
+cd /home/j00977581/sglang-pd
+git pull --ff-only mine dev_oceandisk_linker_pd_notify
+sh examples/runtime/engine/dual_node_pd/run_decode.sh
 ```
+
+134，router 终端（D 启动之后）：
+
+```bash
+cd /home/j00977581/sglang-pd
+sh examples/runtime/engine/dual_node_pd/run_router.sh
+```
+
+134，client 终端（等下面的 readiness 返回成功）：
+
+```bash
+cd /home/j00977581/sglang-pd
+curl --noproxy '*' -fsS http://127.0.0.1:31345/readiness
+sh examples/runtime/engine/dual_node_pd/run_rounds.sh
+```
+
+| 脚本 | 机器 | 固定内容 |
+|---|---|---|
+| `dual_node_pd/run_prefill.sh` | 132 | P：GPU0–7、TP8、CP8、DP1；Mooncake 用奇数网卡；GIDS 配置 `cfg_fbs-h20-01` |
+| `dual_node_pd/run_decode.sh` | 134 | D：GPU0–7、TP8、DP4、attention TP2；Mooncake 用偶数网卡；GIDS 配置 `cfg_fbs-h20-02`；`LOAD_PAGES=0` |
+| `dual_node_pd/run_router.sh` | 134 | router：P `132:31002`，bootstrap 31145；D `134:31001`；监听 31345 |
+| `dual_node_pd/run_rounds.sh` | 134 | Round：16000 起步、每轮 +16000、输出上限 16、10 会话 × 10 轮 |
+
+P、D 都开 `SGLANG_UCL_TRACE=1` 和 `SGLANG_UCL_TRACE_GPU=1`，这是 run03 的打点条件。连接数保持默认 8。
+
+**日志。** P、D 每次启动在本机建 `/home/j00977581/pd_logs/<月日时分>/`（如 `11061644`），并让 `/home/j00977581/pd_logs/latest` 指向它。两台机器各用各的目录，目录名按各自的启动时间，不要求相同。
+
+| 机器 | 目录内容 | 生成时机 |
+|---|---|---|
+| 132 | `prefill.log`、`commit.txt`、`gids_lib.sha256`、P 的 trace `*.jsonl`；`report.md`、`summary.json`、`trace.json` | report 在 P 上按 Ctrl+C 退出后生成，只含 P 的事件 |
+| 134 | `decode.log`、`router.log`、`client.log`、`rounds.json`、`conversations/`、`commit.txt`、`gids_lib.sha256`、D 和客户端的 trace `*.jsonl`；`report.md`、`summary.json`、`trace.json` | report 在 Round 结束后自动生成，含 D 和客户端的事件 |
+
+- 134 的 router、Round 写入 `latest`，所以**先起 D，再起 router 和 Round**。
+- 重跑 Round 前重启 D：否则新旧 trace 进同一个目录、`rounds.json` 被覆盖。重启 P 同理。
+- 132 的 P 不是用 Ctrl+C 退出时，手动生成：`python3 /home/j00977581/sglang-pd/examples/runtime/engine/Round/ucl_trace_tool.py report /home/j00977581/pd_logs/latest`。
+- 想看 P、D 合在一张报告里：把 132 目录的 `*.jsonl` 拷到 134 的一个新目录（连同 134 的 `*.jsonl`），再对新目录跑上面的 report；跨机差值不计算。
+
+**namespace。** 脚本的存储配置不带 `namespace`：原生层用 GIDS 库编译时固定的 ns id（`g_kvnsid`、`g_kvnsid_index`），每次都一样，不刷新。SGLang 的 key 哈希退回模型路径，两端都是 `/home/models/GLM-5.2-W4AFP8/`，因此 P、D 的 key 一致；改模型路径时两个脚本要一起改。
+
+- 两机必须是同一份 GIDS 库：对比两边目录下的 `gids_lib.sha256`，不同就可能各写各的 ns。
+- 存储上的旧数据不再被 namespace 隔开。Round 默认每次随机取语料，新旧前缀不会撞上；**加 `--use-fix-prompt` 重跑相同文本时，P 可能命中上一次写入的数据**，TTFT 不再是冷启动口径。
 
 这是两个独立 TP8 实例。P dist-init 是 `141.111.65.132:31500`，D 是 `141.111.65.134:31501`，不是跨两机的 TP16。两端要能访问服务/bootstrap 和 Mooncake 建立的数据／控制连接；仅 HTTP 端口通不能证明 RDMA 正常。
 
@@ -160,7 +203,7 @@ PREFILL_IP=141.111.65.132 DECODE_IP=141.111.65.134 sh "$ENGINE/run_oceandisk_rou
 - 132 的 `.10/.12/.14/.16` 与 134 的 `.11/.13/.15/.17` 是不同存储端口。P/D 必须有一致的逻辑 DPU 集合／hash ring，并验证跨端口共享 key 空间及 PUT 完成后 GET 可见。
 - 同 key 可能从同一 DPU 的不同连接读取；即使单机，也需确认该 DPU 的端口间可见性。单连接成功不能替代多连接验证。
 
-先用小请求、固定 namespace、tail=0 验证 P PUT→READY→D GET，再清 D 重复读回；逐个 DP 组核对日志、输出和 native 完成状态。双机先跑同拓扑原生 Mooncake 小请求排除网络问题，再启用 notify。不满足跨端口可见性时先停在诊断阶段，不运行十轮长负载。
+**双机路径尚未实测。**先用小请求、tail=0 验证 P PUT→READY→D GET，再清 D 重复读回；逐个 DP 组核对日志、输出和 native 完成状态。双机先跑同拓扑原生 Mooncake 小请求排除网络问题，再启用 notify。不满足跨端口可见性时先停在诊断阶段，不运行十轮长负载。
 
 ## 5. 健康检查、外部后台运行与停止
 
@@ -387,7 +430,7 @@ sed '/^  --disaggregation-linker-notify /d; /^  --enable-unified-cache-external-
    export SGLANG_UCL_TRACE=1
    ```
 
-   双机时每台机器写本地同名目录，结束后把 132 的目录拷到 134 再合并；报告会标注“跨机未校准”，不计算跨机差值。
+   `dual_node_pd/` 的脚本已自带开关和目录，不用设置，目录与报告位置见第 4 节。合并两机报告时，工具标注“跨机未校准”，不计算跨机差值。
 
 2. 照常 `sh run_rounds.sh`。结束后自动等待3秒并生成 `report.md`、`trace.json`、`summary.json`。客户端会给每个请求传 `rid=r<轮>-<序号>-<随机>`；若 router 拒绝该字段，设 `SGLANG_UCL_TRACE_CLIENT_RID=0`（仍记录客户端时间，但无法与服务端按 rid 关联）。自动报告在 P/D 仍运行时执行，会占用少量 CPU 和磁盘；连续正式测数时不要让它与下一次运行重叠。
 

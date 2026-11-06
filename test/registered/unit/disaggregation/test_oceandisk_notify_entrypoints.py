@@ -121,5 +121,46 @@ class TestOceanDiskNotifyEntrypoints(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr.decode())
 
 
+@unittest.skipUnless(SHELL, "requires a POSIX shell")
+class TestDualNodeScripts(unittest.TestCase):
+    """dual_node_pd takes no input: its values live in the files themselves."""
+
+    def read(self, name):
+        return (ENGINE / "dual_node_pd" / name).read_text(encoding="utf-8")
+
+    def test_shell_syntax(self):
+        for path in (ENGINE / "dual_node_pd").glob("*.sh"):
+            result = subprocess.run([SHELL, "-n", str(path)], capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_no_required_input(self):
+        for path in (ENGINE / "dual_node_pd").glob("*.sh"):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(script=path.name):
+                self.assertNotIn("OD_NAMESPACE", text)
+                self.assertNotIn(":-", text)
+                self.assertNotIn(":?", text)
+
+    def test_roles_are_pinned_to_their_hosts(self):
+        prefill, decode = self.read("run_prefill.sh"), self.read("run_decode.sh")
+        self.assertIn("--host 141.111.65.132", prefill)
+        self.assertIn("cfg_fbs-h20-01", prefill)
+        self.assertIn("--enable-prefill-cp", prefill)
+        self.assertIn("--host 141.111.65.134", decode)
+        self.assertIn("cfg_fbs-h20-02", decode)
+        self.assertIn("--data-parallel-size 4", decode)
+        for text in (prefill, decode):
+            self.assertIn("--tensor-parallel-size 8", text)
+            self.assertIn("""--hicache-storage-backend-extra-config '{"layerwise_save":true}'""", text)
+            self.assertIn("/home/j00977581/pd_logs/$(date +%m%d%H%M)", text)
+
+    def test_router_and_client_follow_decode_log_dir(self):
+        self.assertIn("ln -sfn ${log_dir} /home/j00977581/pd_logs/latest", self.read("run_decode.sh"))
+        self.assertIn("/home/j00977581/pd_logs/latest/router.log", self.read("run_router.sh"))
+        rounds = self.read("run_rounds.sh")
+        self.assertIn("export SGLANG_UCL_TRACE_DIR=/home/j00977581/pd_logs/latest", rounds)
+        self.assertIn("report /home/j00977581/pd_logs/latest", rounds)
+
+
 if __name__ == "__main__":
     unittest.main()
