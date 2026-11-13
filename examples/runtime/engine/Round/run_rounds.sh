@@ -14,7 +14,7 @@ python3 run_rounds.py \
 status=$?
 if [ "${SGLANG_UCL_TRACE:-0}" != 0 ] && [ -n "${SGLANG_UCL_TRACE_DIR:-}" ]; then
   # Wait for two server flushes; a failed report never changes the exit code.
-  python3 "$(dirname "$0")/ucl_trace_tool.py" report "$SGLANG_UCL_TRACE_DIR" --wait 3 ||
+  python3 "$(dirname "$0")/ucl_trace_tool.py" report "$SGLANG_UCL_TRACE_DIR" --wait 3     --rounds-json ./rounds.json ||
     echo "UCL trace report failed" >&2
 fi
 exit $status

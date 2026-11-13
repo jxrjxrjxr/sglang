@@ -1141,6 +1141,87 @@ class TestReport(unittest.TestCase):
             self.assertEqual(rounds["r1"]["work"], [2 * 4 * 61])
             self.assertEqual(evicted[("轮次外", "0")], [1, 16, 2.0])
 
+    def test_rounds_json_prints_hit_rate_with_ttft_and_tpot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "rounds.json")
+            result = dict(
+                avg_ttft_ms=120.0, avg_tpot_ms=30.0, total_prompt_tokens_delta=1000
+            )
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    dict(
+                        config=dict(batch_size=2),
+                        results=[dict(result, round=1), dict(result, round=2)],
+                    ),
+                    f,
+                )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                tool.print_hit_rates(
+                    {
+                        "r1": dict(requests=2, prefix_tokens=250),
+                        "r2": dict(requests=1, prefix_tokens=900),
+                    },
+                    path,
+                )
+            text = out.getvalue()
+            self.assertIn("| 1 | 2/2 | 250 | 1000 | 25.0% | 120.0 | 30.0 |", text)
+            self.assertIn("| 2 | 1/2 | 900 | 1000 | - | 120.0 | 30.0 |", text)
+            self.assertIn("Overall D hit rate: 25.0%", text)
+
+    def test_report_hit_rate_covers_only_the_last_client_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_rid, new_rid = "old", "new"
+            write_trace(
+                tmp,
+                "run_rounds",
+                "client",
+                [
+                    (1, "client.send", old_rid, dict(tag="r1-0")),
+                    (2, "client.end", old_rid, dict(ok=True)),
+                ],
+            )
+            write_trace(
+                tmp,
+                "run_rounds2",
+                "client",
+                [
+                    (10, "client.send", new_rid, dict(tag="r1-0")),
+                    (12, "client.end", new_rid, dict(ok=True)),
+                ],
+            )
+            write_trace(
+                tmp,
+                "scheduler_DP0_TP0",
+                "decode",
+                [
+                    (1, "req.arrive", old_rid, dict()),
+                    (1.5, "pd.prealloc", old_rid, dict(room=1, decode_prefix_len=700)),
+                    (10, "req.arrive", new_rid, dict()),
+                    (11, "pd.prealloc", new_rid, dict(room=2, decode_prefix_len=300)),
+                ],
+            )
+            path = os.path.join(tmp, "rounds.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    dict(
+                        config=dict(batch_size=1),
+                        results=[
+                            dict(
+                                round=1,
+                                avg_ttft_ms=1.0,
+                                avg_tpot_ms=2.0,
+                                total_prompt_tokens_delta=1000,
+                            )
+                        ],
+                    ),
+                    f,
+                )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                tool.main(["report", tmp, "--rounds-json", path])
+            self.assertIn("| 1 | 1/1 | 300 | 1000 | 30.0% | 1.0 | 2.0 |", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

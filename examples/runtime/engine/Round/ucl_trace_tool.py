@@ -1692,6 +1692,17 @@ def build_report(run):
         lines += ["没有 gpu.streams 记录。", ""]
 
     rounds, evicted = decode_cache_section(run, server_round)
+    # "latest" can hold several client runs: rates cover only the last one.
+    client = [e for e in run.events if e["n"] in ("client.send", "client.end")]
+    hit_rounds = rounds
+    if client:
+        stamps = [e["w"] for e in client if e["src"] == client[-1]["src"]]
+        last_run = run.windowed(min(stamps), max(stamps))
+        hit_rounds, _ = decode_cache_section(last_run, server_round)
+    summary["decode_hit"] = {
+        rnd: dict(requests=len(b["prefix"]), prefix_tokens=sum(b["prefix"]))
+        for rnd, b in hit_rounds.items()
+    }
     lines += ["## 8.2 D 命中与恢复量", ""]
     if rounds:
         lines += [
@@ -2048,6 +2059,55 @@ def request_tracks(run, states, pid, us):
 # -------------------------------------------------------------------- CLI
 
 
+def print_hit_rates(decode_hit, rounds_json):
+    """Print per-round D hit rate beside the client's TTFT and TPOT.
+
+    Hit tokens are decode_prefix_len (L1 + L2 + OceanDisk), summed over one
+    rank per request; the denominator is the client's usage.prompt_tokens.
+    A round whose request count differs from the batch size has no rate.
+    """
+    try:
+        with open(rounds_json, encoding="utf-8") as f:
+            data = json.load(f)
+        batch_size = data["config"]["batch_size"]
+        results = data["results"]
+    except (OSError, ValueError, KeyError) as e:
+        print(f"Hit rate skipped: {rounds_json}: {e!r}", file=sys.stderr)
+        return
+    rows, total_hit, total_prompt = [], 0, 0
+    for r in results:
+        hit = decode_hit.get(f"r{r['round']}", {})
+        requests = hit.get("requests", 0)
+        tokens = hit.get("prefix_tokens", 0)
+        prompt = r.get("total_prompt_tokens_delta", 0)
+        rate = "-"
+        if requests == batch_size and prompt > 0:
+            rate = f"{tokens / prompt * 100:.1f}%"
+            total_hit += tokens
+            total_prompt += prompt
+        rows.append(
+            [
+                r["round"],
+                f"{requests}/{batch_size}",
+                tokens,
+                prompt,
+                rate,
+                fmt(r.get("avg_ttft_ms")),
+                fmt(r.get("avg_tpot_ms")),
+            ]
+        )
+    print("\nD hit rate (decode_prefix_len: L1+L2+OceanDisk, from UCL trace)")
+    print("Client Cache Hit above is usage.cached_tokens and excludes this.")
+    print(
+        table(
+            ["Round", "Req", "Hit tok", "Prompt tok", "Hit", "Avg TTFT", "Avg TPOT"],
+            rows,
+        )
+    )
+    if total_prompt:
+        print(f"Overall D hit rate: {total_hit / total_prompt * 100:.1f}%")
+
+
 def cmd_report(args):
     if args.wait:
         time.sleep(args.wait)  # let live servers write their next flush
@@ -2065,6 +2125,8 @@ def cmd_report(args):
     print(
         f"timeline: {os.path.join(out, 'trace.json')} (chrome://tracing or ui.perfetto.dev)"
     )
+    if args.rounds_json:
+        print_hit_rates(summary.get("decode_hit", {}), args.rounds_json)
 
 
 def cmd_merge(args):
@@ -2148,6 +2210,10 @@ def main(argv=None):
         type=float,
         default=0.0,
         help="seconds to wait first so running servers flush",
+    )
+    p.add_argument(
+        "--rounds-json",
+        help="run_rounds.py --output-json file; prints per-round D hit rate",
     )
     p.set_defaults(func=cmd_report)
     p = sub.add_parser("merge", help="write only the Chrome/Perfetto trace")
