@@ -471,6 +471,9 @@ class Envs:
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
+    # activities=["CUDA_PROFILER"] calls cudaProfilerStart/Stop only on the
+    # node's first GPU by default; set this so nsys captures every rank.
+    SGLANG_CUDA_PROFILER_ALL_RANKS = EnvBool(False)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_TRACE_ASYNC = EnvBool(False)

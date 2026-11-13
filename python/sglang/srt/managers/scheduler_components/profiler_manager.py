@@ -271,7 +271,10 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            if (
+                envs.SGLANG_CUDA_PROFILER_ALL_RANKS.get()
+                or self.ps.gpu_id == get_device().base_gpu_id
+            ):
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -384,7 +387,10 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            if (
+                envs.SGLANG_CUDA_PROFILER_ALL_RANKS.get()
+                or self.ps.gpu_id == get_device().base_gpu_id
+            ):
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
